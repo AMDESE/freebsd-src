@@ -20,6 +20,10 @@ TEST_METADATA.kern_descrip_test+= is_exclusive="true"
 ATF_TESTS_C+=	exterr_test
 ATF_TESTS_C+=	fdgrowtable_test
 ATF_TESTS_C+=	getdirentries_test
+.if ${MACHINE_ARCH} == "amd64" || ${MACHINE_ARCH} == "i386"
+ATF_TESTS_C+=	hwpmc_exterr_test
+TEST_METADATA.hwpmc_exterr_test+=	required_user="root"
+.endif
 ATF_TESTS_C+=	jail_lookup_root
 ATF_TESTS_C+=	inotify_test
 ATF_TESTS_C+=	kill_zombie
@@ -106,6 +110,9 @@ LIBADD.socket_msg_waitall+=		pthread
 LIBADD.socket_splice+=			pthread
 LIBADD.sendfile_helper+=		pthread
 LIBADD.fdgrowtable_test+=		util pthread kvm procstat
+.if ${MACHINE_ARCH} == "amd64" || ${MACHINE_ARCH} == "i386"
+LIBADD.hwpmc_exterr_test+=		pmc
+.endif
 LIBADD.sigwait+=			rt
 LIBADD.ktrace_test+=			sysdecode
 LIBADD.unix_passfd_dgram+=		jail
