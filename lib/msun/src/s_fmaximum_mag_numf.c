@@ -1,5 +1,8 @@
-/*-
- * Copyright (c) 2012 Semihalf.
+/*
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2004 David Schultz <das@FreeBSD.ORG>
+ * Copyright (c) 2026 Jesús Blázquez <jesuscblazquez@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -24,28 +27,58 @@
  * SUCH DAMAGE.
  */
 
-#ifndef IF_DTSEC_RM_H_
-#define IF_DTSEC_RM_H_
+#include <math.h>
+#include <stdbool.h>
 
-/**
- * @group dTSEC Regular Mode API.
- * @{
- */
-int	dtsec_rm_fm_port_rx_init(struct dtsec_softc *sc, int unit);
-int	dtsec_rm_fm_port_tx_init(struct dtsec_softc *sc, int unit);
+#include "fpmath.h"
 
-void	dtsec_rm_if_start_locked(struct dtsec_softc *sc);
+#ifdef USE_BUILTIN_FMAXIMUM_MAG_NUMF
+float
+fmaximum_mag_numf(float x, float y)
+{
+	return (__builtin_fmaximum_mag_numf(x, y));
+}
+#else
+float
+fmaximum_mag_numf(float x, float y)
+{
+	union IEEEf2bits u[2];
+	bool nan_x, nan_y;
 
-int	dtsec_rm_pool_rx_init(struct dtsec_softc *sc);
-void	dtsec_rm_pool_rx_free(struct dtsec_softc *sc);
+	u[0].f = x;
+	u[1].f = y;
 
-int	dtsec_rm_fi_pool_init(struct dtsec_softc *sc);
-void	dtsec_rm_fi_pool_free(struct dtsec_softc *sc);
+	nan_x = isnan(x);
+	nan_y = isnan(y);
 
-int	dtsec_rm_fqr_rx_init(struct dtsec_softc *sc);
-int	dtsec_rm_fqr_tx_init(struct dtsec_softc *sc);
-void	dtsec_rm_fqr_rx_free(struct dtsec_softc *sc);
-void	dtsec_rm_fqr_tx_free(struct dtsec_softc *sc);
-/** @} */
+	if (nan_x || nan_y) {
+		/* If both are NaN, adding returns qNaN */
+		if (nan_x && nan_y)
+		    return (x + y);
 
-#endif /* IF_DTSEC_RM_H_ */
+		/* force_except makes sure sNaN's raise exceptions */
+		volatile float force_except = x + y;
+		force_except;
+
+		if (nan_x)
+			return (y);
+		else
+			return (x);
+	}
+	
+	float ax = fabsf(x);
+	float ay = fabsf(y);
+
+	if (ay > ax)
+		return (y);
+	if (ax > ay)
+		return (x);
+
+	/* If magnitudes are equal, we break the tie with the sign */
+	if (u[0].bits.sign != u[1].bits.sign)
+		return (u[u[0].bits.sign].f);
+
+	return (x);
+}
+#endif
+

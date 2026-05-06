@@ -1,5 +1,8 @@
-/*-
- * Copyright (c) 2012 Semihalf.
+/*
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2004 David Schultz <das@FreeBSD.ORG>
+ * Copyright (c) 2026 Jesús Blázquez <jesuscblazquez@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -24,16 +27,64 @@
  * SUCH DAMAGE.
  */
 
-#ifndef IF_DTSEC_IM_H_
-#define IF_DTSEC_IM_H_
+#include <float.h>
+#include <math.h>
+#include <stdbool.h>
 
-/**
- * @group dTSEC Independent Mode API.
- * @{
- */
-int	dtsec_im_fm_port_tx_init(struct dtsec_softc *sc, int unit);
-int	dtsec_im_fm_port_rx_init(struct dtsec_softc *sc, int unit);
-void	dtsec_im_if_start_locked(struct dtsec_softc *sc);
-/** @} */
+#include "fpmath.h"
 
-#endif /* IF_DTSEC_IM_H_ */
+#ifdef USE_BUILTIN_FMINIMUM_MAG_NUM
+double
+fminimum_mag_num(double x, double y)
+{
+	return (__builtin_fminimum_mag_num(x, y));
+}
+#else
+double
+fminimum_mag_num(double x, double y)
+{
+	union IEEEd2bits u[2];
+	bool nan_x, nan_y;
+
+	u[0].d = x;
+	u[1].d = y;
+
+	nan_x = isnan(x);
+	nan_y = isnan(y);
+
+	if (nan_x || nan_y) {
+		/* If both are NaN, adding returns qNaN */
+		if (nan_x && nan_y)
+		    return (x + y);
+
+		/* force_except makes sure sNaN's raise exceptions */
+		volatile double force_except = x + y;
+		force_except;
+
+		if (nan_x)
+			return (y);
+		else
+			return (x);
+	}
+
+	double ax = fabs(x);
+	double ay = fabs(y);
+
+	if (ay < ax)
+		return (y);
+	if (ax < ay)
+		return (x);
+
+	/* If magnitudes are equal, we break the tie with the sign */
+	if (u[0].bits.sign != u[1].bits.sign)
+		return (u[u[1].bits.sign].d);
+
+	return (x);
+}
+#endif
+
+#if (LDBL_MANT_DIG == 53)
+__weak_reference(fminimum_mag_num, fminimum_mag_numl);
+#endif
+
+

@@ -1,5 +1,9 @@
-/*-
- * Copyright (c) 2017 Netflix, Inc.
+/*
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2004 David Schultz <das@FreeBSD.ORG>
+ * Copyright (c) 2026 Jesús Blázquez <jesuscblazquez@gmail.com>
+ * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -23,13 +27,53 @@
  * SUCH DAMAGE.
  */
 
-/*
- * different routines to dump data.
- */
+#include <math.h>
+#include <stdbool.h>
 
-void asciidump(uint8_t *data, size_t datalen);
-void bindump(uint8_t *data, size_t datalen);
-void efi_print_load_option(uint8_t *, size_t, int, int, int);
-void hexdump(uint8_t *data, size_t datalen);
-void utf8dump(uint8_t *data, size_t datalen);
+#include "fpmath.h"
+
+long double
+fminimum_mag_numl(long double x, long double y)
+{
+	union IEEEl2bits u[2];
+	bool nan_x, nan_y;
+
+	u[0].e = x;
+	mask_nbit_l(u[0]);
+	u[1].e = y;
+	mask_nbit_l(u[1]);
+
+	nan_x = isnan(x);
+	nan_y = isnan(y);
+
+	if (nan_x || nan_y) {
+		/* If both are NaN, adding returns qNaN */
+		if (nan_x && nan_y)
+		    return (x + y);
+
+		/* force_except makes sure sNaN's raise exceptions */
+		volatile long double force_except = x + y;
+		force_except;
+
+		if (nan_x)
+			return (y);
+		else
+			return (x);
+	}
+
+	long double ax = fabsl(x);
+	long double ay = fabsl(y);
+
+	if (ay < ax)
+		return (y);
+	if (ax < ay)
+		return (x);
+
+	/* If magnitudes are equal, we break the tie with the sign */
+	if (u[0].bits.sign != u[1].bits.sign)
+		return (u[1].bits.sign ? y : x);
+
+	return (x);
+}
+
 
