@@ -50,6 +50,12 @@
 #define	CPUID_IBSID_IBSOPDATA4		0x00000400 /* IBS OP DATA4 */
 #define	CPUID_IBSID_ZEN4IBSEXTENSIONS	0x00000800 /* IBS Zen 4 Extensions */
 #define	CPUID_IBSID_IBSLOADLATENCYFILT	0x00001000 /* Load Latency Filtering */
+#define	CPUID_IBSID_IBSDIS		0x00002000 /* Alternate IBS Disable */
+#define	CPUID_IBSID_FETCHLATFILTERING	0x00004000 /* Fetch Latency Filter */
+#define	CPUID_IBSID_ADDRBIT63FILTERING	0x00008000 /* Addr Bit 63 Filter */
+#define	CPUID_IBSID_STRMSTANDRMTSOCKET	0x00010000 /* StrmSt + RmtSocket */
+#define	CPUID_IBSID_BUFFERV1		0x00020000 /* IBS Buffering V1 */
+#define	CPUID_IBSID_MEMPROFILERV1	0x00040000 /* IBS Memory Profiler V1 */
 #define	CPUID_IBSID_IBSUPDTDDTLBSTATS	0x00080000 /* Simplified DTLB Stats */
 
 /*
@@ -107,11 +113,27 @@
 #define IBS_FETCH_PHYSADDR		0xC0011032 /* Fetch Physical Address */
 #define IBS_FETCH_EXTCTL		0xC001103C /* Fetch Control Extended */
 
+/* IBS Fetch Control 2 (Zen6) */
+#define IBS_FETCH_CTL2			0xC001103F /* IBS Fetch Control 2 */
+#define IBS_FETCH_CTL2_DISABLE		(1ULL << 0) /* IBS Fetch Disable */
+#define IBS_FETCH_CTL2_LATFILTERMASK	(0xFULL << 1) /* Fetch Latency Filter */
+#define IBS_FETCH_CTL2_EXCLADDR63EQ1	(1ULL << 5) /* Exclude addr bit63=1 */
+#define IBS_FETCH_CTL2_EXCLADDR63EQ0	(1ULL << 6) /* Exclude addr bit63=0 */
+#define IBS_FETCH_CTL2_ADDR63MASK	(IBS_FETCH_CTL2_EXCLADDR63EQ0 | \
+    IBS_FETCH_CTL2_EXCLADDR63EQ1)
+
+#define IBS_FETCH_CTL2_LAT_MIN		128
+#define IBS_FETCH_CTL2_LAT_MAX		1920
+#define IBS_FETCH_CTL2_LAT_STEP		128
+#define IBS_FETCH_CTL2_LAT_TO_CTL(_l)	((((_l) >> 7) & 0xFULL) << 1)
+#define IBS_FETCH_CTL2_CTL_TO_LAT(_c)	((((_c) >> 1) & 0xFULL) << 7)
+
 #define PMC_MPIDX_FETCH_CTL		0
 #define PMC_MPIDX_FETCH_EXTCTL		1
 #define PMC_MPIDX_FETCH_LINADDR		2
 #define PMC_MPIDX_FETCH_PHYSADDR	3
 #define PMC_MPIDX_FETCH_MAX		(PMC_MPIDX_FETCH_PHYSADDR + 1)
+#define PMC_MPIDX_FETCH_CTL2		4
 
 /* IBS Execution Control */
 #define IBS_OP_CTL			0xC0011033 /* IBS Execution Control */
@@ -148,6 +170,8 @@
 #define IBS_OP_DATA_RETURN		(1ULL << 34) /* Return */
 
 #define IBS_OP_DATA2			0xC0011036 /* IBS Op Data 2 */
+#define IBS_OP_DATA2_RMTSOCKET		(1ULL << 9)  /* Remote Socket */
+#define IBS_OP_DATA2_STRMST		(1ULL << 8)  /* Streaming Store */
 #define IBS_OP_DATA3			0xC0011037 /* IBS Op Data 3 */
 #define IBS_OP_DATA3_DCPHYADDRVALID	(1ULL << 18) /* DC Physical Address */
 #define IBS_OP_DATA3_DCLINADDRVALID	(1ULL << 17) /* DC Linear Address */
@@ -169,6 +193,15 @@
 #define IBS_OP_DATA4			0xC001103D /* IBS Op Data 4 */
 #define IBS_OP_DATA4_LDRESYNC		(1ULL << 0)  /* Load Resync */
 
+/* IBS Execution Control 2 (Zen6) */
+#define IBS_OP_CTL2			0xC001103E /* IBS Execution Control 2 */
+#define IBS_OP_CTL2_DISABLE		(1ULL << 0) /* IBS Execution Disable */
+#define IBS_OP_CTL2_EXCLRIP63EQ0	(1ULL << 1) /* Exclude RIP bit63=0 */
+#define IBS_OP_CTL2_EXCLRIP63EQ1	(1ULL << 2) /* Exclude RIP bit63=1 */
+#define IBS_OP_CTL2_STRMSTFILTER	(1ULL << 3) /* Streaming Store Filter */
+#define IBS_OP_CTL2_RIP63MASK		(IBS_OP_CTL2_EXCLRIP63EQ0 | \
+    IBS_OP_CTL2_EXCLRIP63EQ1)
+
 #define PMC_MPIDX_OP_CTL		0
 #define PMC_MPIDX_OP_RIP		1
 #define PMC_MPIDX_OP_DATA		2
@@ -179,6 +212,7 @@
 #define PMC_MPIDX_OP_TGT_RIP		7
 #define PMC_MPIDX_OP_DATA4		8
 #define PMC_MPIDX_OP_MAX		(PMC_MPIDX_OP_DATA4 + 1)
+#define PMC_MPIDX_OP_CTL2		9
 
 /*
  * IBS data is encoded as using the multipart flag in the existing callchain

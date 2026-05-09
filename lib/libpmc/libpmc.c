@@ -39,6 +39,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <err.h>
+#include <stdbool.h>
 #include <fcntl.h>
 #include <pmc.h>
 #include <stdio.h>
@@ -700,13 +701,14 @@ ibs_allocate_pmc(enum pmc_event pe, char *ctrspec,
     struct pmc_op_pmcallocate *pmc_config)
 {
 	char *e, *p, *q;
-	uint64_t ctl, ldlat;
-	u_int ibs_features;
-	u_int regs[4];
+	uint64_t ctl, ctl2, ldlat, addr63, fetchlat;
+	bool seen_l3miss, seen_randomize, seen_ldlat, seen_fetchlat;
+	bool seen_opcount, seen_addr63, seen_streamstore;
 
 	pmc_config->pm_caps |=
 	    (PMC_CAP_SYSTEM | PMC_CAP_EDGE | PMC_CAP_PRECISE);
 	pmc_config->pm_md.pm_ibs.ibs_ctl = 0;
+	pmc_config->pm_md.pm_ibs.ibs_ctl2 = 0;
 
 	/* setup parsing tables */
 	switch (pe) {
@@ -725,25 +727,79 @@ ibs_allocate_pmc(enum pmc_event pe, char *ctrspec,
 		return (-1);
 	}
 
-	/* Read the ibs feature flags */
-	ibs_features = 0;
-	do_cpuid(0x80000000, regs);
-	if (regs[0] >= CPUID_IBSID) {
-		do_cpuid(CPUID_IBSID, regs);
-		ibs_features = regs[0];
-	}
+	/*
+	 * Capability gating is kernel-side; we only check syntax 
+	 * and value ranges here.
+	 */
 
-	/* parse parameters */
 	ctl = 0;
+	ctl2 = 0;
+	seen_l3miss = false;
+	seen_randomize = false;
+	seen_ldlat = false;
+	seen_fetchlat = false;
+	seen_opcount = false;
+	seen_addr63 = false;
+	seen_streamstore = false;
 	if (pe == PMC_EV_IBS_FETCH) {
 		while ((p = strsep(&ctrspec, ",")) != NULL) {
 			if (KWMATCH(p, "l3miss")) {
-				if ((ibs_features & CPUID_IBSID_ZEN4IBSEXTENSIONS) == 0)
+				if (seen_l3miss)
 					return (-1);
+				seen_l3miss = true;
 
 				ctl |= IBS_FETCH_CTL_L3MISSONLY;
 			} else if (KWMATCH(p, "randomize")) {
+				if (seen_randomize)
+					return (-1);
+				seen_randomize = true;
 				ctl |= IBS_FETCH_CTL_RANDOMIZE;
+			} else if (KWPREFIXMATCH(p, "fetchlat=")) {
+				if (seen_fetchlat)
+					return (-1);
+				seen_fetchlat = true;
+
+				q = strchr(p, '=');
+				if (*++q == '\0') /* skip '=' */
+					return (-1);
+
+				fetchlat = strtoull(q, &e, 0);
+				if (e == q || *e != '\0')
+					return (-1);
+
+				if (fetchlat < IBS_FETCH_CTL2_LAT_MIN ||
+				    fetchlat > IBS_FETCH_CTL2_LAT_MAX)
+					return (-1);
+				if ((fetchlat % IBS_FETCH_CTL2_LAT_STEP) != 0)
+					return (-1);
+
+				ctl2 |= IBS_FETCH_CTL2_LAT_TO_CTL(fetchlat);
+				/*
+				 * Defence-in-depth round-trip check: catch any
+				 * future macro/range drift that would silently
+				 * truncate fetchlat to the "no filter" encoding.
+				 */
+				if ((ctl2 & IBS_FETCH_CTL2_LATFILTERMASK) == 0)
+					return (-1);
+			} else if (KWPREFIXMATCH(p, "addr63=")) {
+				if (seen_addr63)
+					return (-1);
+				seen_addr63 = true;
+
+				q = strchr(p, '=');
+				if (*++q == '\0') /* skip '=' */
+					return (-1);
+
+				addr63 = strtoull(q, &e, 0);
+				if (e == q || *e != '\0')
+					return (-1);
+
+				if (addr63 == 0)
+					ctl2 |= IBS_FETCH_CTL2_EXCLADDR63EQ1;
+				else if (addr63 == 1)
+					ctl2 |= IBS_FETCH_CTL2_EXCLADDR63EQ0;
+				else
+					return (-1);
 			} else {
 				return (-1);
 			}
@@ -757,10 +813,14 @@ ibs_allocate_pmc(enum pmc_event pe, char *ctrspec,
 	} else {
 		while ((p = strsep(&ctrspec, ",")) != NULL) {
 			if (KWMATCH(p, "l3miss")) {
+				if (seen_l3miss)
+					return (-1);
+				seen_l3miss = true;
 				ctl |= IBS_OP_CTL_L3MISSONLY;
 			} else if (KWPREFIXMATCH(p, "ldlat=")) {
-				if ((ibs_features & CPUID_IBSID_IBSLOADLATENCYFILT) == 0)
+				if (seen_ldlat)
 					return (-1);
+				seen_ldlat = true;
 
 				q = strchr(p, '=');
 				if (*++q == '\0') /* skip '=' */
@@ -786,10 +846,35 @@ ibs_allocate_pmc(enum pmc_event pe, char *ctrspec,
 				ctl |= IBS_OP_CTL_LDLAT_TO_CTL(ldlat);
 				ctl |= IBS_OP_CTL_L3MISSONLY | IBS_OP_CTL_LATFLTEN;
 			} else if (KWMATCH(p, "opcount")) {
-				if ((ibs_features & CPUID_IBSID_OPCNT) == 0)
+				if (seen_opcount)
 					return (-1);
+				seen_opcount = true;
 
 				ctl |= IBS_OP_CTL_COUNTERCONTROL;
+			} else if (KWPREFIXMATCH(p, "addr63=")) {
+				if (seen_addr63)
+					return (-1);
+				seen_addr63 = true;
+
+				q = strchr(p, '=');
+				if (*++q == '\0') /* skip '=' */
+					return (-1);
+
+				addr63 = strtoull(q, &e, 0);
+				if (e == q || *e != '\0')
+					return (-1);
+
+				if (addr63 == 0)
+					ctl2 |= IBS_OP_CTL2_EXCLRIP63EQ1;
+				else if (addr63 == 1)
+					ctl2 |= IBS_OP_CTL2_EXCLRIP63EQ0;
+				else
+					return (-1);
+			} else if (KWMATCH(p, "streamstore")) {
+				if (seen_streamstore)
+					return (-1);
+				seen_streamstore = true;
+				ctl2 |= IBS_OP_CTL2_STRMSTFILTER;
 			} else {
 				return (-1);
 			}
@@ -799,15 +884,12 @@ ibs_allocate_pmc(enum pmc_event pe, char *ctrspec,
 		    pmc_config->pm_count > IBS_OP_MAX_RATE)
 			return (-1);
 
-		if (((ibs_features & CPUID_IBSID_OPCNTEXT) == 0) &&
-		    (pmc_config->pm_count > IBS_OP_MAX_RATE_PREEXT))
-			return (-1);
-
 		ctl |= IBS_OP_INTERVAL_TO_CTL(pmc_config->pm_count);
 	}
 
 
 	pmc_config->pm_md.pm_ibs.ibs_ctl |= ctl;
+	pmc_config->pm_md.pm_ibs.ibs_ctl2 |= ctl2;
 
 	return (0);
 }
