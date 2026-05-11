@@ -48,6 +48,10 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
+#if defined(__amd64__) || defined(__i386__)
+#include <dev/hwpmc/hwpmc_ibs.h>
+#endif
+
 #include <netinet/in.h>
 
 #include <assert.h>
@@ -370,15 +374,37 @@ pmcstat_pmcindex_to_pmcr(int pmcin)
 }
 
 #if defined(__amd64__) || defined(__i386__)
+/*
+ * Set if producer kernel ran on Zen3 B0 (Family 19h Model 0x0-0xF).
+ * Affected by IBS errata #1197, #1238, #1293, #1347.
+ * Initialized from PMCLOG_TYPE_INITIALIZE pl_cpuid ("AuthenticAMD-fam-mod-step", set by hwpmc_amd.c).
+ */
+static bool pmcstat_ibs_amd_zen3_b0;
+
+static void
+pmcstat_ibs_check_errata(const char *cpuid)
+{
+	unsigned int family, model;
+
+	if (sscanf(cpuid, "AuthenticAMD-%u-%x-", &family, &model) != 2)
+		return;
+	if (family == 0x19 && model <= 0x0F)
+		pmcstat_ibs_amd_zen3_b0 = true;
+}
+
 static void
 pmcstat_print_ibs_fetch(struct pmclog_ev_callchain *cc, int offset)
 {
 	uint64_t *ibsbuf = (uint64_t *)&cc->pl_pc[offset];
 	uint64_t ctl;
+	bool show_icmiss;
 
 	ctl = ibsbuf[PMC_MPIDX_FETCH_CTL];
+
+	/* Erratum #1238: IbsIcMiss invalid on Zen3 B0. */
+	show_icmiss = !pmcstat_ibs_amd_zen3_b0;
 	PMCSTAT_PRINT_ENTRY("ibs-fetch", "%s%s%s%s",
-	    (ctl & IBS_FETCH_CTL_ICMISS) ? "icmiss " : "",
+	    (show_icmiss && (ctl & IBS_FETCH_CTL_ICMISS)) ? "icmiss " : "",
 	    (ctl & IBS_FETCH_CTL_L1TLBMISS) ? "l1tlbmiss " : "",
 	    (ctl & IBS_FETCH_CTL_OPCACHEMISS) ? "opcachemiss " : "",
 	    (ctl & IBS_FETCH_CTL_L3MISS) ? "l3miss" : "");
@@ -508,6 +534,9 @@ pmcstat_print_log(void)
 				warnx(
 "WARNING: Log version 0x%x != expected version 0x%x.",
 				    ev.pl_u.pl_i.pl_version, PMC_VERSION);
+#if defined(__amd64__) || defined(__i386__)
+			pmcstat_ibs_check_errata(ev.pl_u.pl_i.pl_cpuid);
+#endif
 			break;
 		case PMCLOG_TYPE_MAP_IN:
 			PMCSTAT_PRINT_ENTRY("map-in","%d %p \"%s\"",

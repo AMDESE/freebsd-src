@@ -60,6 +60,7 @@ struct ibs_descr {
 static uint64_t ibs_features;
 static uint64_t ibs_fetch_allowed_mask;
 static uint64_t ibs_op_allowed_mask;
+static bool ibs_erratum_1293;
 
 static uint64_t ibs_fetch_extra_mask;
 static uint64_t ibs_op_extra_mask;
@@ -482,6 +483,10 @@ pmc_ibs_process_op(struct pmc *pm, struct trapframe *tf, uint64_t config)
 	mpd.pl_mpdata[PMC_MPIDX_OP_DATA] = rdmsr(IBS_OP_DATA);
 	mpd.pl_mpdata[PMC_MPIDX_OP_DATA2] = rdmsr(IBS_OP_DATA2);
 	mpd.pl_mpdata[PMC_MPIDX_OP_DATA3] = rdmsr(IBS_OP_DATA3);
+	if (ibs_erratum_1293 &&
+	    (mpd.pl_mpdata[PMC_MPIDX_OP_DATA3] &
+	    (IBS_OP_DATA3_SWPF | IBS_OP_DATA3_DCMISSNOMABALLOC)) != 0)
+		mpd.pl_mpdata[PMC_MPIDX_OP_DATA2] = 0;
 	mpd.pl_mpdata[PMC_MPIDX_OP_DC_LINADDR] = rdmsr(IBS_OP_DC_LINADDR);
 	mpd.pl_mpdata[PMC_MPIDX_OP_DC_PHYSADDR] = rdmsr(IBS_OP_DC_PHYSADDR);
 	if ((ibs_features & CPUID_IBSID_BRNTRGT) != 0) {
@@ -716,6 +721,14 @@ pmc_ibs_initialize(struct pmc_mdep *pmc_mdep, int ncpus)
 	} else {
 		ibs_features = 0;
 	}
+
+	/*
+	 * Erratum #1293: on Family 19h models 00h-0Fh (Zen3), IBS_OP_DATA2 and
+	 * the L2Miss / OpDcMissOpenMemReqs fields in IBS_OP_DATA3 are invalid
+	 * when DcMissNoMabAlloc or SwPf is set in IBS_OP_DATA3.
+	 */
+	ibs_erratum_1293 = CPUID_TO_FAMILY(cpu_id) == 0x19 &&
+	    CPUID_TO_MODEL(cpu_id) <= 0x0F;
 
 	ibs_init_policy();
 
