@@ -28,6 +28,7 @@
 struct amd_rapl_value {
 	uint64_t prev;
 	volatile uint64_t diff;
+	bool primed;
 };
 
 struct amd_rapl_softc {
@@ -49,10 +50,16 @@ amd_rapl_count_watt(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 static void
 amd_rapl_update_delta(struct amd_rapl_value *val, uint64_t cur)
 {
-	if (cur > val->prev)
+	if (!val->primed) {
+		val->prev = cur;
+		val->diff = 0;
+		val->primed = true;
+		return;
+	}
+	if (cur >= val->prev)
 		val->diff = cur - val->prev;
 	else
-		val->diff = UINT32_MAX - val->prev + cur;
+		val->diff = (UINT32_MAX - val->prev) + cur + 1;
 	val->prev = cur;
 }
 
@@ -87,8 +94,9 @@ amd_rapl_sample(void *arg)
 	mtx_unlock(&sc->mtx);
 	smp_rendezvous_cpus(all_cpus, smp_no_rendezvous_barrier,
 	    amd_rapl_read_core_energy, smp_no_rendezvous_barrier, sc);
+	CPU_ZERO(&package_cpus);
 	for (i = 0; i < vm_ndomains; i++)
-		CPU_SETOF(i * sc->cpus_per_domain, &package_cpus);
+		CPU_SET(i * sc->cpus_per_domain, &package_cpus);
 	smp_rendezvous_cpus(package_cpus, smp_no_rendezvous_barrier,
 	    amd_rapl_read_package_energy, smp_no_rendezvous_barrier, sc);
 	callout_schedule_sbt(&sc->sampling_timer,
@@ -175,9 +183,9 @@ amd_rapl_attach(device_t dev)
 	sc->energy_unit = (value >> 8) & 0x1f;
 	sc->cpus_per_domain = mp_ncpus / vm_ndomains;
 	sc->core_value = malloc(sizeof(struct amd_rapl_value) * mp_ncpus,
-	    M_TEMP, M_WAITOK);
+	    M_TEMP, M_WAITOK | M_ZERO);
 	sc->package_value = malloc(sizeof(struct amd_rapl_value) * vm_ndomains,
-	    M_TEMP, M_WAITOK);
+	    M_TEMP, M_WAITOK | M_ZERO);
 	mtx_init(&sc->mtx, AMD_RAPL_DRIVER_NAME, NULL, MTX_DEF | MTX_RECURSE);
 	callout_init_mtx(&sc->sampling_timer, &sc->mtx, CALLOUT_RETURNUNLOCKED);
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
