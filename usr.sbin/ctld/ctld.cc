@@ -1175,21 +1175,12 @@ conf::add_port(struct target *target, struct pport *pp)
 		return (false);
 	}
 
-	pp->link();
 	return (true);
 }
 
 bool
-conf::add_port(struct kports &kports, struct target *target, int pp, int vp)
+conf::add_port(struct target *target, const std::string &pname, int pp, int vp)
 {
-	struct pport *pport;
-
-	std::string pname = freebsd::stringf("ioctl/%d/%d", pp, vp);
-
-	pport = kports.find_port(pname);
-	if (pport != NULL)
-		return (add_port(target, pport));
-
 	std::string name = pname + "-" + target->name();
 	const auto &pair = conf_ports.try_emplace(name,
 	    std::make_unique<ioctl_port>(target, pp, vp));
@@ -1387,6 +1378,19 @@ target::set_auth_type(const char *type)
 bool
 target::add_physical_port(std::string_view pport)
 {
+	/* Normalize ioctl port names. */
+	std::string pname;
+	if (pport.compare(0, strlen("ioctl/"), "ioctl/") == 0) {
+		int ret, pp, vp;
+
+		pname = std::string(pport);
+		ret = sscanf(pname.c_str(), "ioctl/%d/%d", &pp, &vp);
+		if (ret == 2) {
+			pname = freebsd::stringf("ioctl/%d/%d", pp, vp);
+			pport = pname;
+		}
+	}
+
 	for (const auto &s : t_pports) {
 		if (s == pport) {
 			log_warnx("duplicate physical port \"%s\" for target "
@@ -1973,24 +1977,14 @@ conf::apply(struct conf *oldconf)
 		log_init(conf_debug);
 	}
 
-	/*
-	 * Rename the pidfile if the pathname changes.  On startup,
-	 * oldconf created via conf_new_from_kernel will not contain a
-	 * valid pidfile_path.  On shutdown, the temporary newconf
-	 * will not contain a valid pidfile_path.
-	 */
-	if (!oldconf->conf_pidfile_path.empty() &&
-	    !conf_pidfile_path.empty()) {
-		if (oldconf->conf_pidfile_path != conf_pidfile_path) {
-			/* pidfile has changed.  rename it */
-			log_debugx("moving pidfile to %s",
+	/* Rename the pidfile if the pathname changes. */
+	if (oldconf->conf_pidfile_path != conf_pidfile_path) {
+		log_debugx("moving pidfile to %s", conf_pidfile_path.c_str());
+		if (rename(oldconf->conf_pidfile_path.c_str(),
+		    conf_pidfile_path.c_str()) != 0) {
+			log_err(1, "renaming pidfile %s -> %s",
+			    oldconf->conf_pidfile_path.c_str(),
 			    conf_pidfile_path.c_str());
-			if (rename(oldconf->conf_pidfile_path.c_str(),
-				conf_pidfile_path.c_str()) != 0) {
-				log_err(1, "renaming pidfile %s -> %s",
-				    oldconf->conf_pidfile_path.c_str(),
-				    conf_pidfile_path.c_str());
-			}
 		}
 	}
 
@@ -2208,6 +2202,41 @@ conf::apply(struct conf *oldconf)
 	isns_schedule_update();
 
 	return (cumulated_error);
+}
+
+void
+conf::shutdown()
+{
+	/* Deregister from iSNS servers. */
+	for (auto &kv : conf_isns)
+		isns_deregister_targets(&kv.second);
+
+	/* Remove all ports. */
+	for (const auto &kv : conf_ports) {
+		const std::string &name = kv.first;
+		port *port = kv.second.get();
+
+		if (port->is_dummy())
+			continue;
+		log_debugx("removing port \"%s\"", name.c_str());
+		if (!port->kernel_remove())
+			log_warnx("failed to remove port %s", name.c_str());
+	}
+
+	/* Remove all LUNs. */
+	for (const auto &kv : conf_luns) {
+		struct lun *lun = kv.second.get();
+
+		if (!lun->kernel_remove())
+			log_warnx("failed to remove lun \"%s\", CTL lun %d",
+			    lun->name(), lun->ctl_lun());
+	}
+
+	/* Close sockets on all portal groups. */
+	for (auto &kv : conf_portal_groups)
+		kv.second->close_sockets();
+	for (auto &kv : conf_transport_groups)
+		kv.second->close_sockets();
 }
 
 bool
@@ -2611,6 +2640,7 @@ conf_new_from_file(const char *path, bool ucl)
 bool
 conf::add_pports(struct kports &kports)
 {
+	std::unordered_map<struct pport *, struct target *> linked_ports;
 	struct pport *pp;
 	int ret, i_pp, i_vp;
 
@@ -2618,35 +2648,50 @@ conf::add_pports(struct kports &kports)
 		struct target *targ = kv.second.get();
 
 		for (const auto &pport : targ->pports()) {
-			ret = sscanf(pport.c_str(), "ioctl/%d/%d", &i_pp,
-			    &i_vp);
-			if (ret > 0) {
-				if (!add_port(kports, targ, i_pp, i_vp)) {
-					log_warnx("can't create new ioctl port "
-					    "for %s", targ->label());
+			/*
+			 * If this port is already present in the
+			 * kernel, reuse the existing port.
+			 */
+			pp = kports.find_port(pport);
+			if (pp != nullptr) {
+				const auto &pair = linked_ports.try_emplace(pp,
+				    targ);
+				if (!pair.second) {
+					log_warnx("can't link port \"%s\" to "
+					    "%s, port already linked to %s",
+					    pport.c_str(), targ->label(),
+					    pair.first->second->label());
 					return (false);
 				}
 
+				if (!add_port(targ, pp)) {
+					log_warnx(
+					    "can't link port \"%s\" to %s",
+					    pport.c_str(), targ->label());
+					return (false);
+				}
 				continue;
 			}
 
-			pp = kports.find_port(pport);
-			if (pp == NULL) {
-				log_warnx("unknown port \"%s\" for %s",
-				    pport.c_str(), targ->label());
-				return (false);
+			/*
+			 * If this port is an ioctl port, create a new
+			 * port.
+			 */
+			ret = sscanf(pport.c_str(), "ioctl/%d/%d", &i_pp,
+			    &i_vp);
+			if (ret == 2) {
+				if (!add_port(targ, pport, i_pp, i_vp)) {
+					log_warnx("can't create new port %s "
+					    "for %s", pport.c_str(),
+					    targ->label());
+					return (false);
+				}
+				continue;
 			}
-			if (pp->linked()) {
-				log_warnx("can't link port \"%s\" to %s, "
-				    "port already linked to some target",
-				    pport.c_str(), targ->label());
-				return (false);
-			}
-			if (!add_port(targ, pp)) {
-				log_warnx("can't link port \"%s\" to %s",
-				    pport.c_str(), targ->label());
-				return (false);
-			}
+
+			log_warnx("unknown port \"%s\" for %s",
+			    pport.c_str(), targ->label());
+			return (false);
 		}
 	}
 	return (true);
@@ -2715,6 +2760,9 @@ main(int argc, char **argv)
 		newconf->set_debug(debug);
 	}
 
+	/* Reuse the pidfile path from the configuration file. */
+	oldconf->set_pidfile_path(newconf->pidfile_path());
+
 	if (!newconf->add_pports(kports))
 		log_errx(1, "Error associating physical ports; exiting");
 
@@ -2739,8 +2787,6 @@ main(int argc, char **argv)
 	oldconf.reset();
 
 	pidfile.write();
-
-	newconf->isns_schedule_update();
 
 	for (;;) {
 		main_loop(!daemonize);
@@ -2769,21 +2815,12 @@ main(int argc, char **argv)
 				oldconf.reset();
 			}
 		} else if (sigterm_received) {
-			log_debugx("exiting on signal; "
-			    "reloading empty configuration");
+			log_debugx("exiting on signal");
 
-			log_debugx("removing CTL iSCSI ports "
+			log_debugx("removing CTL iSCSI and NVMeoF ports "
 			    "and terminating all connections");
 
-			oldconf = std::move(newconf);
-			newconf = std::make_unique<conf>();
-			if (debug > 0)
-				newconf->set_debug(debug);
-			error = newconf->apply(oldconf.get());
-			if (error != 0)
-				log_warnx("failed to apply configuration");
-			oldconf.reset();
-
+			newconf->shutdown();
 			log_warnx("exiting on signal");
 			return (0);
 		} else {

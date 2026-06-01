@@ -405,7 +405,7 @@ struct bufqueue __exclusive_cache_line bqempty;
 /*
  * per-cpu empty buffer cache.
  */
-uma_zone_t buf_zone;
+uma_zone_t __read_mostly buf_zone;
 
 static int
 sysctl_runningspace(SYSCTL_HANDLER_ARGS)
@@ -727,7 +727,8 @@ bufspace_wait(struct bufdomain *bd, struct vnode *vp, int gbflags,
 	BD_LOCK(bd);
 	while (bd->bd_wanted) {
 		if (vp != NULL && vp->v_type != VCHR &&
-		    (td->td_pflags & TDP_BUFNEED) == 0) {
+		    (td->td_pflags & TDP_BUFNEED) == 0 &&
+		    vp->v_bufobj.bo_dirty.bv_cnt > 0) {
 			BD_UNLOCK(bd);
 			/*
 			 * getblk() is called with a vnode locked, and
@@ -2052,22 +2053,26 @@ bq_insert(struct bufqueue *bq, struct buf *bp, bool unlock)
 	bp->b_qindex = bq->bq_index;
 	bp->b_subqueue = bq->bq_subqueue;
 
-	/*
-	 * Unlock before we notify so that we don't wakeup a waiter that
-	 * fails a trylock on the buf and sleeps again.
-	 */
-	if (unlock)
-		BUF_UNLOCK(bp);
-
 	if (bp->b_qindex == QUEUE_CLEAN) {
 		/*
 		 * Flush the per-cpu queue and notify any waiters.
+		 *
+		 * Unlock before we notify so that we don't wakeup a waiter
+		 * that fails a trylock on the buf and sleeps again.
 		 */
 		if (bd->bd_wanted || (bq != bd->bd_cleanq &&
-		    bq->bq_len >= bd->bd_lim))
+		    bq->bq_len >= bd->bd_lim)) {
+			if (unlock) {
+				BUF_UNLOCK(bp);
+				unlock = false;
+			}
 			bd_flush(bd, bq);
+		}
 	}
 	BQ_UNLOCK(bq);
+
+	if (unlock)
+		BUF_UNLOCK(bp);
 }
 
 /*

@@ -146,12 +146,14 @@
 #include <vm/uma.h>
 
 #include <machine/asan.h>
+#include <machine/cpu.h>
 #include <machine/cpu_feat.h>
 #include <machine/elf.h>
 #include <machine/ifunc.h>
 #include <machine/machdep.h>
 #include <machine/md_var.h>
 #include <machine/pcb.h>
+#include <machine/rsi.h>
 
 #ifdef NUMA
 #define	PMAP_MEMDOM	MAXMEMDOM
@@ -204,6 +206,8 @@ struct pmap_large_md_page {
 __exclusive_cache_line static struct pmap_large_md_page pv_dummy_large;
 #define pv_dummy pv_dummy_large.pv_page
 __read_mostly static struct pmap_large_md_page *pv_table;
+
+__read_mostly uint64_t prot_ns_shared_pa;
 
 static struct pmap_large_md_page *
 _pa_to_pmdp(vm_paddr_t pa)
@@ -355,6 +359,7 @@ struct pv_chunks_list __exclusive_cache_line pv_chunks[PMAP_MEMDOM];
 vm_paddr_t dmap_phys_base;	/* The start of the dmap region */
 vm_paddr_t dmap_phys_max;	/* The limit of the dmap region */
 vm_offset_t dmap_max_addr;	/* The virtual address limit of the dmap */
+static int dmap_attr = VM_MEMATTR_WRITE_BACK;
 
 extern pt_entry_t pagetable_l0_ttbr1[];
 
@@ -480,7 +485,7 @@ static void pmap_abort_ptp(pmap_t pmap, vm_offset_t va, vm_page_t mpte);
 static bool pmap_activate_int(struct thread *td, pmap_t pmap);
 static void pmap_alloc_asid(pmap_t pmap);
 static int pmap_change_props_locked(void *addr, vm_size_t size,
-    vm_prot_t prot, int mode, bool skip_unmapped);
+    vm_prot_t prot, int mode, int old_mode, bool skip_unmapped);
 static bool pmap_copy_l3c(pmap_t pmap, pt_entry_t *l3p, vm_offset_t va,
     pt_entry_t l3e, vm_page_t ml3, struct rwlock **lockp);
 static pt_entry_t *pmap_demote_l1(pmap_t pmap, pt_entry_t *l1, vm_offset_t va);
@@ -536,6 +541,9 @@ static void bti_free_range(void *ctx, void *node);
 static int pmap_bti_copy(pmap_t dst_pmap, pmap_t src_pmap);
 static void pmap_bti_deassign_all(pmap_t pmap);
 static void pagezero(void *);
+
+static void pmap_set_protected(pt_entry_t old_l3);
+static void pmap_set_unprotected(pt_entry_t new_l3);
 
 /*
  * These load the old table data and store the new value.
@@ -1580,6 +1588,7 @@ pmap_page_init(vm_page_t m)
 
 	TAILQ_INIT(&m->md.pv_list);
 	m->md.pv_memattr = VM_MEMATTR_WRITE_BACK;
+	m->md.pv_flags = 0;
 }
 
 static void
@@ -2378,6 +2387,11 @@ pmap_kenter(vm_offset_t sva, vm_size_t size, vm_paddr_t pa, int mode)
 	    ("pmap_kenter: Invalid virtual address"));
 	KASSERT((size & PAGE_MASK) == 0,
 	    ("pmap_kenter: Mapping is not page-sized"));
+
+	/* CCA - Map devices as nonsecure */
+	if (in_realm() && (mode == VM_MEMATTR_DEVICE ||
+	    mode == VM_MEMATTR_DEVICE_NP))
+		pa |= prot_ns_shared_pa;
 
 	attr = ATTR_AF | pmap_sh_attr | ATTR_S1_AP(ATTR_S1_AP_RW) |
 	    ATTR_S1_XN | ATTR_KERN_GP | ATTR_S1_IDX(mode);
@@ -4222,6 +4236,9 @@ pmap_remove_l3_range(pmap_t pmap, pd_entry_t l2e, vm_offset_t sva,
 		if ((old_l3 & ATTR_SW_WIRED) != 0)
 			pmap->pm_stats.wired_count--;
 		pmap_resident_count_dec(pmap, 1);
+		/* Below will only be true in a realm environment. */
+		if (PTE_TO_PHYS(old_l3) & prot_ns_shared_pa)
+			pmap_set_protected(old_l3);
 		if ((old_l3 & ATTR_SW_MANAGED) != 0) {
 			m = PTE_TO_VM_PAGE(old_l3);
 			if (pmap_pte_dirty(pmap, old_l3))
@@ -5374,6 +5391,28 @@ restart:
 	return (KERN_SUCCESS);
 }
 
+static void
+pmap_set_unprotected(pt_entry_t new_l3)
+{
+	vm_paddr_t pa;
+
+	pa = PTE_TO_PHYS(new_l3) & ~prot_ns_shared_pa;
+
+	rsi_set_addr_range_state(pa, pa + L3_SIZE, RSI_RIPAS_EMPTY,
+	    RSI_CHANGE_DESTROYED, NULL);
+}
+
+static void
+pmap_set_protected(pt_entry_t old_l3)
+{
+	vm_paddr_t pa;
+
+	pa = PTE_TO_PHYS(old_l3) & ~prot_ns_shared_pa;
+
+	rsi_set_addr_range_state(pa, pa + L3_SIZE, RSI_RIPAS_RAM,
+	    RSI_CHANGE_DESTROYED, NULL);
+}
+
 /*
  *	Insert the given physical page (p) at
  *	the specified virtual address (v) in the
@@ -5407,6 +5446,8 @@ pmap_enter(pmap_t pmap, vm_offset_t va, vm_page_t m, vm_prot_t prot,
 	if ((m->oflags & VPO_UNMANAGED) == 0)
 		VM_PAGE_OBJECT_BUSY_ASSERT(m);
 	pa = VM_PAGE_TO_PHYS(m);
+	if (in_realm() && (flags & PMAP_ENTER_UNPROTECTED) != 0)
+		pa |= prot_ns_shared_pa;
 	new_l3 = (pt_entry_t)(PHYS_TO_PTE(pa) | ATTR_AF | pmap_sh_attr |
 	    L3_PAGE);
 	new_l3 |= pmap_pte_memattr(pmap, m->md.pv_memattr);
@@ -5726,6 +5767,10 @@ validate:
 #endif
 
 	rv = KERN_SUCCESS;
+
+	if (in_realm() && (flags & PMAP_ENTER_UNPROTECTED) != 0)
+		pmap_set_unprotected(new_l3);
+
 out:
 	if (lock != NULL)
 		rw_wunlock(lock);
@@ -6878,6 +6923,7 @@ pmap_zero_page(vm_page_t m)
 	void *va = VM_PAGE_TO_DMAP(m);
 
 	pagezero(va);
+	m->md.pv_flags &= ~PV_MTE_TAGGED;
 }
 
 /*
@@ -6909,6 +6955,15 @@ pmap_copy_page(vm_page_t msrc, vm_page_t mdst)
 	void *src = VM_PAGE_TO_DMAP(msrc);
 	void *dst = VM_PAGE_TO_DMAP(mdst);
 
+	/*
+	 * On a page copy, check whether the src page is tagged. If it is,
+	 * we must copy the tags before copying the contents of the page.
+	 */
+	if ((msrc->md.pv_flags & PV_MTE_TAGGED) != 0)
+		mte_copy_tags(msrc, mdst, src, dst);
+	else
+		mdst->md.pv_flags &= ~PV_MTE_TAGGED;
+
 	pagecopy(src, dst);
 }
 
@@ -6925,6 +6980,9 @@ pmap_copy_pages(vm_page_t ma[], vm_offset_t a_offset, vm_page_t mb[],
 	int cnt;
 
 	while (xfersize > 0) {
+		KASSERT(ADDR_IS_CANONICAL(a_offset),
+		    ("%s: Address not in canonical form: %lx", __func__, a_offset));
+
 		a_pg_offset = a_offset & PAGE_MASK;
 		m_a = ma[a_offset >> PAGE_SHIFT];
 		p_a = m_a->phys_addr;
@@ -8119,7 +8177,7 @@ pmap_unmapbios(void *p, vm_size_t size)
 		/* Ensure the attributes are as expected for the DMAP region */
 		PMAP_LOCK(kernel_pmap);
 		error = pmap_change_props_locked(va, size,
-		    PROT_READ | PROT_WRITE, VM_MEMATTR_DEFAULT, false);
+		    PROT_READ | PROT_WRITE, VM_MEMATTR_DEFAULT, -1, false);
 		PMAP_UNLOCK(kernel_pmap);
 		KASSERT(error == 0, ("%s: Failed to reset DMAP attributes: %d",
 		    __func__, error));
@@ -8225,7 +8283,25 @@ pmap_change_attr(void *va, vm_size_t size, int mode)
 	int error;
 
 	PMAP_LOCK(kernel_pmap);
-	error = pmap_change_props_locked(va, size, PROT_NONE, mode, false);
+	error = pmap_change_props_locked(va, size, PROT_NONE, mode, -1, false);
+	PMAP_UNLOCK(kernel_pmap);
+	return (error);
+}
+
+int
+pmap_change_dmap_attr(int mode)
+{
+	int error;
+
+	KASSERT(mode == VM_MEMATTR_WRITE_BACK ||
+	    mode == VM_MEMATTR_TAGGED,
+	    ("%s: mode %d must be compatible with write-back", __func__, mode));
+
+	PMAP_LOCK(kernel_pmap);
+	error = pmap_change_props_locked((void *)DMAP_MIN_ADDRESS,
+	    dmap_max_addr - DMAP_MIN_ADDRESS, PROT_NONE, mode, dmap_attr, true);
+	if (error == 0)
+		dmap_attr = mode;
 	PMAP_UNLOCK(kernel_pmap);
 	return (error);
 }
@@ -8247,20 +8323,20 @@ pmap_change_prot(void *va, vm_size_t size, vm_prot_t prot)
 		return (EINVAL);
 
 	PMAP_LOCK(kernel_pmap);
-	error = pmap_change_props_locked(va, size, prot, -1, false);
+	error = pmap_change_props_locked(va, size, prot, -1, -1, false);
 	PMAP_UNLOCK(kernel_pmap);
 	return (error);
 }
 
 static int
 pmap_change_props_locked(void *addr, vm_size_t size, vm_prot_t prot,
-    int mode, bool skip_unmapped)
+    int mode, int old_mode, bool skip_unmapped)
 {
 	vm_offset_t base, offset, tmpva, va;
 	vm_size_t pte_size;
 	vm_paddr_t pa;
 	pt_entry_t pte, *ptep, *newpte;
-	pt_entry_t bits, mask;
+	pt_entry_t bits, mask, old_mode_bits, old_mode_mask;
 	char *tmpptep;
 	int lvl, rv;
 
@@ -8274,8 +8350,8 @@ pmap_change_props_locked(void *addr, vm_size_t size, vm_prot_t prot,
 	    !(base >= VM_MIN_KERNEL_ADDRESS && base < VM_MAX_KERNEL_ADDRESS))
 		return (EINVAL);
 
-	bits = 0;
-	mask = 0;
+	bits = old_mode_bits = 0;
+	mask = old_mode_mask = 0;
 	if (mode != -1) {
 		bits = ATTR_S1_IDX(mode);
 		mask = ATTR_S1_IDX_MASK;
@@ -8283,6 +8359,10 @@ pmap_change_props_locked(void *addr, vm_size_t size, vm_prot_t prot,
 			mask |= ATTR_S1_XN;
 			bits |= ATTR_S1_XN;
 		}
+	}
+	if (old_mode != -1) {
+		old_mode_bits = ATTR_S1_IDX(old_mode);
+		old_mode_mask = ATTR_S1_IDX_MASK;
 	}
 	if (prot != VM_PROT_NONE) {
 		/* Don't mark the DMAP as executable. It never is on arm64. */
@@ -8311,11 +8391,14 @@ pmap_change_props_locked(void *addr, vm_size_t size, vm_prot_t prot,
 		if (ptep == NULL && !skip_unmapped) {
 			return (EINVAL);
 		} else if ((ptep == NULL && skip_unmapped) ||
-		    (pmap_load(ptep) & mask) == bits) {
+		    (pmap_load(ptep) & mask) == bits ||
+		    (pmap_load(ptep) & old_mode_mask) != old_mode_bits) {
 			/*
-			 * We already have the correct attribute or there
-			 * is no memory mapped at this address and we are
-			 * skipping unmapped memory.
+			 * We already have one of the following meaning
+			 * we can skip this memory region::
+			 *  - No memory mapped at this address
+			 *  - The new attributes are already set
+			 *  - The expected attributes are incorrect
 			 */
 			switch (lvl) {
 			default:
@@ -8445,12 +8528,24 @@ pmap_change_props_locked(void *addr, vm_size_t size, vm_prot_t prot,
 
 			pa = PTE_TO_PHYS(pte);
 			if (!VIRT_IN_DMAP(tmpva) && PHYS_IN_DMAP(pa)) {
+				int dmap_mode;
+
+				/*
+				 * When booting on HW with MTE enabled we may
+				 * need to swap to a tagged type for the DMAP
+				 * to allow tags to be set through it.
+				 */
+				if (mode == VM_MEMATTR_WRITE_BACK)
+					dmap_mode = dmap_attr;
+				else
+					dmap_mode = mode;
+
 				/*
 				 * Keep the DMAP memory in sync.
 				 */
 				rv = pmap_change_props_locked(
 				    PHYS_TO_DMAP(pa), pte_size,
-				    prot, mode, true);
+				    prot, dmap_mode, old_mode, true);
 				if (rv != 0)
 					return (rv);
 			}

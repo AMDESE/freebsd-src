@@ -1792,6 +1792,7 @@ product DLINK DWA182C1		0x3315	DWA-182 rev C1
 product DLINK DWA180A1		0x3316	DWA-180 rev A1
 product DLINK DWA172A1		0x3318	DWA-172 rev A1
 product DLINK DWA131E1		0x3319	DWA-131 rev E1
+product DLINK DWA121B1		0x331b	DWA-121 rev B1
 product DLINK DWA182D1		0x331c	DWA-182 rev D1
 product DLINK DWA181A1		0x331e	DWA-181 rev A1
 product DLINK DWL122		0x3700	DWL-122
@@ -4807,6 +4808,8 @@ product TELEX MIC1		0x0001	Enhanced USB Microphone
 /* Telit products */
 product TELIT UC864E		0x1003	UC864E 3G modem
 product TELIT UC864G		0x1004	UC864G 3G modem
+product TELIT LM960		0x1040	LM960A18 LTE modem (RNDIS)
+product TELIT LM960_ECM		0x1042	LM960A18 LTE modem (ECM)
 
 /* Ten X Technology, Inc. */
 product TENX UAUDIO0		0xf211	USB audio headset
@@ -4860,6 +4863,7 @@ product TPLINK T2UV3		0x011f	Archer T2U ver 3
 product TPLINK T2UPLUS		0x0120	Archer T2U Plus
 product TPLINK RTL8153		0x0601	RTL8153 USB 10/100/1000 LAN
 product TPLINK RTL8153_2	0x0602	RTL8153 USB 10/100/1000 LAN
+product TPLINK UB500		0x0604	UB500 RTL8761BUV Bluetooth
 
 /* Trek Technology products */
 product TREK THUMBDRIVE		0x1111	ThumbDrive

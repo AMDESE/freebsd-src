@@ -487,7 +487,7 @@ struct conf {
 	bool add_port(struct target *target, struct portal_group *pg,
 	    uint32_t ctl_port);
 	bool add_port(struct target *target, struct pport *pp);
-	bool add_port(struct kports &kports, struct target *target, int pp,
+	bool add_port(struct target *target, const std::string &pname, int pp,
 	    int vp);
 	bool add_pports(struct kports &kports);
 
@@ -508,14 +508,12 @@ struct conf {
 	void set_timeout(int timeout);
 
 	bool add_isns(const char *addr);
-	void isns_register_targets(struct isns *isns, struct conf *oldconf);
-	void isns_deregister_targets(struct isns *isns);
-	void isns_schedule_update();
 	void isns_update();
 
 	int apply(struct conf *oldconf);
 	void delete_target_luns(struct lun *lun);
 	bool reuse_portal_group_socket(struct portal &newp);
+	void shutdown();
 	bool verify();
 
 private:
@@ -523,6 +521,9 @@ private:
 	struct isns_req isns_check_request(const char *hostname);
 	struct isns_req isns_deregister_request(const char *hostname);
 	void isns_check(struct isns *isns);
+	void isns_deregister_targets(struct isns *isns);
+	void isns_register_targets(struct isns *isns, struct conf *oldconf);
+	void isns_schedule_update();
 
 	std::string			conf_pidfile_path;
 	std::unordered_map<std::string, std::unique_ptr<lun>> conf_luns;
@@ -566,13 +567,9 @@ struct pport {
 	const char *name() const { return pp_name.c_str(); }
 	uint32_t ctl_port() const { return pp_ctl_port; }
 
-	bool linked() const { return pp_linked; }
-	void link() { pp_linked = true; }
-
 private:
 	std::string			pp_name;
 	uint32_t			pp_ctl_port;
-	bool				pp_linked = false;
 };
 
 struct kports {

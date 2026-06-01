@@ -54,10 +54,10 @@ struct dsp_cdevpriv {
 	struct pcm_channel *wrch;
 };
 
-static int dsp_mmap_allow_prot_exec = 0;
+static int dsp_mmap_allow_prot_exec = -1;
 SYSCTL_INT(_hw_snd, OID_AUTO, compat_linux_mmap, CTLFLAG_RWTUN,
     &dsp_mmap_allow_prot_exec, 0,
-    "linux mmap compatibility (-1=force disable 0=auto 1=force enable)");
+    "linux mmap compatibility (-1=force-disable 0=auto)");
 
 static int dsp_basename_clone = 1;
 SYSCTL_INT(_hw_snd, OID_AUTO, basename_clone, CTLFLAG_RWTUN,
@@ -728,8 +728,7 @@ dsp_ioctl(struct cdev *i_dev, u_long cmd, caddr_t arg, int mode,
 
 		if (d->mixer_dev != NULL) {
 			PCM_ACQUIRE_QUICK(d);
-			ret = mixer_ioctl_cmd(d->mixer_dev, cmd, arg, -1, td,
-			    MIXER_CMD_DIRECT);
+			ret = mixer_ioctl_cmd(d->mixer_dev, cmd, arg, -1, td);
 			PCM_RELEASE_QUICK(d);
 		} else
 			ret = EBADF;
@@ -1526,8 +1525,7 @@ dsp_ioctl(struct cdev *i_dev, u_long cmd, caddr_t arg, int mode,
 
 		if (d->mixer_dev != NULL) {
 			PCM_ACQUIRE_QUICK(d);
-			ret = mixer_ioctl_cmd(d->mixer_dev, xcmd, arg, -1, td,
-			    MIXER_CMD_DIRECT);
+			ret = mixer_ioctl_cmd(d->mixer_dev, xcmd, arg, -1, td);
 			PCM_RELEASE_QUICK(d);
 		} else
 			ret = ENOTSUP;
@@ -1539,8 +1537,7 @@ dsp_ioctl(struct cdev *i_dev, u_long cmd, caddr_t arg, int mode,
 	case SNDCTL_DSP_SET_RECSRC:
 		if (d->mixer_dev != NULL) {
 			PCM_ACQUIRE_QUICK(d);
-			ret = mixer_ioctl_cmd(d->mixer_dev, cmd, arg, -1, td,
-			    MIXER_CMD_DIRECT);
+			ret = mixer_ioctl_cmd(d->mixer_dev, cmd, arg, -1, td);
 			PCM_RELEASE_QUICK(d);
 		} else
 			ret = ENOTSUP;
@@ -1877,23 +1874,24 @@ dsp_poll(struct cdev *i_dev, int events, struct thread *td)
 
 	ret = 0;
 
-	dsp_lock_chans(priv, FREAD | FWRITE);
 	wrch = priv->wrch;
 	rdch = priv->rdch;
 
 	if (wrch != NULL && !(wrch->flags & CHN_F_DEAD)) {
+		CHN_LOCK(wrch);
 		e = (events & (POLLOUT | POLLWRNORM));
 		if (e)
 			ret |= chn_poll(wrch, e, td);
+		CHN_UNLOCK(wrch);
 	}
 
 	if (rdch != NULL && !(rdch->flags & CHN_F_DEAD)) {
+		CHN_LOCK(rdch);
 		e = (events & (POLLIN | POLLRDNORM));
 		if (e)
 			ret |= chn_poll(rdch, e, td);
+		CHN_UNLOCK(rdch);
 	}
-
-	dsp_unlock_chans(priv, FREAD | FWRITE);
 
 	PCM_GIANT_LEAVE(d);
 
@@ -1923,20 +1921,11 @@ dsp_mmap_single(struct cdev *i_dev, vm_ooffset_t *offset,
 	int err;
 
 	/*
-	 * Reject PROT_EXEC by default. It just doesn't makes sense.
-	 * Unfortunately, we have to give up this one due to linux_mmap
-	 * changes.
-	 *
 	 * https://lists.freebsd.org/pipermail/freebsd-emulation/2007-June/003698.html
-	 *
 	 */
-#ifdef SV_ABI_LINUX
 	if ((nprot & PROT_EXEC) && (dsp_mmap_allow_prot_exec < 0 ||
 	    (dsp_mmap_allow_prot_exec == 0 &&
 	    SV_CURPROC_ABI() != SV_ABI_LINUX)))
-#else
-	if ((nprot & PROT_EXEC) && dsp_mmap_allow_prot_exec < 1)
-#endif
 		return (EINVAL);
 
 	/*

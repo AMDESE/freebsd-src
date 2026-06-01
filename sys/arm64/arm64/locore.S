@@ -128,8 +128,7 @@ virtdone:
 
 	/* Set up the stack */
 	adrp	x25, initstack_end
-	add	x25, x25, :lo12:initstack_end
-	sub	sp, x25, #PCB_SIZE
+	add	sp, x25, :lo12:initstack_end
 
 	/* Zero the BSS */
 	ldr	x15, .Lbss
@@ -799,7 +798,7 @@ common:
 	adrp	x9, socdev_va
 	str	x17, [x9, :lo12:socdev_va]
 
-	mov	x9, #(SOCDEV_PA & ~L2_OFFSET)	/* PA start */
+	ldr	x9, =(SOCDEV_PA)	/* PA start */
 	mov	x10, #1
 	bl	build_l2_block_pagetable
 #endif

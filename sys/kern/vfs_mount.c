@@ -500,7 +500,7 @@ vfs_ref_from_vp(struct vnode *vp)
 	if (__predict_false(mp == NULL)) {
 		return (mp);
 	}
-	if (vfs_op_thread_enter(mp, mpcpu)) {
+	if (vfs_op_thread_enter(mp, &mpcpu)) {
 		if (__predict_true(mp == vp->v_mount)) {
 			vfs_mp_count_add_pcpu(mpcpu, ref, 1);
 			vfs_op_thread_exit(mp, mpcpu);
@@ -527,7 +527,7 @@ vfs_ref(struct mount *mp)
 	struct mount_pcpu *mpcpu;
 
 	CTR2(KTR_VFS, "%s: mp %p", __func__, mp);
-	if (vfs_op_thread_enter(mp, mpcpu)) {
+	if (vfs_op_thread_enter(mp, &mpcpu)) {
 		vfs_mp_count_add_pcpu(mpcpu, ref, 1);
 		vfs_op_thread_exit(mp, mpcpu);
 		return;
@@ -645,7 +645,7 @@ vfs_rel(struct mount *mp)
 	struct mount_pcpu *mpcpu;
 
 	CTR2(KTR_VFS, "%s: mp %p", __func__, mp);
-	if (vfs_op_thread_enter(mp, mpcpu)) {
+	if (vfs_op_thread_enter(mp, &mpcpu)) {
 		vfs_mp_count_sub_pcpu(mpcpu, ref, 1);
 		vfs_op_thread_exit(mp, mpcpu);
 		return;
@@ -1292,7 +1292,8 @@ vfs_domount_first(
 	 * Use vn_lock_pair to avoid establishing an ordering between vnodes
 	 * from different filesystems.
 	 */
-	vn_lock_pair(vp, false, LK_EXCLUSIVE, newdp, false, LK_EXCLUSIVE);
+	error1 = vn_lock_pair(vp, false, LK_EXCLUSIVE, newdp, false,
+	    LK_EXCLUSIVE);
 
 	VI_LOCK(vp);
 	vp->v_iflag &= ~VI_MOUNT;
@@ -1302,7 +1303,10 @@ vfs_domount_first(
 	TAILQ_INSERT_TAIL(&mountlist, mp, mnt_list);
 	mtx_unlock(&mountlist_mtx);
 	vfs_event_signal(NULL, VQ_MOUNT, 0);
-	VOP_UNLOCK(vp);
+	if (error1 == 0)
+		VOP_UNLOCK(vp);
+	else
+		MPASS(error1 == EDEADLK);
 	EVENTHANDLER_DIRECT_INVOKE(vfs_mounted, mp, newdp, td);
 	VOP_UNLOCK(newdp);
 	mount_devctl_event("MOUNT", mp, false);
