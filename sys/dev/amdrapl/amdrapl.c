@@ -156,6 +156,7 @@ amd_rapl_update_delta(struct amd_rapl_value *val, uint64_t cur)
 {
 	sbintime_t now = sbinuptime();
 
+	cur &= UINT32_MAX;	/* hardware energy counter is 32-bit */
 	seqc_write_begin(&val->seqc);
 	if (!val->primed) {
 		val->prev = cur;
@@ -183,7 +184,8 @@ amd_rapl_read_core_energy(void *arg)
 	struct amd_rapl_softc *sc = arg;
 	uint64_t cur;
 
-	rdmsr_safe(MSR_RAPL_CORE_ENERGY_STATUS, &cur);
+	if (rdmsr_safe(MSR_RAPL_CORE_ENERGY_STATUS, &cur) != 0)
+		return;
 	amd_rapl_update_delta(&sc->core_value[curcpu], cur);
 }
 
