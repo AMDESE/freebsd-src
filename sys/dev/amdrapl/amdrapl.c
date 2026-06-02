@@ -112,24 +112,59 @@ amd_rapl_read_package_energy(void *arg)
 	    cur);
 }
 
+/*
+ * Refresh every per-core energy counter. Reading a per-core MSR is inherently
+ * an each-CPU operation, so this broadcasts to all_cpus.
+ *
+ * Callable from both the periodic callout and a sysctl read path. Concurrent
+ * invocations are serialized by smp_rendezvous_cpus()'s internal IPI mutex, so
+ * the per-slot accumulation in amd_rapl_update_delta() never interleaves. Must
+ * NOT be called with sc->mtx held: smp_rendezvous_cpus() cannot run under a
+ * mutex.
+ */
 static void
-amd_rapl_sample(void *arg)
+amd_rapl_sample_cores(struct amd_rapl_softc *sc)
 {
-	struct amd_rapl_softc *sc = arg;
-	int i;
-	cpuset_t package_cpus;
-
-	mtx_unlock(&sc->mtx);
 	smp_rendezvous_cpus(all_cpus, smp_no_rendezvous_barrier,
 	    amd_rapl_read_core_energy, smp_no_rendezvous_barrier, sc);
+}
+
+/*
+ * Refresh each package energy counter from the lead CPU of every domain. Same
+ * serialization and locking constraints as amd_rapl_sample_cores().
+ */
+static void
+amd_rapl_sample_package(struct amd_rapl_softc *sc)
+{
+	cpuset_t package_cpus;
+	int i;
+
 	CPU_ZERO(&package_cpus);
 	for (i = 0; i < vm_ndomains; i++)
 		CPU_SET(i * sc->cpus_per_domain, &package_cpus);
 	smp_rendezvous_cpus(package_cpus, smp_no_rendezvous_barrier,
 	    amd_rapl_read_package_energy, smp_no_rendezvous_barrier, sc);
+}
+
+/*
+ * Periodic overflow-guard sampler. With on-demand sampling in the read path the
+ * cumulative counters no longer depend on this callout for freshness; it exists
+ * to bound the 32-bit hardware counter's wrap during read silence (mirrors the
+ * Linux RAPL overflow timer). Runs without sc->mtx held -- the callout is
+ * CALLOUT_RETURNUNLOCKED and drops the lock before rendezvousing.
+ */
+static void
+amd_rapl_sample(void *arg)
+{
+	struct amd_rapl_softc *sc = arg;
+
+	mtx_unlock(&sc->mtx);
+	amd_rapl_sample_cores(sc);
+	amd_rapl_sample_package(sc);
 	callout_schedule_sbt(&sc->sampling_timer,
 	    SBT_1MS * AMD_RAPL_SAMPLE_UNIT, SBT_1MS, 0);
 }
+
 static int
 sysctl_amd_rapl_display_package(SYSCTL_HANDLER_ARGS)
 {
@@ -171,6 +206,9 @@ sysctl_amd_rapl_display_package_uj(SYSCTL_HANDLER_ARGS)
 	struct amd_rapl_softc *sc = arg1;
 	int err, i;
 
+	/* Sample at read time so the counter is fresh, not up to one timer
+	 * period stale (G3 / Phase 1.4). */
+	amd_rapl_sample_package(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%lu",
 	    amd_rapl_count_ujoules(sc, &sc->package_value[0]));
@@ -189,6 +227,9 @@ sysctl_amd_rapl_display_cores_uj(SYSCTL_HANDLER_ARGS)
 	struct amd_rapl_softc *sc = arg1;
 	int err, i;
 
+	/* Sample at read time so the counter is fresh, not up to one timer
+	 * period stale (G3 / Phase 1.4). */
+	amd_rapl_sample_cores(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%lu",
 	    amd_rapl_count_ujoules(sc, &sc->core_value[0]));
