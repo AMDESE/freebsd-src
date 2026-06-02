@@ -652,8 +652,21 @@ static int
 amd_rapl_resume(device_t dev)
 {
 	struct amd_rapl_softc *sc = device_get_softc(dev);
+	int cpu, i;
 
-	sc->last_read = (uint64_t)sbinuptime();
+	/*
+	 * Re-baseline so the first post-resume sample contributes a zero delta.
+	 * The package powers down across suspend and the energy counters reset,
+	 * so without this the wrap correction in amd_rapl_update_delta() would
+	 * fold a spurious ~2^32 delta spanning the suspended interval into accum
+	 * (R-LIFE-5 / the R-CUM-2 baseline principle). accum itself is preserved,
+	 * so cumulative energy continues rather than resetting.
+	 */
+	CPU_FOREACH(cpu)
+		sc->core_value[cpu].primed = false;
+	for (i = 0; i < sc->npackages; i++)
+		sc->package_value[i].primed = false;
+	atomic_store_rel_64(&sc->last_read, (uint64_t)sbinuptime());
 	mtx_lock(&sc->mtx);
 	sc->dying = false;
 	callout_reset_sbt(&sc->sampling_timer, sc->guard_sbt,
