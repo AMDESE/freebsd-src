@@ -1,3 +1,10 @@
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 Advanced Micro Devices, Inc.
+ *
+ * AMD RAPL energy/power telemetry driver.
+ */
 
 #include <sys/param.h>
 #include <sys/bus.h>
