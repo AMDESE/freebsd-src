@@ -340,10 +340,11 @@ sysctl_amd_rapl_display_package(SYSCTL_HANDLER_ARGS)
 	 * spacing is fine (Phase 2.3). */
 	amd_rapl_note_read_package(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
-	sbuf_printf(sb, "%lu", amd_rapl_count_watt(sc, &sc->package_value[0]));
+	sbuf_printf(sb, "%ju",
+	    (uintmax_t)amd_rapl_count_watt(sc, &sc->package_value[0]));
 	for (i = 1; i < sc->npackages; i++)
-		sbuf_printf(sb, ",%lu",
-		    amd_rapl_count_watt(sc, &sc->package_value[i]));
+		sbuf_printf(sb, ",%ju",
+		    (uintmax_t)amd_rapl_count_watt(sc, &sc->package_value[i]));
 	err = sbuf_finish(sb);
 	sbuf_delete(sb);
 	return (err);
@@ -354,7 +355,8 @@ sysctl_amd_rapl_display_cores(SYSCTL_HANDLER_ARGS)
 {
 	struct sbuf sbs, *sb;
 	struct amd_rapl_softc *sc = arg1;
-	int err, i;
+	bool first = true;
+	int err, cpu;
 
 	/* Sample on read so power reflects the interval since the last read,
 	 * not the (now seconds-long) overflow-guard cadence (G3 / Phase 1.4).
@@ -362,10 +364,11 @@ sysctl_amd_rapl_display_cores(SYSCTL_HANDLER_ARGS)
 	 * spacing is fine (Phase 2.3). */
 	amd_rapl_note_read_cores(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
-	sbuf_printf(sb, "%lu", amd_rapl_count_watt(sc, &sc->core_value[0]));
-	for (i = 1; i < mp_ncpus; ++i)
-		sbuf_printf(sb, ",%lu",
-		    amd_rapl_count_watt(sc, &sc->core_value[i]));
+	CPU_FOREACH(cpu) {
+		sbuf_printf(sb, first ? "%ju" : ",%ju",
+		    (uintmax_t)amd_rapl_count_watt(sc, &sc->core_value[cpu]));
+		first = false;
+	}
 	err = sbuf_finish(sb);
 	sbuf_delete(sb);
 	return (err);
@@ -382,11 +385,11 @@ sysctl_amd_rapl_display_package_uj(SYSCTL_HANDLER_ARGS)
 	 * period stale (G3 / Phase 1.4). */
 	amd_rapl_note_read_package(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
-	sbuf_printf(sb, "%lu",
-	    amd_rapl_count_ujoules(sc, &sc->package_value[0]));
+	sbuf_printf(sb, "%ju",
+	    (uintmax_t)amd_rapl_count_ujoules(sc, &sc->package_value[0]));
 	for (i = 1; i < sc->npackages; i++)
-		sbuf_printf(sb, ",%lu",
-		    amd_rapl_count_ujoules(sc, &sc->package_value[i]));
+		sbuf_printf(sb, ",%ju",
+		    (uintmax_t)amd_rapl_count_ujoules(sc, &sc->package_value[i]));
 	err = sbuf_finish(sb);
 	sbuf_delete(sb);
 	return (err);
@@ -397,17 +400,18 @@ sysctl_amd_rapl_display_cores_uj(SYSCTL_HANDLER_ARGS)
 {
 	struct sbuf sbs, *sb;
 	struct amd_rapl_softc *sc = arg1;
-	int err, i;
+	bool first = true;
+	int err, cpu;
 
 	/* Sample at read time so the counter is fresh, not up to one timer
 	 * period stale (G3 / Phase 1.4). */
 	amd_rapl_note_read_cores(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
-	sbuf_printf(sb, "%lu",
-	    amd_rapl_count_ujoules(sc, &sc->core_value[0]));
-	for (i = 1; i < mp_ncpus; ++i)
-		sbuf_printf(sb, ",%lu",
-		    amd_rapl_count_ujoules(sc, &sc->core_value[i]));
+	CPU_FOREACH(cpu) {
+		sbuf_printf(sb, first ? "%ju" : ",%ju",
+		    (uintmax_t)amd_rapl_count_ujoules(sc, &sc->core_value[cpu]));
+		first = false;
+	}
 	err = sbuf_finish(sb);
 	sbuf_delete(sb);
 	return (err);
