@@ -303,7 +303,7 @@ sysctl_amd_rapl_display_package(SYSCTL_HANDLER_ARGS)
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%lu", amd_rapl_count_watt(sc, &sc->package_value[0]));
 	for (i = 1; i < sc->npackages; i++)
-		sbuf_printf(sb, "%lu",
+		sbuf_printf(sb, ",%lu",
 		    amd_rapl_count_watt(sc, &sc->package_value[i]));
 	err = sbuf_finish(sb);
 	sbuf_delete(sb);
