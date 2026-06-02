@@ -54,6 +54,8 @@
  */
 #define	AMD_RAPL_IDLE_GUARD_MULT	4
 
+static MALLOC_DEFINE(M_AMDRAPL, "amdrapl", "AMD RAPL driver state");
+
 struct amd_rapl_value {
 	seqc_t seqc;		/* serializes the multi-field snapshot read below */
 	uint64_t prev;
@@ -458,7 +460,7 @@ amd_rapl_build_package_map(struct amd_rapl_softc *sc)
 	int *pkg_id_of_slot;
 	int cpu, i, pkg, slot;
 
-	sc->cpu_pkg_slot = malloc(sizeof(int) * mp_ncpus, M_TEMP,
+	sc->cpu_pkg_slot = malloc(sizeof(int) * (mp_maxid + 1), M_AMDRAPL,
 	    M_WAITOK | M_ZERO);
 	pkg_id_of_slot = malloc(sizeof(int) * mp_ncpus, M_TEMP,
 	    M_WAITOK | M_ZERO);
@@ -526,10 +528,10 @@ amd_rapl_attach(device_t dev)
 	sc->dying = false;
 	sc->last_read = (uint64_t)sbinuptime();
 	amd_rapl_build_package_map(sc);
-	sc->core_value = malloc(sizeof(struct amd_rapl_value) * mp_ncpus,
-	    M_TEMP, M_WAITOK | M_ZERO);
+	sc->core_value = malloc(sizeof(struct amd_rapl_value) * (mp_maxid + 1),
+	    M_AMDRAPL, M_WAITOK | M_ZERO);
 	sc->package_value = malloc(sizeof(struct amd_rapl_value) * sc->npackages,
-	    M_TEMP, M_WAITOK | M_ZERO);
+	    M_AMDRAPL, M_WAITOK | M_ZERO);
 	mtx_init(&sc->mtx, AMD_RAPL_DRIVER_NAME, NULL, MTX_DEF | MTX_RECURSE);
 	callout_init_mtx(&sc->sampling_timer, &sc->mtx, CALLOUT_RETURNUNLOCKED);
 	/*
@@ -620,9 +622,9 @@ amd_rapl_detach(device_t dev)
 	mtx_unlock(&sc->mtx);
 	callout_drain(&sc->sampling_timer);
 	mtx_destroy(&sc->mtx);
-	free(sc->cpu_pkg_slot, M_TEMP);
-	free(sc->core_value, M_TEMP);
-	free(sc->package_value, M_TEMP);
+	free(sc->cpu_pkg_slot, M_AMDRAPL);
+	free(sc->core_value, M_AMDRAPL);
+	free(sc->package_value, M_AMDRAPL);
 	return (0);
 }
 
