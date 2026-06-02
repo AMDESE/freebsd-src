@@ -823,6 +823,21 @@ cpu_mp_announce(void)
 }
 
 /*
+ * Return the physical package (socket) id of a logical CPU.
+ *
+ * The package id is the CPU's APIC id with the per-package core/thread bits
+ * shifted out. pkg_id_shift is the bit boundary computed during topology probe,
+ * so on a single-package system every CPU yields 0. Exposed for drivers that
+ * must map per-socket hardware (e.g. AMD RAPL package energy MSRs) onto real
+ * sockets rather than approximating with NUMA domains.
+ */
+int
+cpu_get_pkg_id(int cpu)
+{
+	return (cpu_apic_ids[cpu] >> pkg_id_shift);
+}
+
+/*
  * Add a scheduling group, a group of logical processors sharing
  * a particular cache (and, thus having an affinity), to the scheduling
  * topology.
