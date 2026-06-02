@@ -22,11 +22,25 @@
 #define	MSR_RAPL_PWRUNIT		0xC0010299
 #define	MSR_RAPL_CORE_ENERGY_STATUS	0xC001029A
 #define	MSR_RAPL_PACKAGE_ENERGY_STATUS	0xC001029B
-#define	AMD_RAPL_SAMPLE_UNIT		10
+
+/*
+ * Worst-case package power (watts) used to size the overflow-guard timer. The
+ * 32-bit hardware energy counter must not wrap more than once between guard
+ * samples; a deliberately high value keeps the derived interval conservative
+ * (mirrors Linux's 200W-per-domain assumption in its RAPL overflow timer, but
+ * higher to cover dense server sockets).
+ */
+#define	AMD_RAPL_GUARD_WATT		1000
+
+/* Clamp the derived guard interval to a sane band (milliseconds). */
+#define	AMD_RAPL_GUARD_MIN_MS		10
+#define	AMD_RAPL_GUARD_MAX_MS		60000
 
 struct amd_rapl_value {
 	uint64_t prev;
+	sbintime_t prev_time;
 	volatile uint64_t diff;
+	volatile sbintime_t diff_time;
 	volatile uint64_t accum;
 	bool primed;
 };
@@ -36,6 +50,7 @@ struct amd_rapl_softc {
 	struct mtx mtx;
 	uint32_t energy_unit;
 	uint64_t max_energy_uj;
+	sbintime_t guard_sbt;
 	device_t dev;
 	int npackages;
 	int *cpu_pkg_slot;
@@ -43,12 +58,6 @@ struct amd_rapl_softc {
 	struct amd_rapl_value *core_value;
 	struct amd_rapl_value *package_value;
 };
-
-static uint64_t
-amd_rapl_count_watt(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
-{
-	return ((val->diff) * 100 * 1000 / (1UL << sc->energy_unit));
-}
 
 /*
  * Convert a raw energy-counter value to microjoules.
@@ -75,12 +84,39 @@ amd_rapl_count_ujoules(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 	return (amd_rapl_raw_to_uj(sc, val->accum));
 }
 
+/*
+ * Power = energy / time. We report milliwatts: microjoules divided by
+ * milliseconds is exactly mW (1 uJ/ms = 1 mW), so no extra scaling factor is
+ * needed and the result stays well within a uint64_t.
+ *
+ * diff_time is the wall-clock gap between the two samples that produced diff,
+ * captured in amd_rapl_update_delta(). Deriving the denominator from the
+ * measured interval -- rather than assuming a fixed sample rate -- means the
+ * sampling cadence can change (see the unit-derived guard timer) without
+ * silently corrupting the power figure.
+ */
+static uint64_t
+amd_rapl_count_watt(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
+{
+	uint64_t dt_ms, energy_uj;
+
+	dt_ms = val->diff_time / SBT_1MS;
+	if (dt_ms == 0)
+		return (0);
+	energy_uj = amd_rapl_raw_to_uj(sc, val->diff);
+	return (energy_uj / dt_ms);
+}
+
 static void
 amd_rapl_update_delta(struct amd_rapl_value *val, uint64_t cur)
 {
+	sbintime_t now = sbinuptime();
+
 	if (!val->primed) {
 		val->prev = cur;
+		val->prev_time = now;
 		val->diff = 0;
+		val->diff_time = 0;
 		val->primed = true;
 		return;
 	}
@@ -88,8 +124,10 @@ amd_rapl_update_delta(struct amd_rapl_value *val, uint64_t cur)
 		val->diff = cur - val->prev;
 	else
 		val->diff = (UINT32_MAX - val->prev) + cur + 1;
+	val->diff_time = now - val->prev_time;
 	val->accum += val->diff;
 	val->prev = cur;
+	val->prev_time = now;
 }
 
 static void
@@ -157,8 +195,8 @@ amd_rapl_sample(void *arg)
 	mtx_unlock(&sc->mtx);
 	amd_rapl_sample_cores(sc);
 	amd_rapl_sample_package(sc);
-	callout_schedule_sbt(&sc->sampling_timer,
-	    SBT_1MS * AMD_RAPL_SAMPLE_UNIT, SBT_1MS, 0);
+	callout_schedule_sbt(&sc->sampling_timer, sc->guard_sbt,
+	    sc->guard_sbt / 10, 0);
 }
 
 static int
@@ -168,6 +206,11 @@ sysctl_amd_rapl_display_package(SYSCTL_HANDLER_ARGS)
 	struct amd_rapl_softc *sc = arg1;
 	int err, i;
 
+	/* Sample on read so power reflects the interval since the last read,
+	 * not the (now seconds-long) overflow-guard cadence (G3 / Phase 1.4).
+	 * The watt math divides by the measured interval, so an arbitrary read
+	 * spacing is fine (Phase 2.3). */
+	amd_rapl_sample_package(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%lu", amd_rapl_count_watt(sc, &sc->package_value[0]));
 	for (i = 1; i < sc->npackages; i++)
@@ -185,6 +228,11 @@ sysctl_amd_rapl_display_cores(SYSCTL_HANDLER_ARGS)
 	struct amd_rapl_softc *sc = arg1;
 	int err, i;
 
+	/* Sample on read so power reflects the interval since the last read,
+	 * not the (now seconds-long) overflow-guard cadence (G3 / Phase 1.4).
+	 * The watt math divides by the measured interval, so an arbitrary read
+	 * spacing is fine (Phase 2.3). */
+	amd_rapl_sample_cores(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%lu", amd_rapl_count_watt(sc, &sc->core_value[0]));
 	for (i = 1; i < mp_ncpus; ++i)
@@ -313,6 +361,30 @@ amd_rapl_build_package_map(struct amd_rapl_softc *sc)
 	free(pkg_id_of_slot, M_TEMP);
 }
 
+/*
+ * Derive the overflow-guard sampling interval from the hardware energy unit.
+ *
+ * The 32-bit counter wraps after max_energy_uj microjoules of consumption. At a
+ * worst-case AMD_RAPL_GUARD_WATT load that is max_energy_uj / (P * 1e6) seconds;
+ * we sample at half that so the counter can never double-wrap unseen between
+ * guard ticks. Finer-grained energy units (larger shift) wrap sooner and so get
+ * a proportionally shorter interval. The result is clamped to a sane band: too
+ * short wastes IPIs, too long risks a missed wrap if the worst-case estimate is
+ * exceeded.
+ */
+static sbintime_t
+amd_rapl_guard_sbt(struct amd_rapl_softc *sc)
+{
+	uint64_t guard_ms;
+
+	guard_ms = sc->max_energy_uj / (2000ULL * AMD_RAPL_GUARD_WATT);
+	if (guard_ms < AMD_RAPL_GUARD_MIN_MS)
+		guard_ms = AMD_RAPL_GUARD_MIN_MS;
+	else if (guard_ms > AMD_RAPL_GUARD_MAX_MS)
+		guard_ms = AMD_RAPL_GUARD_MAX_MS;
+	return (guard_ms * SBT_1MS);
+}
+
 static int
 amd_rapl_attach(device_t dev)
 {
@@ -326,6 +398,7 @@ amd_rapl_attach(device_t dev)
 	    0, &value);
 	sc->energy_unit = (value >> 8) & 0x1f;
 	sc->max_energy_uj = amd_rapl_raw_to_uj(sc, UINT32_MAX);
+	sc->guard_sbt = amd_rapl_guard_sbt(sc);
 	amd_rapl_build_package_map(sc);
 	sc->core_value = malloc(sizeof(struct amd_rapl_value) * mp_ncpus,
 	    M_TEMP, M_WAITOK | M_ZERO);
@@ -359,8 +432,8 @@ amd_rapl_attach(device_t dev)
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "max_energy_uj", CTLFLAG_RD, &sc->max_energy_uj, 0,
 	    "Energy in microjoules of the maximum hardware counter value (2^32-1)");
-	callout_reset_sbt(&sc->sampling_timer, SBT_1MS * AMD_RAPL_SAMPLE_UNIT,
-	    SBT_1MS, amd_rapl_sample, sc, 0);
+	callout_reset_sbt(&sc->sampling_timer, sc->guard_sbt, sc->guard_sbt / 10,
+	    amd_rapl_sample, sc, 0);
 	return (0);
 }
 
@@ -394,9 +467,8 @@ amd_rapl_resume(device_t dev)
 	struct amd_rapl_softc *sc = device_get_softc(dev);
 
 	if (callout_deactivate(&sc->sampling_timer)) {
-		callout_reset_sbt(&sc->sampling_timer,
-		    SBT_1MS * AMD_RAPL_SAMPLE_UNIT, SBT_1MS, amd_rapl_sample,
-		    sc, 0);
+		callout_reset_sbt(&sc->sampling_timer, sc->guard_sbt,
+		    sc->guard_sbt / 10, amd_rapl_sample, sc, 0);
 	}
 	return (0);
 }
