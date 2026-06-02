@@ -140,16 +140,6 @@ amd_rapl_read_core_energy(void *arg)
 	amd_rapl_update_delta(&sc->core_value[curcpu], cur);
 }
 
-static void
-amd_rapl_read_package_energy(void *arg)
-{
-	struct amd_rapl_softc *sc = arg;
-	uint64_t cur;
-
-	rdmsr_safe(MSR_RAPL_PACKAGE_ENERGY_STATUS, &cur);
-	amd_rapl_update_delta(&sc->package_value[sc->cpu_pkg_slot[curcpu]], cur);
-}
-
 /*
  * Refresh every per-core energy counter. Reading a per-core MSR is inherently
  * an each-CPU operation, so this broadcasts to all_cpus.
@@ -170,14 +160,32 @@ amd_rapl_sample_cores(struct amd_rapl_softc *sc)
 /*
  * Refresh each package energy counter from one lead CPU per physical package
  * (socket). The AMD package energy MSR is socket-scoped, so sc->package_leads
- * holds exactly one CPU per socket (computed once at attach). Same serialization
- * and locking constraints as amd_rapl_sample_cores().
+ * holds exactly one CPU per socket (computed once at attach).
+ *
+ * Unlike the per-core path, this does not rendezvous: an all-CPU IPI is
+ * unnecessary when only one CPU per socket need be read. Instead the thread is
+ * migrated to each lead in turn (MSR_OP_SCHED_ONE) and reads the MSR there,
+ * avoiding the global smp_ipi_mtx and the interrupt of every targeted CPU.
+ * Because the rendezvous mutex no longer serializes concurrent samplers, the
+ * per-slot accumulation is guarded by sc->mtx -- taken only after the migrating
+ * read returns, never across it. Must NOT be called with sc->mtx already held;
+ * the guard callout drops it first.
  */
 static void
 amd_rapl_sample_package(struct amd_rapl_softc *sc)
 {
-	smp_rendezvous_cpus(sc->package_leads, smp_no_rendezvous_barrier,
-	    amd_rapl_read_package_energy, smp_no_rendezvous_barrier, sc);
+	uint64_t cur;
+	int cpu;
+
+	CPU_FOREACH_ISSET(cpu, &sc->package_leads) {
+		x86_msr_op(MSR_RAPL_PACKAGE_ENERGY_STATUS,
+		    MSR_OP_SCHED_ONE | MSR_OP_READ | MSR_OP_CPUID(cpu),
+		    0, &cur);
+		mtx_lock(&sc->mtx);
+		amd_rapl_update_delta(
+		    &sc->package_value[sc->cpu_pkg_slot[cpu]], cur);
+		mtx_unlock(&sc->mtx);
+	}
 }
 
 /*
