@@ -73,7 +73,6 @@ struct amd_rapl_softc {
 	uint32_t energy_unit;
 	uint64_t max_energy_uj;
 	sbintime_t guard_sbt;
-	sbintime_t idle_sbt;
 	volatile uint64_t last_read;
 	u_int idle_guard_mult;
 	bool force_guard;
@@ -256,6 +255,7 @@ amd_rapl_sample(void *arg)
 {
 	struct amd_rapl_softc *sc = arg;
 	sbintime_t now, last;
+	u_int mult;
 
 	mtx_unlock(&sc->mtx);
 	amd_rapl_sample_cores(sc);
@@ -264,11 +264,20 @@ amd_rapl_sample(void *arg)
 	 * Demand-gate (Phase 3.1): keep firing only while a consumer is actively
 	 * reading. force_guard pins the guard always-on (recovers true-cumulative
 	 * *_energy_uj). Otherwise self-disarm once reads have been quiet for
-	 * idle_sbt; the sysctl read paths re-arm via amd_rapl_arm_guard(). This
-	 * final tick still sampled, so accum/prev are maximally fresh at disarm.
+	 * idle_guard_mult guard periods (computed live below); the sysctl read
+	 * paths re-arm via amd_rapl_arm_guard(). This final tick still sampled, so
+	 * accum/prev are maximally fresh at disarm.
 	 */
 	now = sbinuptime();
 	last = (sbintime_t)atomic_load_acq_64(&sc->last_read);
+	/*
+	 * Derive the idle-disarm threshold live from idle_guard_mult (clamped to
+	 * its floor here, not just at attach) so a runtime write to the tunable
+	 * takes effect on the next decision without a reload (R-TUN-2, R-TUN-3).
+	 */
+	mult = sc->idle_guard_mult;
+	if (mult < 2)
+		mult = 2;
 	/*
 	 * Re-take sc->mtx for the reschedule decision. Checking sc->dying here
 	 * (set under sc->mtx by detach/suspend) is what lets callout_drain win
@@ -278,7 +287,7 @@ amd_rapl_sample(void *arg)
 	 */
 	mtx_lock(&sc->mtx);
 	if (!sc->dying &&
-	    (sc->force_guard || (now - last) < sc->idle_sbt))
+	    (sc->force_guard || (now - last) < (sbintime_t)mult * sc->guard_sbt))
 		callout_reset_sbt(&sc->sampling_timer, sc->guard_sbt,
 		    sc->guard_sbt / 10, amd_rapl_sample, sc, 0);
 	mtx_unlock(&sc->mtx);
@@ -590,7 +599,6 @@ amd_rapl_attach(device_t dev)
 	    "Idle disarm threshold as a multiple of the guard interval (>=2)");
 	if (sc->idle_guard_mult < 2)
 		sc->idle_guard_mult = 2;
-	sc->idle_sbt = sc->idle_guard_mult * sc->guard_sbt;
 	/*
 	 * The OIDs above are already live, so a reader could be arming the guard
 	 * concurrently via amd_rapl_arm_guard(). Honor the callout_init_mtx()
