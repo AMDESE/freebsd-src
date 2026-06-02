@@ -11,11 +11,10 @@
 #include <sys/smp.h>
 #include <sys/sysctl.h>
 
-#include <vm/vm.h>
-
 #include <machine/cputypes.h>
 #include <machine/specialreg.h>
 
+#include <x86/x86_smp.h>
 #include <x86/x86_var.h>
 
 #define	AMD_RAPL_DRIVER_NAME	"amd_rapl"
@@ -38,7 +37,9 @@ struct amd_rapl_softc {
 	uint32_t energy_unit;
 	uint64_t max_energy_uj;
 	device_t dev;
-	uint32_t cpus_per_domain;
+	int npackages;
+	int *cpu_pkg_slot;
+	cpuset_t package_leads;
 	struct amd_rapl_value *core_value;
 	struct amd_rapl_value *package_value;
 };
@@ -108,8 +109,7 @@ amd_rapl_read_package_energy(void *arg)
 	uint64_t cur;
 
 	rdmsr_safe(MSR_RAPL_PACKAGE_ENERGY_STATUS, &cur);
-	amd_rapl_update_delta(&sc->package_value[curcpu / sc->cpus_per_domain],
-	    cur);
+	amd_rapl_update_delta(&sc->package_value[sc->cpu_pkg_slot[curcpu]], cur);
 }
 
 /*
@@ -130,19 +130,15 @@ amd_rapl_sample_cores(struct amd_rapl_softc *sc)
 }
 
 /*
- * Refresh each package energy counter from the lead CPU of every domain. Same
- * serialization and locking constraints as amd_rapl_sample_cores().
+ * Refresh each package energy counter from one lead CPU per physical package
+ * (socket). The AMD package energy MSR is socket-scoped, so sc->package_leads
+ * holds exactly one CPU per socket (computed once at attach). Same serialization
+ * and locking constraints as amd_rapl_sample_cores().
  */
 static void
 amd_rapl_sample_package(struct amd_rapl_softc *sc)
 {
-	cpuset_t package_cpus;
-	int i;
-
-	CPU_ZERO(&package_cpus);
-	for (i = 0; i < vm_ndomains; i++)
-		CPU_SET(i * sc->cpus_per_domain, &package_cpus);
-	smp_rendezvous_cpus(package_cpus, smp_no_rendezvous_barrier,
+	smp_rendezvous_cpus(sc->package_leads, smp_no_rendezvous_barrier,
 	    amd_rapl_read_package_energy, smp_no_rendezvous_barrier, sc);
 }
 
@@ -174,7 +170,7 @@ sysctl_amd_rapl_display_package(SYSCTL_HANDLER_ARGS)
 
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%lu", amd_rapl_count_watt(sc, &sc->package_value[0]));
-	for (i = 1; i < vm_ndomains; i++)
+	for (i = 1; i < sc->npackages; i++)
 		sbuf_printf(sb, "%lu",
 		    amd_rapl_count_watt(sc, &sc->package_value[i]));
 	err = sbuf_finish(sb);
@@ -212,7 +208,7 @@ sysctl_amd_rapl_display_package_uj(SYSCTL_HANDLER_ARGS)
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%lu",
 	    amd_rapl_count_ujoules(sc, &sc->package_value[0]));
-	for (i = 1; i < vm_ndomains; i++)
+	for (i = 1; i < sc->npackages; i++)
 		sbuf_printf(sb, ",%lu",
 		    amd_rapl_count_ujoules(sc, &sc->package_value[i]));
 	err = sbuf_finish(sb);
@@ -274,6 +270,49 @@ amd_rapl_probe(device_t dev)
 	return (0);
 
 }
+
+/*
+ * Build the per-CPU -> dense-package-slot map and the set of lead CPUs (one per
+ * physical package) used to sample the socket-scoped package energy MSR.
+ *
+ * The AMD package energy MSR is per-socket: reading it on any core of a socket
+ * returns the whole socket's energy. We therefore enumerate distinct package
+ * ids via cpu_get_pkg_id(), assign each a dense slot in first-seen order, elect
+ * the first CPU seen in each package as its lead, and index package_value[] by
+ * slot. This tracks real socket topology instead of approximating packages with
+ * NUMA domains, which over-counts under AMD NPS (Nodes-Per-Socket) modes.
+ */
+static void
+amd_rapl_build_package_map(struct amd_rapl_softc *sc)
+{
+	int *pkg_id_of_slot;
+	int cpu, i, pkg, slot;
+
+	sc->cpu_pkg_slot = malloc(sizeof(int) * mp_ncpus, M_TEMP,
+	    M_WAITOK | M_ZERO);
+	pkg_id_of_slot = malloc(sizeof(int) * mp_ncpus, M_TEMP,
+	    M_WAITOK | M_ZERO);
+	CPU_ZERO(&sc->package_leads);
+	sc->npackages = 0;
+	CPU_FOREACH(cpu) {
+		pkg = cpu_get_pkg_id(cpu);
+		slot = -1;
+		for (i = 0; i < sc->npackages; i++) {
+			if (pkg_id_of_slot[i] == pkg) {
+				slot = i;
+				break;
+			}
+		}
+		if (slot == -1) {
+			slot = sc->npackages++;
+			pkg_id_of_slot[slot] = pkg;
+			CPU_SET(cpu, &sc->package_leads);
+		}
+		sc->cpu_pkg_slot[cpu] = slot;
+	}
+	free(pkg_id_of_slot, M_TEMP);
+}
+
 static int
 amd_rapl_attach(device_t dev)
 {
@@ -287,10 +326,10 @@ amd_rapl_attach(device_t dev)
 	    0, &value);
 	sc->energy_unit = (value >> 8) & 0x1f;
 	sc->max_energy_uj = amd_rapl_raw_to_uj(sc, UINT32_MAX);
-	sc->cpus_per_domain = mp_ncpus / vm_ndomains;
+	amd_rapl_build_package_map(sc);
 	sc->core_value = malloc(sizeof(struct amd_rapl_value) * mp_ncpus,
 	    M_TEMP, M_WAITOK | M_ZERO);
-	sc->package_value = malloc(sizeof(struct amd_rapl_value) * vm_ndomains,
+	sc->package_value = malloc(sizeof(struct amd_rapl_value) * sc->npackages,
 	    M_TEMP, M_WAITOK | M_ZERO);
 	mtx_init(&sc->mtx, AMD_RAPL_DRIVER_NAME, NULL, MTX_DEF | MTX_RECURSE);
 	callout_init_mtx(&sc->sampling_timer, &sc->mtx, CALLOUT_RETURNUNLOCKED);
@@ -333,6 +372,7 @@ amd_rapl_detach(device_t dev)
 	if (callout_active(&sc->sampling_timer))
 		callout_drain(&sc->sampling_timer);
 	mtx_destroy(&sc->mtx);
+	free(sc->cpu_pkg_slot, M_TEMP);
 	free(sc->core_value, M_TEMP);
 	free(sc->package_value, M_TEMP);
 	return (0);
