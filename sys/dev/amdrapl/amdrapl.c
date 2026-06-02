@@ -36,6 +36,7 @@ struct amd_rapl_softc {
 	struct callout sampling_timer;
 	struct mtx mtx;
 	uint32_t energy_unit;
+	uint64_t max_energy_uj;
 	device_t dev;
 	uint32_t cpus_per_domain;
 	struct amd_rapl_value *core_value;
@@ -49,23 +50,28 @@ amd_rapl_count_watt(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 }
 
 /*
- * Convert the monotonic raw-count accumulator to microjoules.
+ * Convert a raw energy-counter value to microjoules.
  *
- * The straightforward accum * 1000000 / 2^unit overflows a uint64_t after a
- * few weeks of uptime, so split off the whole-Joule part first: the result is
- * bit-identical to the direct computation but only overflows when the µJ value
- * itself would (millennia away).
+ * The straightforward raw * 1000000 / 2^unit overflows a uint64_t after a few
+ * weeks of accumulated uptime, so split off the whole-Joule part first: the
+ * result is bit-identical to the direct computation but only overflows when
+ * the microjoule value itself would (millennia away).
  */
+static uint64_t
+amd_rapl_raw_to_uj(struct amd_rapl_softc *sc, uint64_t raw)
+{
+	uint64_t unit, whole, frac;
+
+	unit = 1UL << sc->energy_unit;
+	whole = raw / unit;
+	frac = raw % unit;
+	return (whole * 1000000UL + (frac * 1000000UL) / unit);
+}
+
 static uint64_t
 amd_rapl_count_ujoules(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 {
-	uint64_t accum, unit, whole, frac;
-
-	accum = val->accum;
-	unit = 1UL << sc->energy_unit;
-	whole = accum / unit;
-	frac = accum % unit;
-	return (whole * 1000000UL + (frac * 1000000UL) / unit);
+	return (amd_rapl_raw_to_uj(sc, val->accum));
 }
 
 static void
@@ -239,6 +245,7 @@ amd_rapl_attach(device_t dev)
 		MSR_OP_CPUID(cpu_get_pcpu(dev)->pc_cpuid),
 	    0, &value);
 	sc->energy_unit = (value >> 8) & 0x1f;
+	sc->max_energy_uj = amd_rapl_raw_to_uj(sc, UINT32_MAX);
 	sc->cpus_per_domain = mp_ncpus / vm_ndomains;
 	sc->core_value = malloc(sizeof(struct amd_rapl_value) * mp_ncpus,
 	    M_TEMP, M_WAITOK | M_ZERO);
@@ -264,6 +271,14 @@ amd_rapl_attach(device_t dev)
 	    "cores_energy_uj", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
 	    sc, 0, sysctl_amd_rapl_display_cores_uj, "A",
 	    "Cumulative per-core energy in microjoules, comma-separated per core");
+	SYSCTL_ADD_UINT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "energy_unit", CTLFLAG_RD, &sc->energy_unit, 0,
+	    "RAPL energy unit as a power-of-two shift (1 count = 1/2^unit J)");
+	SYSCTL_ADD_U64(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "max_energy_uj", CTLFLAG_RD, &sc->max_energy_uj, 0,
+	    "Energy in microjoules of the maximum hardware counter value (2^32-1)");
 	callout_reset_sbt(&sc->sampling_timer, SBT_1MS * AMD_RAPL_SAMPLE_UNIT,
 	    SBT_1MS, amd_rapl_sample, sc, 0);
 	return (0);

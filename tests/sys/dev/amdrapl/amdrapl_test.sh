@@ -12,6 +12,8 @@
 
 PKG_OID="dev.amd_rapl.0.package_energy_uj"
 CORE_OID="dev.amd_rapl.0.cores_energy_uj"
+UNIT_OID="dev.amd_rapl.0.energy_unit"
+MAX_OID="dev.amd_rapl.0.max_energy_uj"
 
 # Skip the calling test unless the amd_rapl energy sysctls are present.
 require_amdrapl()
@@ -104,10 +106,45 @@ package_power_sane_body()
 	fi
 }
 
+atf_test_case energy_unit_sane
+energy_unit_sane_head()
+{
+	atf_set "descr" "energy_unit is within the architectural field range"
+}
+energy_unit_sane_body()
+{
+	require_amdrapl
+	unit=$(sysctl -n "${UNIT_OID}")
+	# (value >> 8) & 0x1f is a 5-bit field; a zero unit (1 J/count) is bogus.
+	if [ "${unit}" -lt 1 ] || [ "${unit}" -gt 31 ]; then
+		atf_fail "energy_unit out of range: ${unit}"
+	fi
+}
+
+atf_test_case max_energy_consistent
+max_energy_consistent_head()
+{
+	atf_set "descr" "max_energy_uj equals UINT32_MAX scaled by the energy unit"
+}
+max_energy_consistent_body()
+{
+	require_amdrapl
+	unit=$(sysctl -n "${UNIT_OID}")
+	maxuj=$(sysctl -n "${MAX_OID}")
+	# Mirror the kernel: microjoules of the 0xffffffff maximum counter value.
+	expected=$((4294967295 * 1000000 / (1 << unit)))
+	if [ "${maxuj}" -ne "${expected}" ]; then
+		atf_fail "max_energy_uj=${maxuj} but expected ${expected}" \
+		    "for energy_unit=${unit}"
+	fi
+}
+
 atf_init_test_cases()
 {
 	atf_add_test_case package_energy_monotonic
 	atf_add_test_case package_energy_advances
 	atf_add_test_case cores_energy_monotonic
 	atf_add_test_case package_power_sane
+	atf_add_test_case energy_unit_sane
+	atf_add_test_case max_energy_consistent
 }
