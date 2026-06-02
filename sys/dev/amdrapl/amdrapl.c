@@ -209,34 +209,39 @@ amd_rapl_sample_cores(struct amd_rapl_softc *sc)
 }
 
 /*
- * Refresh each package energy counter from one lead CPU per physical package
- * (socket). The AMD package energy MSR is socket-scoped, so sc->package_leads
- * holds exactly one CPU per socket (computed once at attach).
- *
- * Unlike the per-core path, this does not rendezvous: an all-CPU IPI is
- * unnecessary when only one CPU per socket need be read. Instead the thread is
- * migrated to each lead in turn (MSR_OP_SCHED_ONE) and reads the MSR there,
- * avoiding the global smp_ipi_mtx and the interrupt of every targeted CPU.
- * Because the rendezvous mutex no longer serializes concurrent samplers, the
- * per-slot accumulation is guarded by sc->mtx -- taken only after the migrating
- * read returns, never across it. Must NOT be called with sc->mtx already held;
- * the guard callout drops it first.
+ * Read this CPU's socket-scoped package energy MSR and fold it into the package
+ * slot for its physical package. Runs as an smp_rendezvous() action on each
+ * package lead, so the MSR read and the per-slot accumulation happen together on
+ * the lead CPU with preemption disabled -- they can never be reordered against a
+ * concurrent sampler, which is what corrupted the counter when the read was done
+ * outside the lock. curcpu is always a package lead here, so
+ * cpu_pkg_slot[curcpu] selects that lead's slot.
+ */
+static void
+amd_rapl_read_package_energy(void *arg)
+{
+	struct amd_rapl_softc *sc = arg;
+	uint64_t cur;
+
+	if (rdmsr_safe(MSR_RAPL_PACKAGE_ENERGY_STATUS, &cur) != 0)
+		return;
+	amd_rapl_update_delta(&sc->package_value[sc->cpu_pkg_slot[curcpu]], cur);
+}
+
+/*
+ * Refresh every package energy counter. The package MSR is socket-scoped, so we
+ * rendezvous only the package leads (one CPU per socket) -- not all_cpus -- which
+ * touches exactly one CPU per socket and never the others (R-SMP-7, R-NF-2).
+ * Concurrent invocations are serialized by smp_rendezvous_cpus()'s internal IPI
+ * mutex, so the per-slot accumulation never interleaves and no sc->mtx is needed.
+ * Like amd_rapl_sample_cores(), it must NOT be called with sc->mtx held: a
+ * rendezvous cannot run under a mutex.
  */
 static void
 amd_rapl_sample_package(struct amd_rapl_softc *sc)
 {
-	uint64_t cur;
-	int cpu;
-
-	CPU_FOREACH_ISSET(cpu, &sc->package_leads) {
-		x86_msr_op(MSR_RAPL_PACKAGE_ENERGY_STATUS,
-		    MSR_OP_SCHED_ONE | MSR_OP_READ | MSR_OP_CPUID(cpu),
-		    0, &cur);
-		mtx_lock(&sc->mtx);
-		amd_rapl_update_delta(
-		    &sc->package_value[sc->cpu_pkg_slot[cpu]], cur);
-		mtx_unlock(&sc->mtx);
-	}
+	smp_rendezvous_cpus(sc->package_leads, smp_no_rendezvous_barrier,
+	    amd_rapl_read_package_energy, smp_no_rendezvous_barrier, sc);
 }
 
 /*
@@ -311,9 +316,8 @@ amd_rapl_note_read_cores(struct amd_rapl_softc *sc)
 }
 
 /*
- * Per-package read entry point. sample_package() takes sc->mtx per-domain
- * internally; the subsequent arm takes it again (sc->mtx is MTX_RECURSE-safe,
- * and the two acquisitions never nest here anyway).
+ * Per-package read entry point: rendezvous the package leads to sample on
+ * demand, record the read time, then keep the overflow guard armed.
  */
 static void
 amd_rapl_note_read_package(struct amd_rapl_softc *sc)
