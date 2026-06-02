@@ -8,6 +8,7 @@
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/sbuf.h>
+#include <sys/seqc.h>
 #include <sys/smp.h>
 #include <sys/sysctl.h>
 
@@ -47,11 +48,12 @@
 #define	AMD_RAPL_IDLE_GUARD_MULT	4
 
 struct amd_rapl_value {
+	seqc_t seqc;		/* serializes the multi-field snapshot read below */
 	uint64_t prev;
 	sbintime_t prev_time;
-	volatile uint64_t diff;
-	volatile sbintime_t diff_time;
-	volatile uint64_t accum;
+	uint64_t diff;
+	sbintime_t diff_time;
+	uint64_t accum;
 	bool primed;
 };
 
@@ -97,7 +99,14 @@ amd_rapl_raw_to_uj(struct amd_rapl_softc *sc, uint64_t raw)
 static uint64_t
 amd_rapl_count_ujoules(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 {
-	return (amd_rapl_raw_to_uj(sc, val->accum));
+	uint64_t accum;
+	seqc_t s;
+
+	do {
+		s = seqc_read(&val->seqc);
+		accum = val->accum;
+	} while (seqc_consistent(&val->seqc, s) == false);
+	return (amd_rapl_raw_to_uj(sc, accum));
 }
 
 /*
@@ -114,12 +123,24 @@ amd_rapl_count_ujoules(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 static uint64_t
 amd_rapl_count_watt(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 {
-	uint64_t dt_ms, energy_uj;
+	uint64_t dt_ms, energy_uj, diff;
+	sbintime_t dt;
+	seqc_t s;
 
-	dt_ms = val->diff_time / SBT_1MS;
+	/* diff and diff_time must come from the same sample; snapshot both
+	 * under a seqc retry loop so a concurrent writer (the guard callout or
+	 * another reader's on-read sample) cannot pair this read's numerator
+	 * with that write's denominator (Phase 3.3). */
+	do {
+		s = seqc_read(&val->seqc);
+		diff = val->diff;
+		dt = val->diff_time;
+	} while (seqc_consistent(&val->seqc, s) == false);
+
+	dt_ms = dt / SBT_1MS;
 	if (dt_ms == 0)
 		return (0);
-	energy_uj = amd_rapl_raw_to_uj(sc, val->diff);
+	energy_uj = amd_rapl_raw_to_uj(sc, diff);
 	return (energy_uj / dt_ms);
 }
 
@@ -128,12 +149,14 @@ amd_rapl_update_delta(struct amd_rapl_value *val, uint64_t cur)
 {
 	sbintime_t now = sbinuptime();
 
+	seqc_write_begin(&val->seqc);
 	if (!val->primed) {
 		val->prev = cur;
 		val->prev_time = now;
 		val->diff = 0;
 		val->diff_time = 0;
 		val->primed = true;
+		seqc_write_end(&val->seqc);
 		return;
 	}
 	if (cur >= val->prev)
@@ -144,6 +167,7 @@ amd_rapl_update_delta(struct amd_rapl_value *val, uint64_t cur)
 	val->accum += val->diff;
 	val->prev = cur;
 	val->prev_time = now;
+	seqc_write_end(&val->seqc);
 }
 
 static void
