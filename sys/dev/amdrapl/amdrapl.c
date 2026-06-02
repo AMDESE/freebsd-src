@@ -543,13 +543,13 @@ amd_rapl_attach(device_t dev)
 	sc->idle_guard_mult = AMD_RAPL_IDLE_GUARD_MULT;
 	sc->force_guard = false;
 	sc->dying = false;
-	sc->last_read = (uint64_t)sbinuptime();
+	atomic_store_rel_64(&sc->last_read, (uint64_t)sbinuptime());
 	amd_rapl_build_package_map(sc);
 	sc->core_value = malloc(sizeof(struct amd_rapl_value) * (mp_maxid + 1),
 	    M_AMDRAPL, M_WAITOK | M_ZERO);
 	sc->package_value = malloc(sizeof(struct amd_rapl_value) * sc->npackages,
 	    M_AMDRAPL, M_WAITOK | M_ZERO);
-	mtx_init(&sc->mtx, AMD_RAPL_DRIVER_NAME, NULL, MTX_DEF | MTX_RECURSE);
+	mtx_init(&sc->mtx, AMD_RAPL_DRIVER_NAME, NULL, MTX_DEF);
 	callout_init_mtx(&sc->sampling_timer, &sc->mtx, CALLOUT_RETURNUNLOCKED);
 	/*
 	 * Register the sysctls on a private context (not the device's auto ctx,
@@ -561,11 +561,11 @@ amd_rapl_attach(device_t dev)
 	sysctl_ctx_init(&sc->clist);
 	SYSCTL_ADD_PROC(&sc->clist,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
-	    "package_mwatt", CTLTYPE_STRING | CTLFLAG_RDTUN | CTLFLAG_MPSAFE,
+	    "package_mwatt", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
 	    sc, 0, sysctl_amd_rapl_display_package, "A", "");
 	SYSCTL_ADD_PROC(&sc->clist,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
-	    "cores_mwatt", CTLTYPE_STRING | CTLFLAG_RDTUN | CTLFLAG_MPSAFE, sc,
+	    "cores_mwatt", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc,
 	    0, sysctl_amd_rapl_display_cores, "A", "");
 	SYSCTL_ADD_PROC(&sc->clist,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
