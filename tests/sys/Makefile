@@ -12,6 +12,7 @@ TESTS_SUBDIRS+=		capsicum
 TESTS_SUBDIRS+=		${_cddl}
 # XXX: Currently broken in CI
 #TESTS_SUBDIRS+=		compat32
+TESTS_SUBDIRS+=		dev
 TESTS_SUBDIRS+=		devrandom
 TESTS_SUBDIRS+=		fifo
 TESTS_SUBDIRS+=		file

@@ -28,6 +28,7 @@
 struct amd_rapl_value {
 	uint64_t prev;
 	volatile uint64_t diff;
+	volatile uint64_t accum;
 	bool primed;
 };
 
@@ -47,6 +48,26 @@ amd_rapl_count_watt(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 	return ((val->diff) * 100 * 1000 / (1UL << sc->energy_unit));
 }
 
+/*
+ * Convert the monotonic raw-count accumulator to microjoules.
+ *
+ * The straightforward accum * 1000000 / 2^unit overflows a uint64_t after a
+ * few weeks of uptime, so split off the whole-Joule part first: the result is
+ * bit-identical to the direct computation but only overflows when the µJ value
+ * itself would (millennia away).
+ */
+static uint64_t
+amd_rapl_count_ujoules(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
+{
+	uint64_t accum, unit, whole, frac;
+
+	accum = val->accum;
+	unit = 1UL << sc->energy_unit;
+	whole = accum / unit;
+	frac = accum % unit;
+	return (whole * 1000000UL + (frac * 1000000UL) / unit);
+}
+
 static void
 amd_rapl_update_delta(struct amd_rapl_value *val, uint64_t cur)
 {
@@ -60,6 +81,7 @@ amd_rapl_update_delta(struct amd_rapl_value *val, uint64_t cur)
 		val->diff = cur - val->prev;
 	else
 		val->diff = (UINT32_MAX - val->prev) + cur + 1;
+	val->accum += val->diff;
 	val->prev = cur;
 }
 
@@ -136,6 +158,42 @@ sysctl_amd_rapl_display_cores(SYSCTL_HANDLER_ARGS)
 	return (err);
 }
 
+static int
+sysctl_amd_rapl_display_package_uj(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sbs, *sb;
+	struct amd_rapl_softc *sc = arg1;
+	int err, i;
+
+	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
+	sbuf_printf(sb, "%lu",
+	    amd_rapl_count_ujoules(sc, &sc->package_value[0]));
+	for (i = 1; i < vm_ndomains; i++)
+		sbuf_printf(sb, ",%lu",
+		    amd_rapl_count_ujoules(sc, &sc->package_value[i]));
+	err = sbuf_finish(sb);
+	sbuf_delete(sb);
+	return (err);
+}
+
+static int
+sysctl_amd_rapl_display_cores_uj(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sbs, *sb;
+	struct amd_rapl_softc *sc = arg1;
+	int err, i;
+
+	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
+	sbuf_printf(sb, "%lu",
+	    amd_rapl_count_ujoules(sc, &sc->core_value[0]));
+	for (i = 1; i < mp_ncpus; ++i)
+		sbuf_printf(sb, ",%lu",
+		    amd_rapl_count_ujoules(sc, &sc->core_value[i]));
+	err = sbuf_finish(sb);
+	sbuf_delete(sb);
+	return (err);
+}
+
 static void
 amd_rapl_identify(driver_t *driver, device_t parent)
 {
@@ -196,6 +254,16 @@ amd_rapl_attach(device_t dev)
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "cores_mwatt", CTLTYPE_STRING | CTLFLAG_RDTUN | CTLFLAG_MPSAFE, sc,
 	    0, sysctl_amd_rapl_display_cores, "A", "");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "package_energy_uj", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+	    sc, 0, sysctl_amd_rapl_display_package_uj, "A",
+	    "Cumulative package energy in microjoules, comma-separated per domain");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "cores_energy_uj", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+	    sc, 0, sysctl_amd_rapl_display_cores_uj, "A",
+	    "Cumulative per-core energy in microjoules, comma-separated per core");
 	callout_reset_sbt(&sc->sampling_timer, SBT_1MS * AMD_RAPL_SAMPLE_UNIT,
 	    SBT_1MS, amd_rapl_sample, sc, 0);
 	return (0);
