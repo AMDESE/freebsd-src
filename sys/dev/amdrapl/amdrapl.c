@@ -36,6 +36,16 @@
 #define	AMD_RAPL_GUARD_MIN_MS		10
 #define	AMD_RAPL_GUARD_MAX_MS		60000
 
+/*
+ * Idle disarm threshold expressed as a multiple of the guard interval. The
+ * demand-gated guard self-disarms once no consumer has read a sysctl for this
+ * many guard periods. It must stay larger than any plausible slow-poll interval
+ * so an actively-monitored-but-slow consumer does not let the guard lapse
+ * mid-window (which would lose counter wraps). Overridable via the
+ * idle_guard_mult tunable; floor of 2.
+ */
+#define	AMD_RAPL_IDLE_GUARD_MULT	4
+
 struct amd_rapl_value {
 	uint64_t prev;
 	sbintime_t prev_time;
@@ -48,9 +58,15 @@ struct amd_rapl_value {
 struct amd_rapl_softc {
 	struct callout sampling_timer;
 	struct mtx mtx;
+	struct sysctl_ctx_list clist;
 	uint32_t energy_unit;
 	uint64_t max_energy_uj;
 	sbintime_t guard_sbt;
+	sbintime_t idle_sbt;
+	volatile uint64_t last_read;
+	u_int idle_guard_mult;
+	bool force_guard;
+	bool dying;
 	device_t dev;
 	int npackages;
 	int *cpu_pkg_slot;
@@ -199,12 +215,77 @@ static void
 amd_rapl_sample(void *arg)
 {
 	struct amd_rapl_softc *sc = arg;
+	sbintime_t now, last;
 
 	mtx_unlock(&sc->mtx);
 	amd_rapl_sample_cores(sc);
 	amd_rapl_sample_package(sc);
-	callout_schedule_sbt(&sc->sampling_timer, sc->guard_sbt,
-	    sc->guard_sbt / 10, 0);
+	/*
+	 * Demand-gate (Phase 3.1): keep firing only while a consumer is actively
+	 * reading. force_guard pins the guard always-on (recovers true-cumulative
+	 * *_energy_uj). Otherwise self-disarm once reads have been quiet for
+	 * idle_sbt; the sysctl read paths re-arm via amd_rapl_arm_guard(). This
+	 * final tick still sampled, so accum/prev are maximally fresh at disarm.
+	 */
+	now = sbinuptime();
+	last = (sbintime_t)atomic_load_acq_64(&sc->last_read);
+	/*
+	 * Re-take sc->mtx for the reschedule decision. Checking sc->dying here
+	 * (set under sc->mtx by detach/suspend) is what lets callout_drain win
+	 * the teardown race: once dying is set we never re-arm, so the drain sees
+	 * a callout that has truly stopped instead of one that keeps rescheduling
+	 * itself. callout_reset_sbt also wants the associated mtx held.
+	 */
+	mtx_lock(&sc->mtx);
+	if (!sc->dying &&
+	    (sc->force_guard || (now - last) < sc->idle_sbt))
+		callout_reset_sbt(&sc->sampling_timer, sc->guard_sbt,
+		    sc->guard_sbt / 10, amd_rapl_sample, sc, 0);
+	mtx_unlock(&sc->mtx);
+}
+
+/*
+ * Re-arm the demand-gated overflow guard if it is not already pending. Called
+ * from the sysctl read paths after stamping last_read, so that any active
+ * consumer keeps the guard alive even if it had self-disarmed during a quiet
+ * spell. A guard handler currently executing is not "pending", so this still
+ * re-arms it -- closing the lost-wakeup window where the handler is about to
+ * decide to stop while a reader arrives. callout_reset/pending require sc->mtx.
+ */
+static void
+amd_rapl_arm_guard(struct amd_rapl_softc *sc)
+{
+	mtx_lock(&sc->mtx);
+	if (!sc->dying && !callout_pending(&sc->sampling_timer))
+		callout_reset_sbt(&sc->sampling_timer, sc->guard_sbt,
+		    sc->guard_sbt / 10, amd_rapl_sample, sc, 0);
+	mtx_unlock(&sc->mtx);
+}
+
+/*
+ * Per-core read entry point: sample on demand, record the read time, then keep
+ * the guard armed. sample_cores() must run outside sc->mtx (it rendezvouses);
+ * last_read is a plain atomic store, so only the arm step takes the mutex.
+ */
+static void
+amd_rapl_note_read_cores(struct amd_rapl_softc *sc)
+{
+	amd_rapl_sample_cores(sc);
+	atomic_store_rel_64(&sc->last_read, (uint64_t)sbinuptime());
+	amd_rapl_arm_guard(sc);
+}
+
+/*
+ * Per-package read entry point. sample_package() takes sc->mtx per-domain
+ * internally; the subsequent arm takes it again (sc->mtx is MTX_RECURSE-safe,
+ * and the two acquisitions never nest here anyway).
+ */
+static void
+amd_rapl_note_read_package(struct amd_rapl_softc *sc)
+{
+	amd_rapl_sample_package(sc);
+	atomic_store_rel_64(&sc->last_read, (uint64_t)sbinuptime());
+	amd_rapl_arm_guard(sc);
 }
 
 static int
@@ -218,7 +299,7 @@ sysctl_amd_rapl_display_package(SYSCTL_HANDLER_ARGS)
 	 * not the (now seconds-long) overflow-guard cadence (G3 / Phase 1.4).
 	 * The watt math divides by the measured interval, so an arbitrary read
 	 * spacing is fine (Phase 2.3). */
-	amd_rapl_sample_package(sc);
+	amd_rapl_note_read_package(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%lu", amd_rapl_count_watt(sc, &sc->package_value[0]));
 	for (i = 1; i < sc->npackages; i++)
@@ -240,7 +321,7 @@ sysctl_amd_rapl_display_cores(SYSCTL_HANDLER_ARGS)
 	 * not the (now seconds-long) overflow-guard cadence (G3 / Phase 1.4).
 	 * The watt math divides by the measured interval, so an arbitrary read
 	 * spacing is fine (Phase 2.3). */
-	amd_rapl_sample_cores(sc);
+	amd_rapl_note_read_cores(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%lu", amd_rapl_count_watt(sc, &sc->core_value[0]));
 	for (i = 1; i < mp_ncpus; ++i)
@@ -260,7 +341,7 @@ sysctl_amd_rapl_display_package_uj(SYSCTL_HANDLER_ARGS)
 
 	/* Sample at read time so the counter is fresh, not up to one timer
 	 * period stale (G3 / Phase 1.4). */
-	amd_rapl_sample_package(sc);
+	amd_rapl_note_read_package(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%lu",
 	    amd_rapl_count_ujoules(sc, &sc->package_value[0]));
@@ -281,7 +362,7 @@ sysctl_amd_rapl_display_cores_uj(SYSCTL_HANDLER_ARGS)
 
 	/* Sample at read time so the counter is fresh, not up to one timer
 	 * period stale (G3 / Phase 1.4). */
-	amd_rapl_sample_cores(sc);
+	amd_rapl_note_read_cores(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%lu",
 	    amd_rapl_count_ujoules(sc, &sc->core_value[0]));
@@ -407,6 +488,10 @@ amd_rapl_attach(device_t dev)
 	sc->energy_unit = (value >> 8) & 0x1f;
 	sc->max_energy_uj = amd_rapl_raw_to_uj(sc, UINT32_MAX);
 	sc->guard_sbt = amd_rapl_guard_sbt(sc);
+	sc->idle_guard_mult = AMD_RAPL_IDLE_GUARD_MULT;
+	sc->force_guard = false;
+	sc->dying = false;
+	sc->last_read = (uint64_t)sbinuptime();
 	amd_rapl_build_package_map(sc);
 	sc->core_value = malloc(sizeof(struct amd_rapl_value) * mp_ncpus,
 	    M_TEMP, M_WAITOK | M_ZERO);
@@ -414,34 +499,64 @@ amd_rapl_attach(device_t dev)
 	    M_TEMP, M_WAITOK | M_ZERO);
 	mtx_init(&sc->mtx, AMD_RAPL_DRIVER_NAME, NULL, MTX_DEF | MTX_RECURSE);
 	callout_init_mtx(&sc->sampling_timer, &sc->mtx, CALLOUT_RETURNUNLOCKED);
-	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	/*
+	 * Register the sysctls on a private context (not the device's auto ctx,
+	 * which newbus tears down only after detach returns). detach calls
+	 * sysctl_ctx_free(&sc->clist) first, which unregisters the OIDs and drains
+	 * any in-flight handler before we destroy the mutex / free the value
+	 * arrays the handlers dereference.
+	 */
+	sysctl_ctx_init(&sc->clist);
+	SYSCTL_ADD_PROC(&sc->clist,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "package_mwatt", CTLTYPE_STRING | CTLFLAG_RDTUN | CTLFLAG_MPSAFE,
 	    sc, 0, sysctl_amd_rapl_display_package, "A", "");
-	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	SYSCTL_ADD_PROC(&sc->clist,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "cores_mwatt", CTLTYPE_STRING | CTLFLAG_RDTUN | CTLFLAG_MPSAFE, sc,
 	    0, sysctl_amd_rapl_display_cores, "A", "");
-	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	SYSCTL_ADD_PROC(&sc->clist,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "package_energy_uj", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
 	    sc, 0, sysctl_amd_rapl_display_package_uj, "A",
-	    "Cumulative package energy in microjoules, comma-separated per domain");
-	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    "Cumulative package energy in microjoules, comma-separated per domain "
+	    "(cumulative across active-monitoring windows unless force_guard=1)");
+	SYSCTL_ADD_PROC(&sc->clist,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "cores_energy_uj", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
 	    sc, 0, sysctl_amd_rapl_display_cores_uj, "A",
-	    "Cumulative per-core energy in microjoules, comma-separated per core");
-	SYSCTL_ADD_UINT(device_get_sysctl_ctx(dev),
+	    "Cumulative per-core energy in microjoules, comma-separated per core "
+	    "(cumulative across active-monitoring windows unless force_guard=1)");
+	SYSCTL_ADD_UINT(&sc->clist,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "energy_unit", CTLFLAG_RD, &sc->energy_unit, 0,
 	    "RAPL energy unit as a power-of-two shift (1 count = 1/2^unit J)");
-	SYSCTL_ADD_U64(device_get_sysctl_ctx(dev),
+	SYSCTL_ADD_U64(&sc->clist,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "max_energy_uj", CTLFLAG_RD, &sc->max_energy_uj, 0,
 	    "Energy in microjoules of the maximum hardware counter value (2^32-1)");
+	SYSCTL_ADD_BOOL(&sc->clist,
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "force_guard", CTLFLAG_RWTUN, &sc->force_guard, 0,
+	    "Pin the overflow-guard sampler always-on. When 0 (default) the guard "
+	    "self-disarms while no consumer is reading and *_energy_uj counters are "
+	    "cumulative across active-monitoring windows rather than since attach");
+	SYSCTL_ADD_UINT(&sc->clist,
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "idle_guard_mult", CTLFLAG_RWTUN, &sc->idle_guard_mult, 0,
+	    "Idle disarm threshold as a multiple of the guard interval (>=2)");
+	if (sc->idle_guard_mult < 2)
+		sc->idle_guard_mult = 2;
+	sc->idle_sbt = sc->idle_guard_mult * sc->guard_sbt;
+	/*
+	 * The OIDs above are already live, so a reader could be arming the guard
+	 * concurrently via amd_rapl_arm_guard(). Honor the callout_init_mtx()
+	 * contract and arm under sc->mtx so the two callout_reset paths serialize.
+	 */
+	mtx_lock(&sc->mtx);
 	callout_reset_sbt(&sc->sampling_timer, sc->guard_sbt, sc->guard_sbt / 10,
 	    amd_rapl_sample, sc, 0);
+	mtx_unlock(&sc->mtx);
 	return (0);
 }
 
@@ -450,8 +565,27 @@ amd_rapl_detach(device_t dev)
 {
 	struct amd_rapl_softc *sc = device_get_softc(dev);
 
-	if (callout_active(&sc->sampling_timer))
-		callout_drain(&sc->sampling_timer);
+	/*
+	 * Tear-down ordering matters (Phase 3.1):
+	 *
+	 * 1. sysctl_ctx_free() unregisters our OIDs -- so no new sysctl handler
+	 *    can be dispatched -- and then sleeps until every in-flight handler
+	 *    has returned (kern_sysctl.c drains oid_running under SYSCTL_WLOCK).
+	 *    After it returns no reader can touch sc, including the value arrays
+	 *    and sc->mtx. The device's own sysctl ctx would not help here: newbus
+	 *    frees it only after detach returns, i.e. after we have already freed
+	 *    these arrays, which is the use-after-free / destroyed-mutex #GP we
+	 *    hit otherwise.
+	 * 2. sc->dying (set under sc->mtx) stops amd_rapl_sample() from
+	 *    rescheduling itself, so callout_drain() converges instead of chasing
+	 *    a self-rearming callout. A handler that ran during step 1 may have
+	 *    re-armed the guard; that fired-or-pending callout is caught here.
+	 */
+	sysctl_ctx_free(&sc->clist);
+	mtx_lock(&sc->mtx);
+	sc->dying = true;
+	mtx_unlock(&sc->mtx);
+	callout_drain(&sc->sampling_timer);
 	mtx_destroy(&sc->mtx);
 	free(sc->cpu_pkg_slot, M_TEMP);
 	free(sc->core_value, M_TEMP);
@@ -464,8 +598,10 @@ amd_rapl_suspend(device_t dev)
 {
 	struct amd_rapl_softc *sc = device_get_softc(dev);
 
-	if (callout_active(&sc->sampling_timer))
-		callout_drain(&sc->sampling_timer);
+	mtx_lock(&sc->mtx);
+	sc->dying = true;
+	mtx_unlock(&sc->mtx);
+	callout_drain(&sc->sampling_timer);
 	return (0);
 }
 
@@ -474,10 +610,12 @@ amd_rapl_resume(device_t dev)
 {
 	struct amd_rapl_softc *sc = device_get_softc(dev);
 
-	if (callout_deactivate(&sc->sampling_timer)) {
-		callout_reset_sbt(&sc->sampling_timer, sc->guard_sbt,
-		    sc->guard_sbt / 10, amd_rapl_sample, sc, 0);
-	}
+	sc->last_read = (uint64_t)sbinuptime();
+	mtx_lock(&sc->mtx);
+	sc->dying = false;
+	callout_reset_sbt(&sc->sampling_timer, sc->guard_sbt,
+	    sc->guard_sbt / 10, amd_rapl_sample, sc, 0);
+	mtx_unlock(&sc->mtx);
 	return (0);
 }
 
