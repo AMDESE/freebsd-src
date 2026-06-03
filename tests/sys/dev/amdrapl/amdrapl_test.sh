@@ -15,6 +15,9 @@ CORE_OID="dev.amd_rapl.0.cores_energy_uj"
 UNIT_OID="dev.amd_rapl.0.energy_unit"
 MAX_OID="dev.amd_rapl.0.max_energy_uj"
 
+# Loadable-module filename (the driver is amd_rapl(4); its .ko is amdrapl.ko).
+MODNAME="amdrapl"
+
 # Skip the calling test unless the amd_rapl package energy sysctl is present.
 require_amdrapl()
 {
@@ -51,6 +54,23 @@ sum_csv()
 {
 	sysctl -n "$1" | awk -F, '{s = 0; for (i = 1; i <= NF; i++) s += $i; \
 	    printf "%d\n", s}'
+}
+
+# Number of comma-separated fields in a sysctl's value.
+field_count()
+{
+	sysctl -n "$1" | awk -F, '{print NF}'
+}
+
+# Fail the calling test unless every comma-separated field of the named
+# sysctl is exactly 0 or 1.
+require_boolean_list()
+{
+	bad=$(sysctl -n "$1" | awk -F, '{for (i = 1; i <= NF; i++) \
+	    if ($i != 0 && $i != 1) { print $i; exit }}')
+	if [ -n "${bad}" ]; then
+		atf_fail "$1 has a non-boolean field: ${bad}"
+	fi
 }
 
 atf_test_case package_energy_monotonic
@@ -212,6 +232,109 @@ max_energy_consistent_body()
 	fi
 }
 
+atf_test_case package_domain_parity
+package_domain_parity_head()
+{
+	atf_set "descr" "package energy_uj, mwatt, and lapsed lists agree on field count"
+}
+package_domain_parity_body()
+{
+	require_amdrapl
+	# All three package lists are printed from the same per-domain array, so
+	# they must expose the same number of comma-separated fields. A drift
+	# here means one printer walked a different length than the others.
+	nuj=$(field_count "${PKG_OID}")
+	nmw=$(field_count "dev.amd_rapl.0.package_mwatt")
+	nlp=$(field_count "dev.amd_rapl.0.package_energy_lapsed")
+	if [ "${nuj}" -ne "${nmw}" ] || [ "${nuj}" -ne "${nlp}" ]; then
+		atf_fail "package field counts disagree:" \
+		    "energy_uj=${nuj} mwatt=${nmw} lapsed=${nlp}"
+	fi
+}
+
+atf_test_case cores_domain_parity
+cores_domain_parity_head()
+{
+	atf_set "descr" "per-core energy_uj, mwatt, and lapsed lists agree on field count"
+}
+cores_domain_parity_body()
+{
+	require_cores
+	# As with the package domain, the three per-core lists are emitted from a
+	# single backing array and must therefore share a field count.
+	nuj=$(field_count "${CORE_OID}")
+	nmw=$(field_count "dev.amd_rapl.0.cores_mwatt")
+	nlp=$(field_count "dev.amd_rapl.0.cores_energy_lapsed")
+	if [ "${nuj}" -ne "${nmw}" ] || [ "${nuj}" -ne "${nlp}" ]; then
+		atf_fail "per-core field counts disagree:" \
+		    "energy_uj=${nuj} mwatt=${nmw} lapsed=${nlp}"
+	fi
+}
+
+atf_test_case lapsed_is_boolean
+lapsed_is_boolean_head()
+{
+	atf_set "descr" "every *_energy_lapsed field is the 0/1 sticky flag"
+}
+lapsed_is_boolean_body()
+{
+	# The lapsed lists are per-domain sticky flags, so each field must be a
+	# bare 0 or 1. Probe both domains independently; skip cleanly if neither
+	# is present.
+	checked=0
+	if sysctl -n dev.amd_rapl.0.package_energy_lapsed >/dev/null 2>&1; then
+		require_boolean_list dev.amd_rapl.0.package_energy_lapsed
+		checked=1
+	fi
+	if sysctl -n dev.amd_rapl.0.cores_energy_lapsed >/dev/null 2>&1; then
+		require_boolean_list dev.amd_rapl.0.cores_energy_lapsed
+		checked=1
+	fi
+	if [ "${checked}" -eq 0 ]; then
+		atf_skip "no amd_rapl(4) lapsed sysctls present"
+	fi
+}
+
+atf_test_case load_unload_cycle cleanup
+load_unload_cycle_head()
+{
+	atf_set "descr" "kldunload/kldload tears down and rebuilds the sysctl tree without panic"
+	atf_set "require.user" "root"
+}
+load_unload_cycle_body()
+{
+	# energy_unit is registered unconditionally on attach, so it is the
+	# canonical "driver is attached" probe (package/core OIDs are domain-gated).
+	if ! sysctl -n "${UNIT_OID}" >/dev/null 2>&1; then
+		atf_skip "amd_rapl(4) not attached; nothing to cycle"
+	fi
+	# Only a loadable module can be cycled. A driver compiled into the kernel
+	# has no .ko to kldunload, so skip rather than fail on such hosts.
+	if ! kldstat -n "${MODNAME}" >/dev/null 2>&1; then
+		atf_skip "amd_rapl(4) is built into the kernel; cannot kldunload"
+	fi
+	# Teardown is the riskiest path (callout drain, cpuset/sysctl free). A
+	# panic here takes the test host down, which is itself the signal.
+	if ! kldunload "${MODNAME}"; then
+		atf_fail "kldunload ${MODNAME} failed"
+	fi
+	if sysctl -n "${UNIT_OID}" >/dev/null 2>&1; then
+		atf_fail "${UNIT_OID} still present after kldunload"
+	fi
+	if ! kldload "${MODNAME}"; then
+		atf_fail "kldload ${MODNAME} failed to reattach"
+	fi
+	if ! sysctl -n "${UNIT_OID}" >/dev/null 2>&1; then
+		atf_fail "${UNIT_OID} did not reappear after kldload"
+	fi
+}
+load_unload_cycle_cleanup()
+{
+	# Restore the loaded state for later tests regardless of where the body
+	# bailed out. Reloading an already-loaded module is a harmless no-op.
+	kldload "${MODNAME}" >/dev/null 2>&1 || true
+}
+
 atf_init_test_cases()
 {
 	atf_add_test_case package_energy_monotonic
@@ -222,4 +345,8 @@ atf_init_test_cases()
 	atf_add_test_case package_power_sane
 	atf_add_test_case energy_unit_sane
 	atf_add_test_case max_energy_consistent
+	atf_add_test_case package_domain_parity
+	atf_add_test_case cores_domain_parity
+	atf_add_test_case lapsed_is_boolean
+	atf_add_test_case load_unload_cycle
 }
