@@ -838,6 +838,22 @@ cpu_get_pkg_id(int cpu)
 }
 
 /*
+ * Return the physical core id of a logical CPU.
+ *
+ * The core id is the CPU's APIC id with the per-core SMT-thread bits shifted
+ * out. core_id_shift is the bit boundary computed during topology probe, so the
+ * two SMT siblings of one physical core yield the same id while the package bits
+ * above keep it unique across sockets. Exposed for drivers that must map
+ * per-physical-core hardware (e.g. the AMD RAPL per-core energy MSR, which is
+ * shared by both siblings) onto real cores rather than per logical CPU.
+ */
+int
+cpu_get_core_id(int cpu)
+{
+	return (cpu_apic_ids[cpu] >> core_id_shift);
+}
+
+/*
  * Add a scheduling group, a group of logical processors sharing
  * a particular cache (and, thus having an affinity), to the scheduling
  * topology.
