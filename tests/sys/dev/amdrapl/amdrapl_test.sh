@@ -15,12 +15,23 @@ CORE_OID="dev.amd_rapl.0.cores_energy_uj"
 UNIT_OID="dev.amd_rapl.0.energy_unit"
 MAX_OID="dev.amd_rapl.0.max_energy_uj"
 
-# Skip the calling test unless the amd_rapl energy sysctls are present.
+# Skip the calling test unless the amd_rapl package energy sysctl is present.
 require_amdrapl()
 {
 	if ! sysctl -n "${PKG_OID}" >/dev/null 2>&1; then
 		atf_skip "amd_rapl(4) energy sysctls not present" \
 		    "(no AMD RAPL hardware or driver not loaded)"
+	fi
+}
+
+# Skip the calling test unless the per-core energy sysctl is present. The
+# package and per-core domains are probed independently, so a host may export
+# one without the other.
+require_cores()
+{
+	if ! sysctl -n "${CORE_OID}" >/dev/null 2>&1; then
+		atf_skip "amd_rapl(4) per-core energy sysctl not present" \
+		    "(no AMD RAPL hardware, driver not loaded, or core domain absent)"
 	fi
 }
 
@@ -33,6 +44,13 @@ pkg_uj()
 core0_uj()
 {
 	sysctl -n "${CORE_OID}" | cut -d, -f1
+}
+
+# Integer sum of all comma-separated fields of a sysctl's value.
+sum_csv()
+{
+	sysctl -n "$1" | awk -F, '{s = 0; for (i = 1; i <= NF; i++) s += $i; \
+	    printf "%d\n", s}'
 }
 
 atf_test_case package_energy_monotonic
@@ -74,12 +92,67 @@ cores_energy_monotonic_head()
 }
 cores_energy_monotonic_body()
 {
-	require_amdrapl
+	require_cores
 	v1=$(core0_uj)
 	sleep 2
 	v2=$(core0_uj)
 	if [ "${v2}" -lt "${v1}" ]; then
 		atf_fail "cores_energy_uj[0] decreased: ${v1} -> ${v2}"
+	fi
+}
+
+atf_test_case cores_field_count_matches_cores
+cores_field_count_matches_cores_head()
+{
+	atf_set "descr" "per-core energy list has one field per physical core"
+}
+cores_field_count_matches_cores_body()
+{
+	require_cores
+	ncores=$(sysctl -n kern.smp.cores 2>/dev/null)
+	if [ -z "${ncores}" ]; then
+		atf_skip "kern.smp.cores unavailable; cannot check per-core count"
+	fi
+	# One field per physical core. The F1 regression emits one field per
+	# logical CPU, ~2x kern.smp.cores on an SMT-enabled part. kern.smp.cores
+	# (mp_ncores) can itself legitimately undercount the driver's per-core dedup
+	# when a core's primary SMT thread is individually disabled but a sibling
+	# survives, so flag only a near-2x blowup rather than requiring strict
+	# equality.
+	fields=$(sysctl -n "${CORE_OID}" | awk -F, '{print NF}')
+	if [ "${fields}" -lt 1 ] || [ "${fields}" -gt $((ncores + ncores / 2)) ]; then
+		atf_fail "per-core field count ${fields} vs physical cores" \
+		    "${ncores} (SMT double-count would make this ~2x)"
+	fi
+}
+
+atf_test_case cores_sum_within_package
+cores_sum_within_package_head()
+{
+	atf_set "descr" "summed per-core energy delta does not exceed the package delta"
+}
+cores_sum_within_package_body()
+{
+	require_amdrapl
+	require_cores
+	# The core domain is a subset of the package domain, so the summed
+	# per-core energy gained over an interval must not exceed the package
+	# energy gained over the same interval. A per-SMT-sibling double-count of
+	# the core domain can push the core sum past the package total. This bound
+	# is host-independent: it needs no knowledge of the core or socket count.
+	pc1=$(sum_csv "${CORE_OID}")
+	pp1=$(sum_csv "${PKG_OID}")
+	sleep 3
+	pc2=$(sum_csv "${CORE_OID}")
+	pp2=$(sum_csv "${PKG_OID}")
+	dcore=$((pc2 - pc1))
+	dpkg=$((pp2 - pp1))
+	if [ "${dpkg}" -le 0 ]; then
+		atf_skip "no package energy accumulated; cannot bound cores"
+	fi
+	if [ "${dcore}" -gt "${dpkg}" ]; then
+		atf_fail "core energy delta ${dcore} uj exceeds package" \
+		    "${dpkg} uj (an SMT double-count would do this)"
 	fi
 }
 
@@ -144,6 +217,8 @@ atf_init_test_cases()
 	atf_add_test_case package_energy_monotonic
 	atf_add_test_case package_energy_advances
 	atf_add_test_case cores_energy_monotonic
+	atf_add_test_case cores_field_count_matches_cores
+	atf_add_test_case cores_sum_within_package
 	atf_add_test_case package_power_sane
 	atf_add_test_case energy_unit_sane
 	atf_add_test_case max_energy_consistent

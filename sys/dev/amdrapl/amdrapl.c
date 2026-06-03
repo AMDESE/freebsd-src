@@ -64,6 +64,7 @@ struct amd_rapl_value {
 	sbintime_t diff_time;
 	uint64_t accum;
 	bool primed;
+	bool lapsed;		/* a sample gap exceeded one wrap period (see F4) */
 };
 
 struct amd_rapl_softc {
@@ -73,14 +74,20 @@ struct amd_rapl_softc {
 	uint32_t energy_unit;
 	uint64_t max_energy_uj;
 	sbintime_t guard_sbt;
+	sbintime_t lapse_sbt;
 	volatile uint64_t last_read;
 	u_int idle_guard_mult;
 	bool force_guard;
+	bool has_core;
+	bool has_package;
 	bool dying;
 	device_t dev;
 	int npackages;
 	int *cpu_pkg_slot;
 	cpuset_t package_leads;
+	int ncores;
+	int *cpu_core_slot;
+	cpuset_t core_leads;
 	struct amd_rapl_value *core_value;
 	struct amd_rapl_value *package_value;
 };
@@ -153,7 +160,8 @@ amd_rapl_count_watt(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 }
 
 static void
-amd_rapl_update_delta(struct amd_rapl_value *val, uint64_t cur)
+amd_rapl_update_delta(struct amd_rapl_softc *sc, struct amd_rapl_value *val,
+    uint64_t cur)
 {
 	sbintime_t now = sbinuptime();
 
@@ -173,6 +181,16 @@ amd_rapl_update_delta(struct amd_rapl_value *val, uint64_t cur)
 	else
 		val->diff = (UINT32_MAX - val->prev) + cur + 1;
 	val->diff_time = now - val->prev_time;
+	/*
+	 * The wrap correction above recovers exactly one 32-bit wrap. If the
+	 * sample gap exceeds one worst-case wrap period the counter may have
+	 * wrapped more than once unseen (only possible once the demand-gated
+	 * guard has self-disarmed during read silence), so accum -- and the
+	 * cumulative *_energy_uj derived from it -- silently under-counts. Latch
+	 * a sticky flag so that loss is reportable via *_energy_lapsed (F4).
+	 */
+	if (val->diff_time > sc->lapse_sbt)
+		val->lapsed = true;
 	val->accum += val->diff;
 	val->prev = cur;
 	val->prev_time = now;
@@ -187,12 +205,18 @@ amd_rapl_read_core_energy(void *arg)
 
 	if (rdmsr_safe(MSR_RAPL_CORE_ENERGY_STATUS, &cur) != 0)
 		return;
-	amd_rapl_update_delta(&sc->core_value[curcpu], cur);
+	amd_rapl_update_delta(sc, &sc->core_value[sc->cpu_core_slot[curcpu]],
+	    cur);
 }
 
 /*
- * Refresh every per-core energy counter. Reading a per-core MSR is inherently
- * an each-CPU operation, so this broadcasts to all_cpus.
+ * Refresh every per-core energy counter. The AMD per-core energy MSR is shared
+ * by a physical core's SMT siblings (reading it on either thread returns the
+ * same whole-core energy), so we rendezvous only the core leads -- one logical
+ * CPU per physical core -- rather than all_cpus. This reports the core domain
+ * once per physical core, matching Linux's PERF_PMU_SCOPE_CORE, instead of
+ * double-counting the shared counter once per SMT sibling (F1/F2). curcpu is
+ * always a core lead here, so cpu_core_slot[curcpu] selects that lead's slot.
  *
  * Callable from both the periodic callout and a sysctl read path. Concurrent
  * invocations are serialized by smp_rendezvous_cpus()'s internal IPI mutex, so
@@ -203,7 +227,7 @@ amd_rapl_read_core_energy(void *arg)
 static void
 amd_rapl_sample_cores(struct amd_rapl_softc *sc)
 {
-	smp_rendezvous_cpus(all_cpus, smp_no_rendezvous_barrier,
+	smp_rendezvous_cpus(sc->core_leads, smp_no_rendezvous_barrier,
 	    amd_rapl_read_core_energy, smp_no_rendezvous_barrier, sc);
 }
 
@@ -224,7 +248,8 @@ amd_rapl_read_package_energy(void *arg)
 
 	if (rdmsr_safe(MSR_RAPL_PACKAGE_ENERGY_STATUS, &cur) != 0)
 		return;
-	amd_rapl_update_delta(&sc->package_value[sc->cpu_pkg_slot[curcpu]], cur);
+	amd_rapl_update_delta(sc, &sc->package_value[sc->cpu_pkg_slot[curcpu]],
+	    cur);
 }
 
 /*
@@ -258,8 +283,10 @@ amd_rapl_sample(void *arg)
 	u_int mult;
 
 	mtx_unlock(&sc->mtx);
-	amd_rapl_sample_cores(sc);
-	amd_rapl_sample_package(sc);
+	if (sc->has_core)
+		amd_rapl_sample_cores(sc);
+	if (sc->has_package)
+		amd_rapl_sample_package(sc);
 	/*
 	 * Demand-gate (Phase 3.1): keep firing only while a consumer is actively
 	 * reading. force_guard pins the guard always-on (recovers true-cumulative
@@ -364,20 +391,19 @@ sysctl_amd_rapl_display_cores(SYSCTL_HANDLER_ARGS)
 {
 	struct sbuf sbs, *sb;
 	struct amd_rapl_softc *sc = arg1;
-	bool first = true;
-	int err, cpu;
+	int err, i;
 
 	/* Sample on read so power reflects the interval since the last read,
 	 * not the (now seconds-long) overflow-guard cadence (G3 / Phase 1.4).
 	 * The watt math divides by the measured interval, so an arbitrary read
-	 * spacing is fine (Phase 2.3). */
+	 * spacing is fine (Phase 2.3). One field per physical core (F1). */
 	amd_rapl_note_read_cores(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
-	CPU_FOREACH(cpu) {
-		sbuf_printf(sb, first ? "%ju" : ",%ju",
-		    (uintmax_t)amd_rapl_count_watt(sc, &sc->core_value[cpu]));
-		first = false;
-	}
+	sbuf_printf(sb, "%ju",
+	    (uintmax_t)amd_rapl_count_watt(sc, &sc->core_value[0]));
+	for (i = 1; i < sc->ncores; i++)
+		sbuf_printf(sb, ",%ju",
+		    (uintmax_t)amd_rapl_count_watt(sc, &sc->core_value[i]));
 	err = sbuf_finish(sb);
 	sbuf_delete(sb);
 	return (err);
@@ -409,18 +435,57 @@ sysctl_amd_rapl_display_cores_uj(SYSCTL_HANDLER_ARGS)
 {
 	struct sbuf sbs, *sb;
 	struct amd_rapl_softc *sc = arg1;
-	bool first = true;
-	int err, cpu;
+	int err, i;
 
 	/* Sample at read time so the counter is fresh, not up to one timer
-	 * period stale (G3 / Phase 1.4). */
+	 * period stale (G3 / Phase 1.4). One field per physical core (F1). */
 	amd_rapl_note_read_cores(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
-	CPU_FOREACH(cpu) {
-		sbuf_printf(sb, first ? "%ju" : ",%ju",
-		    (uintmax_t)amd_rapl_count_ujoules(sc, &sc->core_value[cpu]));
-		first = false;
-	}
+	sbuf_printf(sb, "%ju",
+	    (uintmax_t)amd_rapl_count_ujoules(sc, &sc->core_value[0]));
+	for (i = 1; i < sc->ncores; i++)
+		sbuf_printf(sb, ",%ju",
+		    (uintmax_t)amd_rapl_count_ujoules(sc, &sc->core_value[i]));
+	err = sbuf_finish(sb);
+	sbuf_delete(sb);
+	return (err);
+}
+
+/*
+ * Report the sticky idle-lapse flag (F4) for each domain as a comma-separated
+ * 0/1 list parallel to *_energy_uj. A 1 means a sample gap once exceeded one
+ * wrap period, so that domain's cumulative *_energy_uj has silently lost at
+ * least one 2^32 wrap and under-reports. This is a status read: it does not
+ * sample or re-arm the guard (the flag only advances on a sample, which the
+ * *_energy_uj read paths already drive), so a bare poll costs no IPIs.
+ */
+static int
+sysctl_amd_rapl_display_package_lapsed(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sbs, *sb;
+	struct amd_rapl_softc *sc = arg1;
+	int err, i;
+
+	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
+	sbuf_printf(sb, "%d", sc->package_value[0].lapsed ? 1 : 0);
+	for (i = 1; i < sc->npackages; i++)
+		sbuf_printf(sb, ",%d", sc->package_value[i].lapsed ? 1 : 0);
+	err = sbuf_finish(sb);
+	sbuf_delete(sb);
+	return (err);
+}
+
+static int
+sysctl_amd_rapl_display_cores_lapsed(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sbs, *sb;
+	struct amd_rapl_softc *sc = arg1;
+	int err, i;
+
+	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
+	sbuf_printf(sb, "%d", sc->core_value[0].lapsed ? 1 : 0);
+	for (i = 1; i < sc->ncores; i++)
+		sbuf_printf(sb, ",%d", sc->core_value[i].lapsed ? 1 : 0);
 	err = sbuf_finish(sb);
 	sbuf_delete(sb);
 	return (err);
@@ -444,7 +509,8 @@ amd_rapl_identify(driver_t *driver, device_t parent)
 static int
 amd_rapl_probe(device_t dev)
 {
-	if (cpu_vendor_id != CPU_VENDOR_AMD)
+	if (cpu_vendor_id != CPU_VENDOR_AMD &&
+	    cpu_vendor_id != CPU_VENDOR_HYGON)
 		return (ENXIO);
 	if (!(amd_pminfo & AMDPM_RAPL))
 		return (ENXIO);
@@ -503,6 +569,64 @@ amd_rapl_build_package_map(struct amd_rapl_softc *sc)
 }
 
 /*
+ * Build the per-CPU -> dense-physical-core-slot map and the set of lead CPUs
+ * (one logical CPU per physical core) used to sample the per-core energy MSR.
+ *
+ * The AMD per-core energy MSR is shared by a physical core's SMT siblings, so --
+ * exactly like the package map above -- we enumerate distinct core ids via
+ * cpu_get_core_id(), assign each a dense slot in first-seen order, elect the
+ * first CPU seen in each core as its lead, and index core_value[] by slot. This
+ * reports the core domain once per physical core instead of once per logical
+ * CPU, which would double-count the shared counter on SMT parts (F1/F2). With
+ * SMT off every CPU is its own core and the map degenerates to one slot per CPU.
+ */
+static void
+amd_rapl_build_core_map(struct amd_rapl_softc *sc)
+{
+	int *core_id_of_slot;
+	int cpu, i, core, slot;
+
+	sc->cpu_core_slot = malloc(sizeof(int) * (mp_maxid + 1), M_AMDRAPL,
+	    M_WAITOK | M_ZERO);
+	core_id_of_slot = malloc(sizeof(int) * mp_ncpus, M_TEMP,
+	    M_WAITOK | M_ZERO);
+	CPU_ZERO(&sc->core_leads);
+	sc->ncores = 0;
+	CPU_FOREACH(cpu) {
+		core = cpu_get_core_id(cpu);
+		slot = -1;
+		for (i = 0; i < sc->ncores; i++) {
+			if (core_id_of_slot[i] == core) {
+				slot = i;
+				break;
+			}
+		}
+		if (slot == -1) {
+			slot = sc->ncores++;
+			core_id_of_slot[slot] = core;
+			CPU_SET(cpu, &sc->core_leads);
+		}
+		sc->cpu_core_slot[cpu] = slot;
+	}
+	free(core_id_of_slot, M_TEMP);
+}
+
+/*
+ * Fault-safe presence probe for a RAPL MSR. Reads the MSR on the given CPU with
+ * MSR_OP_SAFE so a #GP (e.g. a hypervisor that advertises the RAPL feature bit
+ * but does not emulate the MSR) is caught and reported as absent instead of
+ * panicking the host. Mirrors Linux's rdmsrq_safe-based perf_msr_probe (F5/F6).
+ */
+static bool
+amd_rapl_msr_present(u_int msr, u_int cpuid)
+{
+	uint64_t v;
+
+	return (x86_msr_op(msr, MSR_OP_RENDEZVOUS_ONE | MSR_OP_READ |
+	    MSR_OP_SAFE | MSR_OP_CPUID(cpuid), 0, &v) == 0);
+}
+
+/*
  * Derive the overflow-guard sampling interval from the hardware energy unit.
  *
  * The 32-bit counter wraps after max_energy_uj microjoules of consumption. At a
@@ -530,22 +654,63 @@ static int
 amd_rapl_attach(device_t dev)
 {
 	struct amd_rapl_softc *sc = device_get_softc(dev);
+	u_int probe_cpu = cpu_get_pcpu(dev)->pc_cpuid;
 	uint64_t value;
+	int error;
 
 	sc->dev = dev;
-	x86_msr_op(MSR_RAPL_PWRUNIT,
-	    MSR_OP_RENDEZVOUS_ONE | MSR_OP_READ |
-		MSR_OP_CPUID(cpu_get_pcpu(dev)->pc_cpuid),
+	/*
+	 * Read the power-unit MSR fault-safely (F5). A hypervisor can advertise
+	 * the RAPL feature bit (CPUID 0x80000007 EDX[14]) yet not emulate this
+	 * MSR; without MSR_OP_SAFE the rdmsr #GP inside the rendezvous IPI has no
+	 * pcb_onfault and panics the host. Nothing is allocated yet, so a fault is
+	 * a clean ENXIO abort (and only the _SAFE path even sets the return value).
+	 */
+	error = x86_msr_op(MSR_RAPL_PWRUNIT,
+	    MSR_OP_RENDEZVOUS_ONE | MSR_OP_READ | MSR_OP_SAFE |
+		MSR_OP_CPUID(probe_cpu),
 	    0, &value);
+	if (error != 0) {
+		device_printf(dev, "power-unit MSR (0x%x) read faulted: %d\n",
+		    MSR_RAPL_PWRUNIT, error);
+		return (ENXIO);
+	}
 	sc->energy_unit = (value >> 8) & 0x1f;
 	sc->max_energy_uj = amd_rapl_raw_to_uj(sc, UINT32_MAX);
 	sc->guard_sbt = amd_rapl_guard_sbt(sc);
+	/*
+	 * Lapse threshold: one worst-case wrap period at AMD_RAPL_GUARD_WATT, which
+	 * is exactly twice the guard interval (the guard samples at half a wrap
+	 * period). Derive it from the already-clamped guard_sbt rather than recompute
+	 * from the raw unit, so the threshold can never drop below the sampling
+	 * cadence -- otherwise a very fine energy unit, whose guard interval was
+	 * clamped up to AMD_RAPL_GUARD_MIN_MS, would latch val->lapsed on every
+	 * normal sample. update_delta() recovers a single wrap, so a sample gap
+	 * beyond this risks an unrecovered wrap and latches val->lapsed (F4).
+	 */
+	sc->lapse_sbt = 2 * sc->guard_sbt;
 	sc->idle_guard_mult = AMD_RAPL_IDLE_GUARD_MULT;
 	sc->force_guard = false;
 	sc->dying = false;
+	/*
+	 * Probe each energy MSR fault-safely and export only the domains that
+	 * respond (F6): a VM may emulate one domain and not the other. If neither
+	 * responds there is nothing to report -- abort before any allocation so
+	 * the return is a clean ENXIO.
+	 */
+	sc->has_package = amd_rapl_msr_present(MSR_RAPL_PACKAGE_ENERGY_STATUS,
+	    probe_cpu);
+	sc->has_core = amd_rapl_msr_present(MSR_RAPL_CORE_ENERGY_STATUS,
+	    probe_cpu);
+	if (!sc->has_package && !sc->has_core) {
+		device_printf(dev,
+		    "no RAPL energy MSR responded; not attaching\n");
+		return (ENXIO);
+	}
 	atomic_store_rel_64(&sc->last_read, (uint64_t)sbinuptime());
 	amd_rapl_build_package_map(sc);
-	sc->core_value = malloc(sizeof(struct amd_rapl_value) * (mp_maxid + 1),
+	amd_rapl_build_core_map(sc);
+	sc->core_value = malloc(sizeof(struct amd_rapl_value) * sc->ncores,
 	    M_AMDRAPL, M_WAITOK | M_ZERO);
 	sc->package_value = malloc(sizeof(struct amd_rapl_value) * sc->npackages,
 	    M_AMDRAPL, M_WAITOK | M_ZERO);
@@ -559,26 +724,50 @@ amd_rapl_attach(device_t dev)
 	 * arrays the handlers dereference.
 	 */
 	sysctl_ctx_init(&sc->clist);
-	SYSCTL_ADD_PROC(&sc->clist,
-	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
-	    "package_mwatt", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
-	    sc, 0, sysctl_amd_rapl_display_package, "A", "");
-	SYSCTL_ADD_PROC(&sc->clist,
-	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
-	    "cores_mwatt", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc,
-	    0, sysctl_amd_rapl_display_cores, "A", "");
-	SYSCTL_ADD_PROC(&sc->clist,
-	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
-	    "package_energy_uj", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
-	    sc, 0, sysctl_amd_rapl_display_package_uj, "A",
-	    "Cumulative package energy in microjoules, comma-separated per domain "
-	    "(cumulative across active-monitoring windows unless force_guard=1)");
-	SYSCTL_ADD_PROC(&sc->clist,
-	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
-	    "cores_energy_uj", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
-	    sc, 0, sysctl_amd_rapl_display_cores_uj, "A",
-	    "Cumulative per-core energy in microjoules, comma-separated per core "
-	    "(cumulative across active-monitoring windows unless force_guard=1)");
+	if (sc->has_package) {
+		SYSCTL_ADD_PROC(&sc->clist,
+		    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+		    "package_mwatt",
+		    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, 0, sysctl_amd_rapl_display_package, "A", "");
+		SYSCTL_ADD_PROC(&sc->clist,
+		    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+		    "package_energy_uj",
+		    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, 0, sysctl_amd_rapl_display_package_uj, "A",
+		    "Cumulative package energy in microjoules, comma-separated per "
+		    "domain (cumulative across active-monitoring windows unless "
+		    "force_guard=1)");
+		SYSCTL_ADD_PROC(&sc->clist,
+		    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+		    "package_energy_lapsed",
+		    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, 0, sysctl_amd_rapl_display_package_lapsed, "A",
+		    "Per-domain 0/1: 1 means package_energy_uj lost a counter wrap "
+		    "during read silence and under-reports (see force_guard)");
+	}
+	if (sc->has_core) {
+		SYSCTL_ADD_PROC(&sc->clist,
+		    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+		    "cores_mwatt",
+		    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, 0, sysctl_amd_rapl_display_cores, "A", "");
+		SYSCTL_ADD_PROC(&sc->clist,
+		    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+		    "cores_energy_uj",
+		    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, 0, sysctl_amd_rapl_display_cores_uj, "A",
+		    "Cumulative per-core energy in microjoules, comma-separated per "
+		    "physical core (cumulative across active-monitoring windows "
+		    "unless force_guard=1)");
+		SYSCTL_ADD_PROC(&sc->clist,
+		    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+		    "cores_energy_lapsed",
+		    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, 0, sysctl_amd_rapl_display_cores_lapsed, "A",
+		    "Per-core 0/1: 1 means cores_energy_uj lost a counter wrap "
+		    "during read silence and under-reports (see force_guard)");
+	}
 	SYSCTL_ADD_UINT(&sc->clist,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "energy_unit", CTLFLAG_RD, &sc->energy_unit, 0,
@@ -639,6 +828,7 @@ amd_rapl_detach(device_t dev)
 	callout_drain(&sc->sampling_timer);
 	mtx_destroy(&sc->mtx);
 	free(sc->cpu_pkg_slot, M_AMDRAPL);
+	free(sc->cpu_core_slot, M_AMDRAPL);
 	free(sc->core_value, M_AMDRAPL);
 	free(sc->package_value, M_AMDRAPL);
 	return (0);
@@ -660,7 +850,7 @@ static int
 amd_rapl_resume(device_t dev)
 {
 	struct amd_rapl_softc *sc = device_get_softc(dev);
-	int cpu, i;
+	int i;
 
 	/*
 	 * Re-baseline so the first post-resume sample contributes a zero delta.
@@ -668,10 +858,12 @@ amd_rapl_resume(device_t dev)
 	 * so without this the wrap correction in amd_rapl_update_delta() would
 	 * fold a spurious ~2^32 delta spanning the suspended interval into accum
 	 * (R-LIFE-5 / the R-CUM-2 baseline principle). accum itself is preserved,
-	 * so cumulative energy continues rather than resetting.
+	 * so cumulative energy continues rather than resetting. Iterate dense
+	 * core/package slots, not logical CPUs -- core_value is sized by physical
+	 * core after the F1 dedup.
 	 */
-	CPU_FOREACH(cpu)
-		sc->core_value[cpu].primed = false;
+	for (i = 0; i < sc->ncores; i++)
+		sc->core_value[i].primed = false;
 	for (i = 0; i < sc->npackages; i++)
 		sc->package_value[i].primed = false;
 	atomic_store_rel_64(&sc->last_read, (uint64_t)sbinuptime());
