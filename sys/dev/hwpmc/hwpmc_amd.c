@@ -43,6 +43,8 @@
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 
+#include "hwpmc_pmu.h"
+
 #include <machine/cpu.h>
 #include <machine/cpufunc.h>
 #include <machine/md_var.h>
@@ -380,11 +382,10 @@ amd_switch_out(struct pmc_cpu *pc __pmcdbg_used,
 }
 
 /*
- * Check if a given PMC allocation is feasible.
+ * Validate whether an event can use row 'ri' (used by grouping assign).
  */
-static int
-amd_allocate_pmc(int cpu __unused, int ri, struct pmc *pm,
-    const struct pmc_op_pmcallocate *a)
+int
+amd_can_assign_pmc(int ri, struct pmc *pm, const struct pmc_op_pmcallocate *a)
 {
 	const struct pmc_descr *pd;
 	uint64_t allowed_unitmask, caps, config, unitmask;
@@ -396,7 +397,6 @@ amd_allocate_pmc(int cpu __unused, int ri, struct pmc *pm,
 
 	pd = &amd_pmcdesc[ri].pm_descr;
 
-	/* check class match */
 	if (pd->pd_class != a->pm_class)
 		return (EINVAL);
 
@@ -409,9 +409,6 @@ amd_allocate_pmc(int cpu __unused, int ri, struct pmc *pm,
 	    ((pd->pd_caps & PMC_CAP_PRECISE) == 0))
 		return (EINVAL);
 
-	PMCDBG2(MDP, ALL, 1,"amd-allocate ri=%d caps=0x%x", ri, caps);
-
-	/* Validate sub-class. */
 	if (amd_pmcdesc[ri].pm_subclass != a->pm_md.pm_amd.pm_amd_sub_class)
 		return (EINVAL);
 
@@ -420,18 +417,10 @@ amd_allocate_pmc(int cpu __unused, int ri, struct pmc *pm,
 		if ((config & ~amd_config_mask(amd_pmcdesc[ri].pm_subclass,
 		    caps)) != 0)
 			return (EINVAL);
-		pm->pm_md.pm_amd.pm_amd_evsel = config;
-		PMCDBG2(MDP, ALL, 2, "amd-allocate ri=%d -> config=0x%jx",
-		    ri, (uintmax_t)config);
 		return (0);
 	}
 
-	/*
-	 * Everything below this is for supporting older processors.
-	 */
 	pe = a->pm_ev;
-
-	/* map ev to the correct event mask code */
 	config = allowed_unitmask = 0;
 	for (i = 0; i < amd_event_codes_size; i++) {
 		if (amd_event_codes[i].pe_ev == pe) {
@@ -446,16 +435,105 @@ amd_allocate_pmc(int cpu __unused, int ri, struct pmc *pm,
 		return (EINVAL);
 
 	unitmask = a->pm_md.pm_amd.pm_amd_config & AMD_PMC_UNITMASK;
-	if ((unitmask & ~allowed_unitmask) != 0) /* disallow reserved bits */
+	if ((unitmask & ~allowed_unitmask) != 0)
 		return (EINVAL);
 
+	return (0);
+}
+
+/*
+ * Build a pmc_sched_constraint for the requested allocation.  Row
+ * mask is derived from the dynamically-detected
+ * amd_{core,l3,df}_npmcs - the same counters init populates from
+ * EXTPERFMON or the per-family defaults - so this works on every Zen
+ * generation without per-uarch code paths.
+ */
+int
+amd_get_sched_constraint(struct pmc *pm __unused,
+    const struct pmc_op_pmcallocate *a, struct pmc_sched_constraint *cons)
+{
+	uint32_t mask;
+	u_int first, count, i;
+
+	if (cons == NULL || a == NULL)
+		return (EINVAL);
+	bzero(cons, sizeof(*cons));
+
+	switch (a->pm_md.pm_amd.pm_amd_sub_class) {
+	case PMC_AMD_SUB_CLASS_CORE:
+		first = 0;
+		count = amd_core_npmcs;
+		break;
+	case PMC_AMD_SUB_CLASS_L3_CACHE:
+		first = amd_core_npmcs;
+		count = amd_l3_npmcs;
+		break;
+	case PMC_AMD_SUB_CLASS_DATA_FABRIC:
+		first = amd_core_npmcs + amd_l3_npmcs;
+		count = amd_df_npmcs;
+		break;
+	default:
+		return (EOPNOTSUPP);
+	}
+	if (count == 0 || first + count > 32)
+		return (EOPNOTSUPP);
+
+	mask = 0;
+	for (i = 0; i < count; i++)
+		mask |= 1u << (first + i);
+	cons->pc_allowed_rows = mask;
+	cons->pc_weight = (uint8_t)count;
+	cons->pc_flags = PMC_SC_F_SHARED;
+	cons->pc_fixed_row = (uint8_t)first;
+	return (0);
+}
+
+/*
+ * Check if a given PMC allocation is feasible.
+ */
+static int
+amd_allocate_pmc(int cpu __unused, int ri, struct pmc *pm,
+    const struct pmc_op_pmcallocate *a)
+{
+	uint64_t config;
+	enum pmc_event pe;
+	int error, i;
+	uint64_t allowed_unitmask, caps, unitmask;
+
+	error = amd_can_assign_pmc(ri, pm, a);
+	if (error != 0)
+		return (error);
+
+	caps = pm->pm_caps;
+	PMCDBG2(MDP, ALL, 1,"amd-allocate ri=%d caps=0x%x", ri, caps);
+
+	if (strlen(pmc_cpuid) != 0) {
+		config = a->pm_md.pm_amd.pm_amd_config;
+		pm->pm_md.pm_amd.pm_amd_evsel = config;
+		PMCDBG2(MDP, ALL, 2, "amd-allocate ri=%d -> config=0x%jx",
+		    ri, (uintmax_t)config);
+		return (0);
+	}
+
+	pe = a->pm_ev;
+	config = allowed_unitmask = 0;
+	for (i = 0; i < amd_event_codes_size; i++) {
+		if (amd_event_codes[i].pe_ev == pe) {
+			config =
+			    AMD_PMC_TO_EVENTMASK(amd_event_codes[i].pe_code);
+			allowed_unitmask =
+			    AMD_PMC_TO_UNITMASK(amd_event_codes[i].pe_mask);
+			break;
+		}
+	}
+
+	unitmask = a->pm_md.pm_amd.pm_amd_config & AMD_PMC_UNITMASK;
 	if (unitmask && (caps & PMC_CAP_QUALIFIER) != 0)
 		config |= unitmask;
 
 	if ((caps & PMC_CAP_THRESHOLD) != 0)
 		config |= a->pm_md.pm_amd.pm_amd_config & AMD_PMC_COUNTERMASK;
 
-	/* Set at least one of the 'usr' or 'os' caps. */
 	if ((caps & PMC_CAP_USER) != 0)
 		config |= AMD_PMC_USR;
 	if ((caps & PMC_CAP_SYSTEM) != 0)
@@ -470,7 +548,7 @@ amd_allocate_pmc(int cpu __unused, int ri, struct pmc *pm,
 	if ((caps & PMC_CAP_INTERRUPT) != 0)
 		config |= AMD_PMC_INT;
 
-	pm->pm_md.pm_amd.pm_amd_evsel = config; /* save config value */
+	pm->pm_md.pm_amd.pm_amd_evsel = config;
 
 	PMCDBG2(MDP, ALL, 2, "amd-allocate ri=%d -> config=0x%x", ri, config);
 

@@ -75,6 +75,8 @@ struct pmcstat_ev {
 	pmc_id_t	ev_pmcid; /* allocated ID */
 	pmc_value_t	ev_saved; /* for incremental counts */
 	char	       *ev_spec;  /* event specification */
+	int		ev_groupid; /* 0 = no group, >0 = syntactic group id */
+	int		ev_is_leader; /* 1 if leader of its group */
 };
 
 struct pmcstat_target {
@@ -108,6 +110,7 @@ struct pmcstat_args {
 #define	FLAG_SKIP_TOP_FN_RES		0x00200000	/* -A */
 #define	FLAG_FILTER_THREAD_ID		0x00400000	/* -L */
 #define	FLAG_SHOW_OFFSET		0x00800000	/* -I */
+#define	FLAG_DO_GROUPING		0x01000000	/* -b */
 
 	int	pa_required;		/* required features */
 	int	pa_pplugin;		/* pre-processing plugin */
@@ -379,6 +382,20 @@ int pmcstat_analyze_log(struct pmcstat_args *args,
 
 int pmcstat_open_log(const char *_p, int _mode);
 int pmcstat_close_log(struct pmcstat_args *args);
+
+/*
+ * libpmcstat_group.c: parse a -b {a,b,c} brace-list event group.
+ * Returns 0 on success and fills *out_events with a malloc'd
+ * NULL-terminated array of malloc'd event-spec strings.  Returns
+ * a positive count via *n_out.  When the input is not a brace-list
+ * the function returns 1 and the caller treats `spec` as a single
+ * non-grouped event.  Returns -1 on parse error with errno set.
+ */
+int pmcstat_parse_event_group(const char *spec, char ***out_events,
+    size_t *n_out);
+void pmcstat_free_event_group(char **events, size_t n);
+void pmcstat_add_one_event(int option, const char *spec,
+    struct pmcstat_args *pa, int groupid, int is_leader);
 
 __END_DECLS
 

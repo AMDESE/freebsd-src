@@ -120,6 +120,8 @@ dev/hwpmc/hwpmc_core.c		optional	hwpmc
 dev/hwpmc/hwpmc_uncore.c	optional	hwpmc
 dev/hwpmc/hwpmc_tsc.c		optional	hwpmc
 dev/hwpmc/hwpmc_x86.c		optional	hwpmc
+dev/hwpmc/hwpmc_pmu.c		optional	hwpmc
+dev/hwpmc/hwpmc_assign.c	optional	hwpmc
 dev/hyperv/hvsock/hv_sock.c				optional	hyperv
 dev/hyperv/input/hv_hid.c				optional	hyperv hvhid
 dev/hyperv/input/hv_kbd.c				optional	hyperv

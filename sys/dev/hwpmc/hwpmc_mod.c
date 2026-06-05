@@ -74,6 +74,9 @@
 #include <vm/vm_object.h>
 
 #include "hwpmc_soft.h"
+#include "hwpmc_pmu.h"
+
+int (*hwpmc_pmu_attach_p)(struct proc *p, struct pmc *pm);
 
 #define PMC_EPOCH_ENTER()						\
     struct epoch_tracker pmc_et;					\
@@ -86,12 +89,7 @@
  * Types
  */
 
-enum pmc_flags {
-	PMC_FLAG_NONE	  = 0x00, /* do nothing */
-	PMC_FLAG_REMOVE   = 0x01, /* atomically remove entry from hash */
-	PMC_FLAG_ALLOCATE = 0x02, /* add entry to hash if not found */
-	PMC_FLAG_NOWAIT   = 0x04, /* do not wait for mallocs */
-};
+/* enum pmc_flags moved to hwpmc_pmu.h so the PMU grouping layer can use it. */
 
 /*
  * The offset in sysent where the syscall is allocated.
@@ -208,7 +206,7 @@ static int	pmc_add_sample(ring_type_t ring, struct pmc *pm,
     struct trapframe *tf, struct pmc_multipart *mp);
 static void	pmc_add_thread_descriptors_from_proc(struct proc *p,
     struct pmc_process *pp);
-static int	pmc_attach_process(struct proc *p, struct pmc *pm);
+int	pmc_attach_process(struct proc *p, struct pmc *pm);
 static struct pmc *pmc_allocate_pmc_descriptor(void);
 static struct pmc_owner *pmc_allocate_owner_descriptor(struct proc *p);
 static int	pmc_attach_one_process(struct proc *p, struct pmc *pm);
@@ -961,6 +959,179 @@ pmc_link_target_process(struct pmc *pm, struct pmc_process *pp)
 /*
  * Removes the association between a target process and a PMC.
  */
+void
+pmc_unlink_target_process_pmu(struct pmc *pm, struct pmc_process *pp)
+{
+	pmc_unlink_target_process(pm, pp);
+}
+
+void
+hwpmc_pmu_sx_xlock(void)
+{
+
+	sx_xlock(&pmc_sx);
+}
+
+void
+hwpmc_pmu_sx_xunlock(void)
+{
+
+	sx_xunlock(&pmc_sx);
+}
+
+/*
+ * Cross-translation-unit shim so hwpmc_pmu.c can KASSERT on the global
+ * SX lock without seeing the (file-static-by-convention) pmc_sx symbol.
+ * Compiles to the usual sx_assert under WITNESS / INVARIANTS and to
+ * nothing in production kernels.
+ */
+void
+hwpmc_pmu_sx_assert_xlocked(void)
+{
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+}
+
+/*
+ * Sleep on 'chan' while the caller holds pmc_sx.  Releases pmc_sx for
+ * the duration of the sleep and reacquires it on wakeup; lets the
+ * multiplex rotation kthread wait between windows while still being
+ * promptly woken up by wakeup(pg) from pmu_group_on_stop /
+ * pmu_group_on_release.
+ */
+int
+hwpmc_pmu_sx_sleep(void *chan, int timo, const char *wmesg)
+{
+
+	return (sx_sleep(chan, &pmc_sx, 0, wmesg, timo));
+}
+
+pmc_value_t
+hwpmc_pmc_read_delta(int cpu, int ri, struct pmc *pm)
+{
+	struct pmc_classdep *pcd;
+	pmc_value_t newvalue, tmp;
+	int adjri;
+
+	pcd = pmc_ri_to_classdep(md, ri, &adjri);
+	(void)pcd->pcd_read_pmc(cpu, adjri, pm, &newvalue);
+	tmp = newvalue - PMC_PCPU_SAVED(cpu, ri);
+	return (tmp);
+}
+
+void
+hwpmc_pmu_accumulate_remove(int cpu, int ri, struct pmc *pm,
+    struct pmc_process *pp)
+{
+	pmc_value_t val;
+
+	val = hwpmc_pmc_read_delta(cpu, ri, pm);
+	mtx_pool_lock_spin(pmc_mtxpool, pm);
+	pm->pm_gv.pm_savedvalue += val;
+	pp->pp_pmcs[ri].pp_pmcval += val;
+	mtx_pool_unlock_spin(pmc_mtxpool, pm);
+}
+
+/*
+ * Wait until pm->pm_runcount drops to zero - i.e. no CPU is currently
+ * running this PMC.  Mirrors pmc_wait_for_pmc_idle but is called by
+ * the multiplex rotation path which transitions pm_state to STOPPED
+ * (not DELETED) before draining.
+ */
+void
+pmc_rotation_drain(struct pmc *pm)
+{
+#ifdef INVARIANTS
+	int maxloop = 100 * pmc_cpu_max();
+#endif
+	while (counter_u64_fetch(pm->pm_runcount) > 0) {
+#ifdef INVARIANTS
+		KASSERT(maxloop-- > 0,
+		    ("[pmc,%d] pm=%p stuck runcount=%ju in rotation drain",
+		    __LINE__, pm,
+		    (uintmax_t)counter_u64_fetch(pm->pm_runcount)));
+#endif
+		pmc_force_context_switch();
+	}
+}
+
+/*
+ * Detach a PMC from a process target without touching the cumulative
+ * count (already maintained in pm->pm_gv.pm_savedvalue by the regular
+ * csw_out path) and without sending SIGIO when pm->pm_targets becomes
+ * empty.  Caller must hold pmc_sx and must have transitioned pm to
+ * STOPPED + drained pm_runcount first.
+ */
+void
+pmc_rotation_detach(struct pmc *pm, struct pmc_process *pp)
+{
+	struct pmc_target *ptgt;
+	int ri;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	KASSERT(pm != NULL && pp != NULL,
+	    ("[pmc,%d] null pm/pp in rotation detach", __LINE__));
+	KASSERT(!PMC_ROW_IS_UNASSIGNED(pm),
+	    ("[pmc,%d] rotation detach on unassigned pm=%p", __LINE__, pm));
+
+	ri = PMC_TO_ROWINDEX(pm);
+	KASSERT(pp->pp_pmcs[ri].pp_pmc == pm,
+	    ("[pmc,%d] rotation detach pm=%p ri=%d pp_pmcs=%p",
+	    __LINE__, pm, ri, pp->pp_pmcs[ri].pp_pmc));
+
+	pp->pp_pmcs[ri].pp_pmc = NULL;
+	pp->pp_pmcs[ri].pp_pmcval = (pmc_value_t)0;
+
+	LIST_FOREACH(ptgt, &pm->pm_targets, pt_next) {
+		if (ptgt->pt_process == pp) {
+			LIST_REMOVE(ptgt, pt_next);
+			free(ptgt, M_PMC);
+			break;
+		}
+	}
+	pp->pp_refcnt--;
+
+	if (pm->pm_owner != NULL && pm->pm_owner->po_owner == pp->pp_proc)
+		pm->pm_flags &= ~PMC_F_ATTACHED_TO_OWNER;
+}
+
+/*
+ * Re-attach a PMC to a process target after rotation has assigned it
+ * a fresh row.  Mirrors pmc_link_target_process minus the owner-list
+ * gymnastics and the per-thread KASSERTs that don't apply here.  pp_pmcval
+ * is left at zero so the next csw_in can copy pm->pm_gv.pm_savedvalue
+ * into PMC_PCPU_SAVED and the HW counter, continuing the count exactly
+ * where the prior window left off.
+ */
+void
+pmc_rotation_attach(struct pmc *pm, struct pmc_process *pp)
+{
+	struct pmc_target *ptgt;
+	int ri;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	KASSERT(pm != NULL && pp != NULL,
+	    ("[pmc,%d] null pm/pp in rotation attach", __LINE__));
+	KASSERT(!PMC_ROW_IS_UNASSIGNED(pm),
+	    ("[pmc,%d] rotation attach unassigned pm=%p", __LINE__, pm));
+
+	ri = PMC_TO_ROWINDEX(pm);
+	KASSERT(pp->pp_pmcs[ri].pp_pmc == NULL,
+	    ("[pmc,%d] rotation attach into busy slot ri=%d", __LINE__, ri));
+
+	ptgt = malloc(sizeof(*ptgt), M_PMC, M_WAITOK | M_ZERO);
+	ptgt->pt_process = pp;
+	LIST_INSERT_HEAD(&pm->pm_targets, ptgt, pt_next);
+
+	atomic_store_rel_ptr((uintptr_t *)&pp->pp_pmcs[ri].pp_pmc,
+	    (uintptr_t)pm);
+	pp->pp_pmcs[ri].pp_pmcval = (pmc_value_t)0;
+	pp->pp_refcnt++;
+
+	if (pm->pm_owner != NULL && pm->pm_owner->po_owner == pp->pp_proc)
+		pm->pm_flags |= PMC_F_ATTACHED_TO_OWNER;
+}
+
 static void
 pmc_unlink_target_process(struct pmc *pm, struct pmc_process *pp)
 {
@@ -1094,8 +1265,66 @@ pmc_attach_one_process(struct proc *p, struct pmc *pm)
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
 
+	/*
+	 * Deferred grouped sibling: under the new all-or-none scheduling
+	 * a group is either fully placed (every sibling on a HW row,
+	 * pm_id valid) or fully deferred (every sibling carries pm_id =
+	 * PMC_ROW_UNASSIGNED until the per-pp rotation kthread brings
+	 * the group in atomically).
+	 *
+	 * Trying to opportunistically run pmu_assign_group from this
+	 * path is wrong: the per-proc rows are already occupied by the
+	 * previously-committed groups, so the placement would always
+	 * fail with EBUSY/ENOSPC and abort pmc_attach.  Instead we
+	 * silently mark the deferred sibling attached; pmu_group_on_start
+	 * will register the whole group on pp->pp_pmu_groups and either
+	 * pmu_pp_schedule_in (if rows are free now) or the per-pp
+	 * rotation kthread (later) atomically binds every sibling at
+	 * once.  Walking pp_pmcs[ri] here would also be unsafe because
+	 * pp_pmcs[] is a flexible array sized to md->pmd_npmc, so
+	 * indexing it at PMC_ROW_UNASSIGNED (255) is an OOB read+write.
+	 */
+	if (PMC_ROW_IS_UNASSIGNED(pm)) {
+		pm->pm_flags |= PMC_F_ATTACH_DONE;
+		/*
+		 * Even though we cannot bind a row right now, we MUST
+		 * make the target proc visible to hwpmc and remember
+		 * the target on the group: pmu_group_on_start /
+		 * pmu_pp_schedule_in / the rotation kthread all need
+		 * the TARGET's pmc_process (not the owner's) so that
+		 * pp_pmu_groups, pp_pmcs[] and the eventual
+		 * pmc_rotation_attach all live on the same pp the
+		 * scheduler will hit at csw_in/out time.
+		 */
+		PROC_LOCK(p);
+		p->p_flag |= P_HWPMC;
+		PROC_UNLOCK(p);
+		(void)pmc_find_process_descriptor(p, PMC_FLAG_ALLOCATE);
+		if (pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL) {
+			struct pmu_group *pg = pm->pm_pmu->pe_group;
+
+			if (pg->pg_attach_proc == NULL)
+				pg->pg_attach_proc = p;
+		}
+		PMCDBG3(PRC, ATT, 2,
+		    "attach-deferred pm=%p proc=%p (%d)", pm, p, p->p_pid);
+		return (0);
+	}
+
 	PMCDBG5(PRC,ATT,2, "attach-one pm=%p ri=%d proc=%p (%d, %s)", pm,
 	    PMC_TO_ROWINDEX(pm), p, p->p_pid, p->p_comm);
+
+	/*
+	 * Same as above for the regular (committed-bound) path: stash
+	 * the target proc on the group so the PMU layer never has to
+	 * fall back to the owner.
+	 */
+	if (pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL) {
+		struct pmu_group *pg = pm->pm_pmu->pe_group;
+
+		if (pg->pg_attach_proc == NULL)
+			pg->pg_attach_proc = p;
+	}
 
 	/*
 	 * Locate the process descriptor corresponding to process 'p',
@@ -1162,7 +1391,7 @@ fail:
 /*
  * Attach a process and optionally its children
  */
-static int
+int
 pmc_attach_process(struct proc *p, struct pmc *pm)
 {
 	int error;
@@ -1234,6 +1463,18 @@ pmc_detach_one_process(struct proc *p, struct pmc *pm, int flags)
 
 	PMCDBG6(PRC,ATT,2, "detach-one pm=%p ri=%d proc=%p (%d, %s) flags=0x%x",
 	    pm, ri, p, p->p_pid, p->p_comm, flags);
+
+	/*
+	 * Symmetric with the attach path: a deferred multiplex sibling is
+	 * never linked into pp_pmcs[] (its row is rotated in transparently
+	 * by pmc_rotation_attach when its turn comes), and its pm_id has
+	 * the synthetic PMC_ROW_UNASSIGNED row index.  Treat detach as a
+	 * silent no-op rather than dereferencing pp_pmcs[255] OOB.
+	 */
+	if (PMC_ROW_IS_UNASSIGNED(pm)) {
+		pm->pm_flags &= ~PMC_F_ATTACH_DONE;
+		return (0);
+	}
 
 	if ((pp = pmc_find_process_descriptor(p, 0)) == NULL)
 		return (ESRCH);
@@ -1472,6 +1713,9 @@ pmc_process_csw_in(struct thread *td)
 	    ("[pmc,%d] weird CPU id %d", __LINE__, cpu));
 
 	pc = pmc_pcpu[cpu];
+
+	pmu_group_csw_in(td, pp);
+
 	for (ri = 0; ri < md->pmd_npmc; ri++) {
 		if ((pm = pp->pp_pmcs[ri].pp_pmc) == NULL)
 			continue;
@@ -1639,6 +1883,8 @@ pmc_process_csw_out(struct thread *td)
 	    ("[pmc,%d weird CPU id %d", __LINE__, cpu));
 
 	pc = pmc_pcpu[cpu];
+
+	pmu_group_csw_out(td, cpu);
 
 	/*
 	 * When a PMC gets unlinked from a target PMC, it will
@@ -2311,6 +2557,8 @@ pmc_allocate_owner_descriptor(struct proc *p)
 	LIST_INSERT_HEAD(poh, po, po_next); /* insert into hash table */
 
 	TAILQ_INIT(&po->po_logbuffers);
+	LIST_INIT(&po->po_groups);
+	po->po_next_deferred_serial = PMC_HANDLE_DEFERRED_BASE;
 	mtx_init(&po->po_mtx, "pmc-owner-mtx", "pmc-per-proc", MTX_SPIN);
 
 	PMCDBG4(OWN,ALL,1, "allocate-owner proc=%p (%d, %s) pmc-owner=%p",
@@ -2529,6 +2777,12 @@ restart:
  * Find the descriptor corresponding to process 'p', adding or removing it
  * as specified by 'mode'.
  */
+struct pmc_process *
+pmc_find_process_descriptor_pmu(struct proc *p, uint32_t mode)
+{
+	return (pmc_find_process_descriptor(p, mode));
+}
+
 static struct pmc_process *
 pmc_find_process_descriptor(struct proc *p, uint32_t mode)
 {
@@ -2561,6 +2815,7 @@ pmc_find_process_descriptor(struct proc *p, uint32_t mode)
 	if ((mode & PMC_FLAG_ALLOCATE) != 0 && pp == NULL && ppnew != NULL) {
 		ppnew->pp_proc = p;
 		LIST_INIT(&ppnew->pp_tds);
+		LIST_INIT(&ppnew->pp_pmu_groups);
 		ppnew->pp_tdslock = mtx_pool_find(pmc_mtxpool, ppnew);
 		LIST_INSERT_HEAD(pph, ppnew, pp_next);
 		mtx_unlock_spin(&pmc_processhash_mtx);
@@ -2599,6 +2854,16 @@ static void
 pmc_destroy_process_descriptor(struct pmc_process *pp)
 {
 	struct pmc_thread *pmc_td;
+
+	/*
+	 * Defense in depth: with the reordering in
+	 * pmc_release_pmc_descriptor, every pmu_group should already
+	 * have been unhooked from pp by its own pmu_group_on_release.
+	 * But if any caller ever drives pp_refcnt to zero without going
+	 * through that path, sever any leftover pp_pmu_groups linkage
+	 * here so the pgs never see a freed pp.
+	 */
+	pmu_pp_release_all(pp);
 
 	while ((pmc_td = LIST_FIRST(&pp->pp_tds)) != NULL) {
 		LIST_REMOVE(pmc_td, pt_next);
@@ -2724,9 +2989,26 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 	sx_assert(&pmc_sx, SX_XLOCKED);
 	KASSERT(pm, ("[pmc,%d] null pmc", __LINE__));
 
-	ri   = PMC_TO_ROWINDEX(pm);
-	pcd  = pmc_ri_to_classdep(md, ri, &adjri);
+	ri = PMC_TO_ROWINDEX(pm);
 	mode = PMC_TO_MODE(pm);
+	if (PMC_ROW_IS_UNASSIGNED(pm)) {
+		/*
+		 * Deferred-group PMC that was allocated with
+		 * PMC_F_GROUP_DEFER but never bound to hardware (commit
+		 * failed or release before commit).  No targets, no HW
+		 * to deconfigure - just unwind the PMU layer and the
+		 * owner list.
+		 */
+		pm->pm_state = PMC_STATE_DELETED;
+		if (pm->pm_pmu != NULL)
+			pmu_group_on_release(pm);
+		if (pm->pm_owner != NULL) {
+			LIST_REMOVE(pm, pm_next);
+			pm->pm_owner = NULL;
+		}
+		return;
+	}
+	pcd  = pmc_ri_to_classdep(md, ri, &adjri);
 
 	PMCDBG3(PMC,REL,1, "release-pmc pmc=%p ri=%d mode=%d", pm, ri,
 	    mode);
@@ -2803,11 +3085,30 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 		pmc_wait_for_pmc_idle(pm);
 
 		/*
+		 * Unwind PMU group bookkeeping FIRST, while every pp on
+		 * pp_pmu_groups is still alive.  pmu_group_on_release
+		 * calls pmu_pp_schedule_out -> pmc_rotation_detach which
+		 * removes the rotation-installed pmc_targets from
+		 * pm_targets, decrements pp_refcnt, and LIST_REMOVE's pg
+		 * from pp->pp_pmu_groups.  If we left this until AFTER
+		 * the pm_targets unlink loop below, an earlier sibling's
+		 * release could already have driven pp_refcnt to zero
+		 * and freed pp -- the next sibling's pmu_group_on_release
+		 * would then LIST_REMOVE pg from a freed pp's list,
+		 * panicking with "Bad link elm prev->next != elm".
+		 */
+		if (pm->pm_pmu != NULL)
+			pmu_group_on_release(pm);
+
+		/*
 		 * At this point the PMC is off all CPUs and cannot be freshly
 		 * scheduled onto a CPU. It is now safe to unlink all targets
 		 * from this PMC. If a process-record's refcount falls to zero,
 		 * we remove it from the hash table. The module-wide SX lock
-		 * protects us from races.
+		 * protects us from races.  For grouped pms whose rotation
+		 * had attached targets, those entries were already removed
+		 * by pmu_group_on_release above; the loop below typically
+		 * walks an empty list in that case.
 		 */
 		LIST_FOREACH_SAFE(ptgt, &pm->pm_targets, pt_next, tmp) {
 			pp = ptgt->pt_process;
@@ -2846,6 +3147,15 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 		LIST_REMOVE(pm, pm_next);
 		pm->pm_owner = NULL;
 	}
+
+	/*
+	 * For VIRTUAL_MODE pms, the PMU layer was already unwound above
+	 * (before the unlink loop) so its pp_pmu_groups state stays
+	 * coherent with pp lifetime.  For SYSTEM_MODE the rotation never
+	 * runs, so pmu_group_on_release here is just the destroy path.
+	 */
+	if (!PMC_IS_VIRTUAL_MODE(mode) && pm->pm_pmu != NULL)
+		pmu_group_on_release(pm);
 }
 
 /*
@@ -2952,6 +3262,42 @@ pmc_can_allocate_rowindex(struct proc *p, unsigned int ri, int cpu)
  * Check if a given PMC at row index 'ri' can be currently used in
  * mode 'mode'.
  */
+struct pmc_mdep *
+hwpmc_get_mdep(void)
+{
+	return (md);
+}
+
+struct pmc_classdep *
+hwpmc_ri_to_classdep(int ri, int *adjri)
+{
+	return (pmc_ri_to_classdep(md, ri, adjri));
+}
+
+bool
+hwpmc_can_allocate_row(int ri, enum pmc_mode mode)
+{
+	return (pmc_can_allocate_row(ri, mode));
+}
+
+bool
+hwpmc_can_allocate_rowindex(struct proc *p, unsigned int ri, int cpu)
+{
+	return (pmc_can_allocate_rowindex(p, ri, cpu));
+}
+
+void
+hwpmc_mark_row_thread(int ri)
+{
+	PMC_MARK_ROW_THREAD(ri);
+}
+
+void
+hwpmc_mark_row_free(int ri)
+{
+	PMC_MARK_ROW_FREE(ri);
+}
+
 static bool
 pmc_can_allocate_row(int ri, enum pmc_mode mode)
 {
@@ -2995,13 +3341,23 @@ static struct pmc *
 pmc_find_pmc_descriptor_in_process(struct pmc_owner *po, pmc_id_t pmcid)
 {
 	struct pmc *pm;
+	u_int ri;
 
-	KASSERT(PMC_ID_TO_ROWINDEX(pmcid) < md->pmd_npmc,
-	    ("[pmc,%d] Illegal pmc index %d (max %d)", __LINE__,
-	    PMC_ID_TO_ROWINDEX(pmcid), md->pmd_npmc));
+	ri = PMC_ID_TO_ROWINDEX(pmcid);
+	if (ri != PMC_ROW_UNASSIGNED && !PMC_ROW_IS_DEFERRED_HANDLE(ri)) {
+		KASSERT(ri < md->pmd_npmc,
+		    ("[pmc,%d] Illegal pmc index %d (max %d)", __LINE__,
+		    ri, md->pmd_npmc));
+	}
 
+	/*
+	 * Match against pm_handle (stable user-facing id) first; for
+	 * non-deferred PMCs pm_handle == pm_id so this is a no-op.  This
+	 * lets userland keep using the original pmcid even after the
+	 * group assigner rewrites pm_id with the real hardware row.
+	 */
 	LIST_FOREACH(pm, &po->po_pmcs, pm_next) {
-		if (pm->pm_id == pmcid)
+		if (pm->pm_handle == pmcid)
 			return (pm);
 	}
 
@@ -3016,7 +3372,9 @@ pmc_find_pmc(pmc_id_t pmcid, struct pmc **pmc)
 	struct pmc_process *pp;
 
 	PMCDBG1(PMC,FND,1, "find-pmc id=%d", pmcid);
-	if (PMC_ID_TO_ROWINDEX(pmcid) >= md->pmd_npmc)
+	if (PMC_ID_TO_ROWINDEX(pmcid) != PMC_ROW_UNASSIGNED &&
+	    !PMC_ROW_IS_DEFERRED_HANDLE(PMC_ID_TO_ROWINDEX(pmcid)) &&
+	    PMC_ID_TO_ROWINDEX(pmcid) >= md->pmd_npmc)
 		return (EINVAL);
 
 	if ((po = pmc_find_owner_descriptor(curthread->td_proc)) == NULL) {
@@ -3028,6 +3386,13 @@ pmc_find_pmc(pmc_id_t pmcid, struct pmc **pmc)
 		pp = pmc_find_process_descriptor(curthread->td_proc,
 		    PMC_FLAG_NONE);
 		if (pp == NULL)
+			return (ESRCH);
+		/*
+		 * Deferred-handle pmcids do not index pp_pmcs directly; the
+		 * descendants path is only valid for pmcids whose row-index
+		 * is the real hardware row.
+		 */
+		if (PMC_ROW_IS_DEFERRED_HANDLE(PMC_ID_TO_ROWINDEX(pmcid)))
 			return (ESRCH);
 		opm = pp->pp_pmcs[PMC_ID_TO_ROWINDEX(pmcid)].pp_pmc;
 		if (opm == NULL)
@@ -3066,6 +3431,22 @@ pmc_start(struct pmc *pm)
 	    ("[pmc,%d] null pm", __LINE__));
 
 	mode = PMC_TO_MODE(pm);
+	/*
+	 * Multiplexed group siblings are only periodically bound to a
+	 * HW row by the rotation kthread; in between they live with
+	 * pm_id encoding PMC_ROW_UNASSIGNED.  Calling pmc_ri_to_classdep
+	 * on ri == 255 would assert and panic, so for those we just
+	 * mark RUNNING and let the rotation pick the PMC up on its
+	 * next window.  Userland already saw a successful pmc_start.
+	 */
+	if (PMC_ROW_IS_UNASSIGNED(pm)) {
+		KASSERT(PMC_IS_VIRTUAL_MODE(mode),
+		    ("[pmc,%d] start on unassigned non-virtual pmc=%p",
+		    __LINE__, pm));
+		(void)pmu_group_on_start(pm);
+		pm->pm_state = PMC_STATE_RUNNING;
+		return (0);
+	}
 	ri   = PMC_TO_ROWINDEX(pm);
 	pcd  = pmc_ri_to_classdep(md, ri, &adjri);
 
@@ -3092,6 +3473,15 @@ pmc_start(struct pmc *pm)
 		pmc_log_kernel_mappings(pm);
 
 	if (PMC_IS_VIRTUAL_MODE(mode)) {
+		error = pmu_group_on_start(pm);
+		if (error != 0)
+			return (error);
+		if (pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL) {
+			if ((pm->pm_flags & PMC_F_ATTACHED_TO_OWNER) != 0)
+				pmc_force_context_switch();
+			return (0);
+		}
+
 		/*
 		 * If a PMCATTACH has never been done on this PMC,
 		 * attach it to its owner process.
@@ -3196,9 +3586,16 @@ pmc_stop(struct pmc *pm)
 	 *
 	 * If this PMC is current running on a CPU, then it will handled
 	 * correctly at the time its target process is context switched out.
+	 *
+	 * For mux group leaders this also tears down the rotation kthread
+	 * and stops every sibling that may currently be live on a HW row.
+	 * Without this, the per-group rotation kthread would keep cycling
+	 * counters in and out of hardware while userland is reading them.
 	 */
-	if (PMC_IS_VIRTUAL_MODE(PMC_TO_MODE(pm)))
+	if (PMC_IS_VIRTUAL_MODE(PMC_TO_MODE(pm))) {
+		pmu_group_on_stop(pm);
 		return (0);
+	}
 
 	/*
 	 * A system-mode PMC. Move to the CPU associated with this PMC, and
@@ -3351,7 +3748,7 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 	 */
 	if ((flags & ~(PMC_F_DESCENDANTS | PMC_F_LOG_PROCCSW |
 	    PMC_F_LOG_PROCEXIT | PMC_F_CALLCHAIN | PMC_F_USERCALLCHAIN |
-	    PMC_F_EV_PMU)) != 0)
+	    PMC_F_EV_PMU | PMC_F_GROUP_DEFER | PMC_F_GROUP_MUX)) != 0)
 		return (EINVAL);
 
 	/* PMC_F_USERCALLCHAIN is only valid with PMC_F_CALLCHAIN. */
@@ -3393,6 +3790,69 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 	pmc->pm_state = PMC_STATE_FREE;
 	pmc->pm_caps  = caps;
 	pmc->pm_flags = flags;
+
+	if ((flags & PMC_F_GROUP_DEFER) != 0) {
+		if (!PMC_IS_VIRTUAL_MODE(mode)) {
+			pmc_destroy_pmc_descriptor(pmc);
+			return (EINVAL);
+		}
+		if (class != PMC_CLASS_K8) {
+			pmc_destroy_pmc_descriptor(pmc);
+			return (EOPNOTSUPP);
+		}
+		pmc->pm_id = PMC_ID_MAKE_ID(PMC_CPU_ANY, mode, class,
+		    PMC_ROW_UNASSIGNED);
+		if (PMC_IS_SAMPLING_MODE(mode)) {
+			if (pa->pm_count < MAX(1, pmc_mincount))
+				pmc->pm_sc.pm_reloadcount = MAX(MAX(1,
+				    pmc_mincount), pa->pm_count);
+			else
+				pmc->pm_sc.pm_reloadcount = MAX(MAX(1,
+				    pmc_mincount), pa->pm_count);
+		} else
+			pmc->pm_sc.pm_initial = pa->pm_count;
+		error = pmu_group_on_allocate(pmc, pa);
+		if (error != 0) {
+			pmc_destroy_pmc_descriptor(pmc);
+			return (error);
+		}
+		pmc->pm_state = PMC_STATE_ALLOCATED;
+		pmc->pm_class = class;
+		error = pmc_register_owner(p, pmc);
+		if (error != 0) {
+			pmu_group_on_release(pmc);
+			pmc_destroy_pmc_descriptor(pmc);
+			return (error);
+		}
+		/*
+		 * Deferred PMCs share the same encoded pm_id (CPU_ANY,
+		 * mode, class, ROW_UNASSIGNED) so we cannot use pm_id as
+		 * the per-PMC user-facing handle.  Allocate a unique
+		 * value in the row-index byte so pmc_find_pmc() can
+		 * distinguish individual deferred PMCs and so userland
+		 * receives a distinct id from each pmc_allocate_group().
+		 */
+		{
+			struct pmc_owner *po2 = pmc->pm_owner;
+			uint8_t serial;
+
+			if (po2->po_next_deferred_serial <
+			    PMC_HANDLE_DEFERRED_BASE)
+				po2->po_next_deferred_serial =
+				    PMC_HANDLE_DEFERRED_BASE;
+			if (po2->po_next_deferred_serial >
+			    PMC_HANDLE_DEFERRED_MAX) {
+				pmu_group_on_release(pmc);
+				pmc_destroy_pmc_descriptor(pmc);
+				return (ENOSPC);
+			}
+			serial = po2->po_next_deferred_serial++;
+			pmc->pm_handle = PMC_ID_MAKE_ID(PMC_CPU_ANY, mode,
+			    class, serial);
+		}
+		pa->pm_pmcid = pmc->pm_handle;
+		return (0);
+	}
 
 	/* XXX set lower bound on sampling for process counters */
 	if (PMC_IS_SAMPLING_MODE(mode)) {
@@ -3520,9 +3980,11 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 	}
 
 	/*
-	 * Return the allocated index.
+	 * Return the allocated index.  Non-deferred PMCs use pm_id as
+	 * their stable handle.
 	 */
-	pa->pm_pmcid = pmc->pm_id;
+	pmc->pm_handle = pmc->pm_id;
+	pa->pm_pmcid = pmc->pm_handle;
 	return (0);
 }
 
@@ -3552,12 +4014,11 @@ pmc_do_op_pmcattach(struct thread *td, struct pmc_op_pmcattach a)
 		return (EINVAL);
 
 	/* PMCs may be (re)attached only when allocated or stopped */
-	if (pm->pm_state == PMC_STATE_RUNNING) {
+	if (pm->pm_state == PMC_STATE_RUNNING)
 		return (EBUSY);
-	} else if (pm->pm_state != PMC_STATE_ALLOCATED &&
-	    pm->pm_state != PMC_STATE_STOPPED) {
+	else if (pm->pm_state != PMC_STATE_ALLOCATED &&
+	    pm->pm_state != PMC_STATE_STOPPED)
 		return (EINVAL);
-	}
 
 	/* lookup pid */
 	if ((p = pfind(a.pm_pid)) == NULL)
@@ -3703,6 +4164,25 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 		 * read/write to the savedvalue field.
 		 */
 
+		/*
+		 * Deferred multiplex sibling: no HW row right now, so the
+		 * pcd_read_pmc / pmc_ri_to_classdep path would dereference
+		 * row 255 and panic.  pm_savedvalue is the cumulative count
+		 * maintained by csw_out across rotation windows, which is
+		 * exactly what userland wants to see; return it directly.
+		 */
+		if (PMC_ROW_IS_UNASSIGNED(pm)) {
+			mtx_pool_lock_spin(pmc_mtxpool, pm);
+			if ((prw->pm_flags & PMC_F_OLDVALUE) != 0)
+				*valp = pm->pm_gv.pm_savedvalue;
+			if ((prw->pm_flags & PMC_F_NEWVALUE) != 0)
+				pm->pm_gv.pm_savedvalue = prw->pm_value;
+			mtx_pool_unlock_spin(pmc_mtxpool, pm);
+			if ((prw->pm_flags & PMC_F_OLDVALUE) != 0)
+				(void)pmu_group_read_value(pm, valp);
+			return (0);
+		}
+
 		ri = PMC_TO_ROWINDEX(pm);
 		pcd = pmc_ri_to_classdep(md, ri, &adjri);
 
@@ -3750,6 +4230,9 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 		if (error != 0)
 			return (error);
 	}
+
+	if (error == 0 && (prw->pm_flags & PMC_F_OLDVALUE) != 0)
+		(void)pmu_group_read_value(pm, valp);
 
 #ifdef HWPMC_DEBUG
 	if ((prw->pm_flags & PMC_F_NEWVALUE) != 0)
@@ -4449,9 +4932,15 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		if ((error = pmc_find_pmc(pmcid, &pm)) != 0)
 			break;
 
-		KASSERT(pmcid == pm->pm_id,
-		    ("[pmc,%d] pmcid %x != id %x", __LINE__,
-			pm->pm_id, pmcid));
+		/*
+		 * For non-deferred PMCs pm_handle == pm_id; for deferred
+		 * group PMCs pm_id is rewritten by the assigner with the
+		 * real hardware row, while pm_handle stays equal to the
+		 * stable user-facing pmcid.  Compare against pm_handle.
+		 */
+		KASSERT(pmcid == pm->pm_handle,
+		    ("[pmc,%d] pmcid %x != handle %x", __LINE__,
+			pm->pm_handle, pmcid));
 
 		if (pm->pm_state == PMC_STATE_RUNNING) /* already running */
 			break;
@@ -4491,9 +4980,10 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		if ((error = pmc_find_pmc(pmcid, &pm)) != 0)
 			break;
 
-		KASSERT(pmcid == pm->pm_id,
-		    ("[pmc,%d] pmc id %x != pmcid %x", __LINE__,
-			pm->pm_id, pmcid));
+		/* See deferred-PMC pm_handle vs pm_id note in PMC_OP_PMCSTART. */
+		KASSERT(pmcid == pm->pm_handle,
+		    ("[pmc,%d] pmcid %x != handle %x", __LINE__,
+			pm->pm_handle, pmcid));
 
 		if (pm->pm_state == PMC_STATE_STOPPED) /* already stopped */
 			break;
@@ -4539,6 +5029,88 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 	 * Get the PMC capabilities
 	 */
 
+	case PMC_OP_PMCGROUPCREATE:
+	{
+		struct pmc_op_pmcgroupcreate gc;
+		struct pmc_owner *po;
+
+		sx_assert(&pmc_sx, SX_XLOCKED);
+		if ((error = copyin(arg, &gc, sizeof(gc))) != 0)
+			break;
+		po = pmc_find_owner_descriptor(td->td_proc);
+		if (po == NULL)
+			if ((po = pmc_allocate_owner_descriptor(td->td_proc)) == NULL) {
+				error = ENOMEM;
+				break;
+			}
+		error = pmu_group_create(po, &gc.pm_groupid);
+		PMCDBG3(PMC, ALL, 1, "groupcreate: pid=%d gid=%u err=%d",
+		    td->td_proc->p_pid, gc.pm_groupid, error);
+		if (error == 0)
+			error = copyout(&gc, arg, sizeof(gc));
+	}
+	break;
+
+	case PMC_OP_PMCGROUPADD:
+	{
+		struct pmc_op_pmcgroupadd ga;
+		struct pmc *pm;
+		struct pmc_owner *po;
+		struct pmu_group *pg;
+
+		sx_assert(&pmc_sx, SX_XLOCKED);
+		if ((error = copyin(arg, &ga, sizeof(ga))) != 0)
+			break;
+		po = pmc_find_owner_descriptor(td->td_proc);
+		if (po == NULL) {
+			error = EINVAL;
+			break;
+		}
+		pg = pmu_group_lookup(po, ga.pm_groupid);
+		if (pg == NULL) {
+			error = EINVAL;
+			break;
+		}
+		if ((error = pmc_find_pmc(ga.pm_pmcid, &pm)) != 0)
+			break;
+		if (pm->pm_owner != po) {
+			error = EPERM;
+			break;
+		}
+		error = pmu_group_add(pg, pm,
+		    (ga.pm_flags & PMC_GROUP_F_LEADER) != 0);
+		PMCDBG4(PMC, ALL, 2,
+		    "groupadd: gid=%u pmcid=0x%jx leader=%d err=%d",
+		    ga.pm_groupid, (uintmax_t)ga.pm_pmcid,
+		    (int)((ga.pm_flags & PMC_GROUP_F_LEADER) != 0), error);
+	}
+	break;
+
+	case PMC_OP_PMCGROUPCOMMIT:
+	{
+		struct pmc_op_pmcgroupcommit gcom;
+		struct pmc_owner *po;
+		struct pmu_group *pg;
+
+		sx_assert(&pmc_sx, SX_XLOCKED);
+		if ((error = copyin(arg, &gcom, sizeof(gcom))) != 0)
+			break;
+		po = pmc_find_owner_descriptor(td->td_proc);
+		if (po == NULL) {
+			error = EINVAL;
+			break;
+		}
+		pg = pmu_group_lookup(po, gcom.pm_groupid);
+		if (pg == NULL) {
+			error = EINVAL;
+			break;
+		}
+		error = pmu_group_commit(pg);
+		PMCDBG2(PMC, OPS, 1, "groupcommit: gid=%u err=%d",
+		    gcom.pm_groupid, error);
+	}
+	break;
+
 	case PMC_OP_GETCAPS:
 	{
 		struct pmc_op_caps c;
@@ -4557,9 +5129,10 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		if ((error = pmc_find_pmc(pmcid, &pm)) != 0)
 			break;
 
-		KASSERT(pmcid == pm->pm_id,
-		    ("[pmc,%d] pmc id %x != pmcid %x", __LINE__,
-			pm->pm_id, pmcid));
+		/* See deferred-PMC pm_handle vs pm_id note in PMC_OP_PMCSTART. */
+		KASSERT(pmcid == pm->pm_handle,
+		    ("[pmc,%d] pmcid %x != handle %x", __LINE__,
+			pm->pm_handle, pmcid));
 
 		ri = PMC_TO_ROWINDEX(pm);
 		pcd = pmc_ri_to_classdep(md, ri, &adjri);
@@ -5216,6 +5789,18 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 			pmc_unlink_target_process(pm, pp);
 		}
 	}
+
+	/*
+	 * Sever every pmu_group still hooked off pp before pp is
+	 * freed.  pmcstat (the OWNER) typically issues PMC_OP_PMCRELEASE
+	 * AFTER its target dies, and pmu_group_on_release would otherwise
+	 * follow stale pg->pg_pp into freed memory and panic LIST_REMOVE
+	 * with "Bad link prev->next != elm".  This also tears down the
+	 * per-pp rotation kthread, which itself holds pp as its arg.
+	 */
+	printf("hwpmc: pmc_process_exit pid=%d pp=%p calling pmu_pp_release_all\n",
+	    p->p_pid, pp);
+	pmu_pp_release_all(pp);
 	free(pp, M_PMC);
 
 out:
@@ -5756,6 +6341,7 @@ pmc_initialize(void)
 	pmc_intr = md->pmd_intr;
 	wmb();
 	pmc_hook = pmc_hook_handler;
+	hwpmc_pmu_attach_p = pmc_attach_process;
 
 	if (error == 0) {
 		printf(PMC_MODULE_NAME ":");

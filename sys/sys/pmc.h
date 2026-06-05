@@ -60,7 +60,7 @@
  * The patch version is incremented for every bug fix.
  */
 #define	PMC_VERSION_MAJOR	0x0A
-#define	PMC_VERSION_MINOR	0x01
+#define	PMC_VERSION_MINOR	0x02
 #define	PMC_VERSION_PATCH	0x0000
 
 #define	PMC_VERSION		(PMC_VERSION_MAJOR << 24 |		\
@@ -348,7 +348,10 @@ enum pmc_event {
 	__PMC_OP(WRITELOG, "Write a cookie to the log file")		\
 	__PMC_OP(CLOSELOG, "Close log file")				\
 	__PMC_OP(GETDYNEVENTINFO, "Get dynamic events list")		\
-	__PMC_OP(GETCAPS, "Get capabilities")
+	__PMC_OP(GETCAPS, "Get capabilities")				\
+	__PMC_OP(PMCGROUPCREATE, "Create a PMC event group")		\
+	__PMC_OP(PMCGROUPADD, "Add PMC to a group")			\
+	__PMC_OP(PMCGROUPCOMMIT, "Commit a PMC event group")
 
 enum pmc_ops {
 #undef	__PMC_OP
@@ -360,12 +363,18 @@ enum pmc_ops {
  * Flags used in operations on PMCs.
  */
 
-#define	PMC_F_UNUSED1		0x00000001 /* unused */
 #define	PMC_F_DESCENDANTS	0x00000002 /*OP ALLOCATE track descendants */
 #define	PMC_F_LOG_PROCCSW	0x00000004 /*OP ALLOCATE track ctx switches */
 #define	PMC_F_LOG_PROCEXIT	0x00000008 /*OP ALLOCATE log proc exits */
 #define	PMC_F_NEWVALUE		0x00000010 /*OP RW write new value */
 #define	PMC_F_OLDVALUE		0x00000020 /*OP RW get old value */
+/*
+ * NOTE: bit 0x00000001 is reserved by PMC_PP_ENABLE_MSR_ACCESS in
+ * pp_flags but is incorrectly tested against pm_flags inside
+ * pmc_attach_process(); avoid using it as a pm_flags bit.  Bit
+ * 0x00000040 is the first slot that is otherwise free.
+ */
+#define	PMC_F_GROUP_DEFER	0x00000040 /* defer HW row assign (group) */
 
 /* V2 API */
 #define	PMC_F_CALLCHAIN		0x00000080 /*OP ALLOCATE capture callchains */
@@ -379,6 +388,8 @@ enum pmc_ops {
 					    * through class-dependent fields
 					    */
 
+#define	PMC_F_GROUP_MUX		0x00000400 /* multiplex when nevents > slots */
+#define	PMC_F_SCALED		0x00000800 /* OP RW return scaled value */
 /* internal flags */
 #define	PMC_F_ATTACHED_TO_OWNER	0x00010000 /*attached to owner*/
 #define	PMC_F_NEEDS_LOGFILE	0x00020000 /*needs log file */
@@ -434,6 +445,24 @@ typedef uint64_t	pmc_value_t;
  */
 
 #define	PMC_CPU_ANY	~0
+
+#define	PMC_ROW_UNASSIGNED	0xFF
+
+struct pmc_op_pmcgroupcreate {
+	uint32_t	pm_groupid;	/* [return] group id */
+};
+
+struct pmc_op_pmcgroupadd {
+	uint32_t	pm_groupid;
+	pmc_id_t	pm_pmcid;
+	uint32_t	pm_flags;	/* PMC_GROUP_F_LEADER */
+};
+
+#define	PMC_GROUP_F_LEADER	0x00000001
+
+struct pmc_op_pmcgroupcommit {
+	uint32_t	pm_groupid;
+};
 
 struct pmc_op_pmcallocate {
 	uint32_t	pm_caps;	/* PMC_CAP_* */
@@ -799,7 +828,27 @@ struct pmc {
 
 	/* md extensions */
 	union pmc_md_pmc	pm_md;
+
+#ifdef _KERNEL
+	struct pmu_event	*pm_pmu;	/* grouping/multiplex state */
+	pmc_id_t		pm_handle;	/* stable user-facing id;
+						 * pm_id may be rewritten by
+						 * the group assigner, but
+						 * pm_handle is fixed at
+						 * allocate time */
+#endif
 };
+
+/*
+ * Reserved range in the row-index byte for deferred (group) PMC handles
+ * before the assigner places them on real hardware rows.  Distinguishes
+ * each deferred PMC for pmc_find_pmc() lookups.  Real hardware rows are
+ * always < md->pmd_npmc which is much smaller than 0x80.
+ */
+#define	PMC_HANDLE_DEFERRED_BASE	0x80
+#define	PMC_HANDLE_DEFERRED_MAX		0xFE
+#define	PMC_ROW_IS_DEFERRED_HANDLE(R)	\
+	((R) >= PMC_HANDLE_DEFERRED_BASE && (R) <= PMC_HANDLE_DEFERRED_MAX)
 
 /*
  * Accessor macros for 'struct pmc'
@@ -849,6 +898,8 @@ struct pmc_targetstate {
 	pmc_value_t	pp_pmcval; /* per-process value */
 };
 
+struct pmu_group;
+
 struct pmc_process {
 	LIST_ENTRY(pmc_process) pp_next;	/* hash chain */
 	LIST_HEAD(,pmc_thread) pp_tds;		/* list of threads */
@@ -856,6 +907,30 @@ struct pmc_process {
 	int		pp_refcnt;		/* reference count */
 	uint32_t	pp_flags;		/* flags PMC_PP_* */
 	struct proc	*pp_proc;		/* target process */
+#ifdef _KERNEL
+	LIST_HEAD(, pmu_group) pp_pmu_groups;	/* attached PMU groups (FIFO) */
+	/*
+	 * Inter-group multiplex rotation.  When the union of events
+	 * across pp_pmu_groups exceeds the available HW counters, the
+	 * pp-level rotation kthread evicts the front-most scheduled
+	 * group every kern.hwpmc.mux_period_ms tick and brings in
+	 * any deferred group whose nevents now fits.  Within a group
+	 * scheduling is always atomic: every sibling is placed on HW
+	 * together or none of them is.
+	 */
+	struct thread	*pp_pmu_rot_td;
+	bool		pp_pmu_rot_running;
+	/*
+	 * Round-robin cursor: the next group to attempt scheduling-in
+	 * at the start of each rotation tick.  When a group fails to
+	 * fit (ENOSPC) we record it as the next cursor and stop the
+	 * tick; the next tick begins from there.  When a group is
+	 * removed from pp_pmu_groups (release path) it must clear
+	 * this if it points at itself, so the kthread does not chase
+	 * a freed pmu_group.
+	 */
+	struct pmu_group *pp_pmu_rot_cursor;
+#endif
 	struct pmc_targetstate pp_pmcs[];       /* NHWPMCs */
 };
 
@@ -877,6 +952,10 @@ struct pmc_owner  {
 	LIST_ENTRY(pmc_owner)	po_next;	/* hash chain */
 	CK_LIST_ENTRY(pmc_owner)	po_ssnext;	/* (g/p) list of SS PMC owners */
 	LIST_HEAD(, pmc)	po_pmcs;	/* owned PMC list */
+#ifdef _KERNEL
+	LIST_HEAD(, pmu_group)	po_groups;	/* PMU event groups */
+	uint8_t			po_next_deferred_serial; /* 0x80..0xFE */
+#endif
 	TAILQ_HEAD(, pmclog_buffer) po_logbuffers; /* (o) logbuffer list */
 	struct mtx		po_mtx;		/* spin lock for (o) */
 	struct proc		*po_owner;	/* owner proc */

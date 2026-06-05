@@ -3,6 +3,7 @@ INTERNALLIB=
 
 SRCS=	\
 	libpmcstat_event.c	\
+	libpmcstat_group.c	\
 	libpmcstat_image.c	\
 	libpmcstat_logging.c	\
 	libpmcstat_process.c	\

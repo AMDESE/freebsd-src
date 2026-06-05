@@ -115,6 +115,7 @@ static kvm_t	*pmcstat_kvm;
 static struct kinfo_proc *pmcstat_plist;
 struct pmcstat_args args;
 static bool	libpmc_initialized = false;
+static int	next_syntactic_gid = 1;
 
 static void
 pmcstat_get_cpumask(const char *cpuspec, cpuset_t *cpumask)
@@ -519,8 +520,12 @@ main(int argc, char **argv)
 	CPU_COPY(&rootmask, &cpumask);
 
 	while ((option = getopt(argc, argv,
-	    "ACD:EF:G:ILM:NO:P:R:S:TUWZa:c:def:gi:l:m:n:o:p:qr:s:t:u:vw:z:")) != -1)
+	    "ACD:EF:G:ILM:NO:P:R:S:TUWZa:bc:def:gi:l:m:n:o:p:qr:s:t:u:vw:z:")) != -1)
 		switch (option) {
+		case 'b':	/* batch grouping: {a,b,c} forms a PMU group */
+			args.pa_flags |= FLAG_DO_GROUPING;
+			break;
+
 		case 'A':
 			args.pa_flags |= FLAG_SKIP_TOP_FN_RES;
 			break;
@@ -639,6 +644,30 @@ main(int argc, char **argv)
 		case 's':	/* system-wide counting PMC */
 		case 'P':	/* process virtual sampling PMC */
 		case 'S':	/* system-wide sampling PMC */
+			if ((args.pa_flags & FLAG_DO_GROUPING) != 0 &&
+			    optarg != NULL && optarg[0] == '{') {
+				char **siblings = NULL;
+				size_t si, nsib = 0;
+				int gid, rv;
+
+				rv = pmcstat_parse_event_group(optarg,
+				    &siblings, &nsib);
+				if (rv < 0)
+					errx(EX_USAGE,
+					    "ERROR: Bad group spec \"%s\"",
+					    optarg);
+				if (rv == 0) {
+					gid = next_syntactic_gid++;
+					for (si = 0; si < nsib; si++)
+						pmcstat_add_one_event(option,
+						    siblings[si], &args, gid,
+						    si == 0);
+					pmcstat_free_event_group(siblings,
+					    nsib);
+					break;
+				}
+				/* not really a group; fall through */
+			}
 			caps = 0;
 			if ((ev = malloc(sizeof(*ev))) == NULL)
 				errx(EX_SOFTWARE, "ERROR: Out of memory.");
@@ -1139,19 +1168,83 @@ main(int argc, char **argv)
 	 */
 
 	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
-		if (pmc_allocate(ev->ev_spec, ev->ev_mode,
-			ev->ev_flags, ev->ev_cpu, &ev->ev_pmcid,
-			ev->ev_count) < 0)
+		int rc;
+
+		/*
+		 * In brace-grouping mode (-b) we cannot tell at parse time
+		 * whether the combined event count of every group attached
+		 * to one target will fit in the available HW counters.  Two
+		 * groups that each fit on their own can still collectively
+		 * over-subscribe the PMU (e.g. 2+3+3 events on a 6-counter
+		 * Zen3).  The kernel only consults PMC_F_GROUP_MUX on the
+		 * leader's allocation and only acts on it when nevents
+		 * exceeds the *remaining* HW slot budget at commit time, so
+		 * setting it unconditionally on every leader is a no-op for
+		 * groups that fit and a graceful fallback for groups that
+		 * would otherwise hit ENOSPC at pmc_group_commit.
+		 */
+		if (ev->ev_groupid > 0 && ev->ev_is_leader)
+			ev->ev_flags |= PMC_F_GROUP_MUX;
+
+		if (ev->ev_groupid > 0)
+			rc = pmc_allocate_group(ev->ev_spec, ev->ev_mode,
+			    ev->ev_flags, ev->ev_cpu, &ev->ev_pmcid,
+			    ev->ev_count);
+		else
+			rc = pmc_allocate(ev->ev_spec, ev->ev_mode,
+			    ev->ev_flags, ev->ev_cpu, &ev->ev_pmcid,
+			    ev->ev_count);
+		if (rc < 0)
 			err(EX_OSERR,
 "ERROR: Cannot allocate %s-mode pmc with specification \"%s\"",
 			    PMC_IS_SYSTEM_MODE(ev->ev_mode) ?
 			    "system" : "process", ev->ev_spec);
+		if (args.pa_verbosity > 0 || ev->ev_groupid > 0)
+			fprintf(stderr,
+			    "pmcstat: alloc spec=\"%s\" groupid=%d "
+			    "leader=%d -> pmcid=0x%jx\n",
+			    ev->ev_spec, ev->ev_groupid,
+			    ev->ev_is_leader, (uintmax_t)ev->ev_pmcid);
 
 		if (PMC_IS_SAMPLING_MODE(ev->ev_mode) &&
 		    pmc_set(ev->ev_pmcid, ev->ev_count) < 0)
 			err(EX_OSERR,
 			    "ERROR: Cannot set sampling count for PMC \"%s\"",
 			    ev->ev_name);
+	}
+
+	if ((args.pa_flags & FLAG_DO_GROUPING) != 0) {
+		struct pmcstat_ev *ev2;
+		int gid_seen;
+		uint32_t real_gid;
+
+		for (gid_seen = 1; gid_seen < next_syntactic_gid;
+		    gid_seen++) {
+			real_gid = 0;
+			if (pmc_group_create(&real_gid) < 0)
+				err(EX_OSERR, "ERROR: pmc_group_create");
+			fprintf(stderr,
+			    "pmcstat: created kernel gid=%u (syntactic=%d)\n",
+			    real_gid, gid_seen);
+			STAILQ_FOREACH(ev2, &args.pa_events, ev_next) {
+				if (ev2->ev_groupid != gid_seen)
+					continue;
+				fprintf(stderr,
+				    "pmcstat: group_add gid=%u pmcid=0x%jx "
+				    "spec=\"%s\" leader=%d\n",
+				    real_gid, (uintmax_t)ev2->ev_pmcid,
+				    ev2->ev_spec, ev2->ev_is_leader);
+				if (pmc_group_add(real_gid, ev2->ev_pmcid,
+				    ev2->ev_is_leader) < 0)
+					err(EX_OSERR,
+					    "ERROR: pmc_group_add gid=%u",
+					    real_gid);
+			}
+			if (pmc_group_commit(real_gid) < 0)
+				err(EX_OSERR,
+				    "ERROR: pmc_group_commit gid=%u",
+				    real_gid);
+		}
 	}
 
 	/* compute printout widths */
