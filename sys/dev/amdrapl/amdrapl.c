@@ -176,6 +176,21 @@ amd_rapl_update_delta(struct amd_rapl_softc *sc, struct amd_rapl_value *val,
 		seqc_write_end(&val->seqc);
 		return;
 	}
+	/*
+	 * Coalesce sub-millisecond re-samples. sysctl(8) invokes a string handler
+	 * twice for one read -- once with oldptr==NULL to size the buffer, once to
+	 * fill it -- so the read path samples this slot twice, microseconds apart.
+	 * Folding the second hit in would collapse diff_time below the 1ms
+	 * resolution amd_rapl_count_watt() divides by, zeroing the reported power.
+	 * Drop it without touching prev/prev_time so the next genuine sample spans
+	 * the full interval and accum loses no energy; both sysctl passes then read
+	 * back an identical diff and format the same string (a length mismatch
+	 * between passes would make the data pass fail with ENOMEM).
+	 */
+	if (now - val->prev_time < SBT_1MS) {
+		seqc_write_end(&val->seqc);
+		return;
+	}
 	if (cur >= val->prev)
 		val->diff = cur - val->prev;
 	else
@@ -373,7 +388,9 @@ sysctl_amd_rapl_display_package(SYSCTL_HANDLER_ARGS)
 	/* Sample on read so power reflects the interval since the last read,
 	 * not the (now seconds-long) overflow-guard cadence (G3 / Phase 1.4).
 	 * The watt math divides by the measured interval, so an arbitrary read
-	 * spacing is fine (Phase 2.3). */
+	 * spacing is fine (Phase 2.3). The sysctl size-probe/data double call
+	 * samples this twice in quick succession; amd_rapl_update_delta() ignores
+	 * the sub-millisecond second hit so the interval is not collapsed. */
 	amd_rapl_note_read_package(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%ju",
@@ -396,7 +413,10 @@ sysctl_amd_rapl_display_cores(SYSCTL_HANDLER_ARGS)
 	/* Sample on read so power reflects the interval since the last read,
 	 * not the (now seconds-long) overflow-guard cadence (G3 / Phase 1.4).
 	 * The watt math divides by the measured interval, so an arbitrary read
-	 * spacing is fine (Phase 2.3). One field per physical core (F1). */
+	 * spacing is fine (Phase 2.3). One field per physical core (F1). The
+	 * sysctl size-probe/data double call samples this twice in quick
+	 * succession; amd_rapl_update_delta() ignores the sub-millisecond second
+	 * hit so the interval is not collapsed. */
 	amd_rapl_note_read_cores(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%ju",
