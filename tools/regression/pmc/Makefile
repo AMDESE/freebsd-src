@@ -28,7 +28,8 @@ LIBPMCSTAT_INC=	-I${LIBPMCSTAT_SRC}
 CFLAGS+=	-O -g -Wall
 
 # Kernel ABI tests (need hwpmc(4) loaded and root to run).
-KTESTS=		pmc_group_test pmc_mux_test pmc_mux_works_test
+KTESTS=		pmc_group_test pmc_mux_test pmc_mux_works_test \
+		pmc_mux_drain_test
 
 # Userland-only test (parser unit test, no PMU access).
 UTESTS=		test_libpmcstat_group
@@ -48,6 +49,11 @@ pmc_mux_test: ${.CURDIR}/pmc_mux_test.c
 pmc_mux_works_test: ${.CURDIR}/pmc_mux_works_test.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
 
+# Reproduces the multiplex switch-off drain wedge; needs -lpthread for
+# the pinned real-time worker threads that starve the passive drain.
+pmc_mux_drain_test: ${.CURDIR}/pmc_mux_drain_test.c
+	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc -lpthread
+
 # libpmcstat is INTERNALLIB (no .so installed), so build the parser TU
 # directly into the test binary.
 test_libpmcstat_group: ${.CURDIR}/test_libpmcstat_group.c \
@@ -66,6 +72,8 @@ check-root: ${KTESTS}
 	./pmc_mux_test
 	@echo "==> pmc_mux_works_test"
 	./pmc_mux_works_test
+	@echo "==> pmc_mux_drain_test"
+	./pmc_mux_drain_test
 	@if [ -r ${.CURDIR}/pmcstat_test.sh ]; then \
 		echo "==> pmcstat(8) shell tests"; \
 		sh ${.CURDIR}/pmcstat_test.sh; \
