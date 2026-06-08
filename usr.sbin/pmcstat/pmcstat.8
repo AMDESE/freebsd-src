@@ -309,6 +309,36 @@ option to read in samples that were previously collected and
 saved with the
 .Fl O
 option.
+.It Fl b
+Enable PMU event grouping.
+When this flag is set, an argument to
+.Fl p ,
+.Fl P ,
+.Fl s
+or
+.Fl S
+may be a brace-list of the form
+.Sq Brq Ar ev1 , Ar ev2 , Ar ev3 :
+all listed events are programmed atomically as a single PMU group, so
+the counter values for siblings are read at consistent program points.
+Every brace-mode group leader is allocated with
+.Dv PMC_F_GROUP_MUX
+set, which has no effect on groups that fit in hardware but lets the
+kernel transparently time-multiplex any group that overflows the
+.Em remaining
+hardware counter budget.
+For example, on a 6-counter Zen3 the invocation
+.Bd -literal -offset indent
+pmcstat -b -p '{instructions,unhalted-cycles}' \\
+    -p '{ls_alloc_mab_count,ls_not_halted_cyc,ls_dispatch.all}' \\
+    -p '{ls_smi_rx,ls_int_taken,instructions}' sleep 60
+.Ed
+.Pp
+attaches three groups (2+3+3 = 8 events) to one target.
+The first two groups consume 5 of 6 counters, leaving 1.
+The third group is then committed in multiplex mode so its 3 events
+rotate through the remaining slot rather than failing with
+.Er ENOSPC .
 .It Fl c Ar cpu-spec
 Set the cpus for subsequent system mode PMCs specified on the
 command line to
