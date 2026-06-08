@@ -826,10 +826,10 @@ cpu_mp_announce(void)
  * Return the physical package (socket) id of a logical CPU.
  *
  * The package id is the CPU's APIC id with the per-package core/thread bits
- * shifted out. pkg_id_shift is the bit boundary computed during topology probe,
- * so on a single-package system every CPU yields 0. Exposed for drivers that
- * must map per-socket hardware (e.g. AMD RAPL package energy MSRs) onto real
- * sockets rather than approximating with NUMA domains.
+ * shifted out. pkg_id_shift is the bit boundary from the topology probe, so a
+ * single-package system yields 0 for every CPU. Exposed for drivers that map
+ * per-socket hardware (e.g. AMD RAPL package energy MSRs) onto real sockets
+ * rather than approximating with NUMA domains.
  */
 int
 cpu_get_pkg_id(int cpu)
@@ -841,11 +841,11 @@ cpu_get_pkg_id(int cpu)
  * Return the physical core id of a logical CPU.
  *
  * The core id is the CPU's APIC id with the per-core SMT-thread bits shifted
- * out. core_id_shift is the bit boundary computed during topology probe, so the
- * two SMT siblings of one physical core yield the same id while the package bits
- * above keep it unique across sockets. Exposed for drivers that must map
- * per-physical-core hardware (e.g. the AMD RAPL per-core energy MSR, which is
- * shared by both siblings) onto real cores rather than per logical CPU.
+ * out. core_id_shift is the bit boundary from the topology probe, so the two SMT
+ * siblings of one core yield the same id while the package bits above keep it
+ * unique across sockets. Exposed for drivers that map per-physical-core hardware
+ * (e.g. the AMD RAPL per-core energy MSR, shared by both siblings) onto real
+ * cores rather than per logical CPU.
  */
 int
 cpu_get_core_id(int cpu)
