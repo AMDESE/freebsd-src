@@ -1276,6 +1276,98 @@ out:
 }
 
 int
+pmc_allocate_group(const char *ctrspec, enum pmc_mode mode, uint32_t flags,
+    int cpu, pmc_id_t *pmcid, uint64_t count)
+{
+	return (pmc_allocate(ctrspec, mode, flags | PMC_F_GROUP_DEFER, cpu,
+	    pmcid, count));
+}
+
+int
+pmc_group_create(uint32_t *groupid)
+{
+	struct pmc_op_pmcgroupcreate args;
+	int rv;
+
+	if (groupid == NULL) {
+		errno = EINVAL;
+		return (-1);
+	}
+	bzero(&args, sizeof(args));
+	rv = PMC_CALL(PMC_OP_PMCGROUPCREATE, &args);
+	if (rv == 0)
+		*groupid = args.pm_groupid;
+	return (rv);
+}
+
+int
+pmc_group_add(uint32_t groupid, pmc_id_t pmcid, int leader)
+{
+	struct pmc_op_pmcgroupadd args;
+
+	bzero(&args, sizeof(args));
+	args.pm_groupid = groupid;
+	args.pm_pmcid = pmcid;
+	if (leader)
+		args.pm_flags = PMC_GROUP_F_LEADER;
+	return (PMC_CALL(PMC_OP_PMCGROUPADD, &args));
+}
+
+int
+pmc_group_commit(uint32_t groupid)
+{
+	struct pmc_op_pmcgroupcommit args;
+
+	bzero(&args, sizeof(args));
+	args.pm_groupid = groupid;
+	return (PMC_CALL(PMC_OP_PMCGROUPCOMMIT, &args));
+}
+
+/*
+ * Convenience: release a sequence of grouped pmc ids.  Kept lib-side
+ * so callers do not have to track sibling ids individually; the
+ * kernel side has already wired pmu_group_on_release into
+ * pmc_release_pmc_descriptor.
+ */
+int
+pmc_group_release(pmc_id_t *pmcids, size_t n)
+{
+	size_t i;
+	int last_err = 0;
+
+	for (i = 0; i < n; i++)
+		if (pmc_release(pmcids[i]) != 0)
+			last_err = -1;
+	return (last_err);
+}
+
+/*
+ * Advanced reader: returns the (scaled) value plus the time_enabled
+ * and time_running ratios used by the kernel to scale a multiplexed
+ * event.  Until the kernel exports the ratios in pmc_op_pmcrw,
+ * *enabled and *running are populated with zero and pmc_read() returns
+ * the already-scaled value; callers that want explicit scaling factors
+ * should treat unsupported (0,0) as "scaling not available".
+ */
+int
+pmc_read_pair(pmc_id_t pmc, pmc_value_t *value, uint64_t *enabled,
+    uint64_t *running)
+{
+	int rv;
+
+	if (value == NULL) {
+		errno = EINVAL;
+		return (-1);
+	}
+	rv = pmc_read(pmc, value);
+	if (enabled != NULL)
+		*enabled = 0;
+	if (running != NULL)
+		*running = 0;
+	return (rv);
+}
+
+int
 pmc_attach(pmc_id_t pmc, pid_t pid)
 {
 	struct pmc_op_pmcattach pmc_attach_args;
