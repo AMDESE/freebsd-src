@@ -1819,8 +1819,10 @@ dev/hid/ps4dshock.c		optional ps4dshock
 dev/hid/u2f.c			optional u2f
 dev/hid/xb360gp.c		optional xb360gp
 dev/hptiop/hptiop.c		optional hptiop scbus
+dev/hwpmc/hwpmc_assign.c	optional hwpmc
 dev/hwpmc/hwpmc_logging.c	optional hwpmc
 dev/hwpmc/hwpmc_mod.c		optional hwpmc
+dev/hwpmc/hwpmc_pmu.c		optional hwpmc
 dev/hwpmc/hwpmc_soft.c		optional hwpmc
 dev/hwreset/hwreset.c		optional hwreset
 dev/hwreset/hwreset_array.c	optional hwreset
