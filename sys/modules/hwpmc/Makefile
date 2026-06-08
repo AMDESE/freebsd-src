@@ -7,6 +7,7 @@
 KMOD=	hwpmc
 
 SRCS=	bus_if.h device_if.h hwpmc_mod.c hwpmc_logging.c hwpmc_soft.c
+SRCS+=	hwpmc_pmu.c hwpmc_assign.c
 SRCS+=	vnode_if.h
 
 .if ${MACHINE_CPUARCH} == "aarch64"
