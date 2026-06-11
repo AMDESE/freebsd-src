@@ -280,13 +280,11 @@ ibs_allocate_pmc(int cpu __unused, int ri, struct pmc *pm,
 	KASSERT(ri >= 0 && ri < IBS_NPMCS,
 	    ("[ibs,%d] illegal row index %d", __LINE__, ri));
 
-	/* check class match */
+	/* Row discriminators; the allocation loop probes every row. */
 	if (a->pm_class != PMC_CLASS_IBS)
-		return (EXTERROR(EINVAL, "PMC class is not IBS"));
+		return (EINVAL);
 	if (a->pm_md.pm_ibs.ibs_type != ri)
-		return (EXTERROR(EINVAL,
-		    "IBS type %ju does not match PMC index %ju",
-		    (uint64_t)a->pm_md.pm_ibs.ibs_type, (uint64_t)ri));
+		return (EINVAL);
 
 	caps = pm->pm_caps;
 

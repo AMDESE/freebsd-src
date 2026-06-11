@@ -3267,35 +3267,6 @@ pmc_class_to_classdep(enum pmc_class class)
 	return (NULL);
 }
 
-static bool
-pmc_capture_hwpmc_exterr(struct thread *td, struct kexterr *ke)
-{
-
-	if ((td->td_pflags2 & TDP2_EXTERR) == 0)
-		return (false);
-
-	switch (td->td_kexterr.cat) {
-	case EXTERR_CAT_HWPMC_AMD:
-	case EXTERR_CAT_HWPMC_IBS:
-	case EXTERR_CAT_HWPMC_MOD:
-		*ke = td->td_kexterr;
-		return (true);
-	default:
-		return (false);
-	}
-}
-
-static int
-pmc_return_saved_exterr(const struct kexterr *ke, int error)
-{
-	struct kexterr saved;
-
-	saved = *ke;
-	saved.error = error;
-	exterr_set_from(&saved);
-	return (error);
-}
-
 #if defined(HWPMC_DEBUG) && defined(KTR)
 static const char *pmc_op_to_name[] = {
 #undef	__PMC_OP
@@ -3328,7 +3299,6 @@ static const char *pmc_op_to_name[] = {
 static int
 pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 {
-	struct kexterr alloc_ke;
 	struct proc *p;
 	struct pmc *pmc;
 	struct pmc_binding pb;
@@ -3482,8 +3452,6 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 		for (n = pcd->pcd_ri; n < md->pmd_npmc; n++) {
 			pcd = pmc_ri_to_classdep(md, n, &adjri);
 
-			if (pcd->pcd_class != class)
-				continue;
 			if (!pmc_can_allocate_row(n, mode) ||
 			    !pmc_can_allocate_rowindex(p, n, cpu))
 				continue;
@@ -3491,7 +3459,6 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 			    !PMC_IS_SHAREABLE_PMC(cpu, n))
 				continue;
 
-			td->td_pflags2 &= ~TDP2_EXTERR;
 			if (pcd->pcd_allocate_pmc(cpu, adjri, pmc, pa) == 0) {
 				/* Success. */
 				break;
@@ -3502,13 +3469,10 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 		for (n = pcd->pcd_ri; n < md->pmd_npmc; n++) {
 			pcd = pmc_ri_to_classdep(md, n, &adjri);
 
-			if (pcd->pcd_class != class)
-				continue;
 			if (!pmc_can_allocate_row(n, mode) ||
 			    !pmc_can_allocate_rowindex(p, n, PMC_CPU_ANY))
 				continue;
 
-			td->td_pflags2 &= ~TDP2_EXTERR;
 			if (pcd->pcd_allocate_pmc(td->td_oncpu, adjri, pmc,
 			    pa) == 0) {
 				/* Success. */
@@ -3524,8 +3488,9 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 
 	if (n == md->pmd_npmc) {
 		pmc_destroy_pmc_descriptor(pmc);
-		if (pmc_capture_hwpmc_exterr(td, &alloc_ke))
-			return (pmc_return_saved_exterr(&alloc_ke, EINVAL));
+		/* Preserve a more specific error from the class allocator. */
+		if ((td->td_pflags2 & TDP2_EXTERR) != 0)
+			return (EINVAL);
 		return (EXTERROR(EINVAL,
 		    "No PMC row accepted the allocation request"));
 	}
@@ -3562,15 +3527,10 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 			    "PMC row %ju on CPU %ju is not enabled",
 			    (uintmax_t)n, (uintmax_t)cpu));
 		}
-		/* Discard any stale extended error from the allocation loop. */
-		td->td_pflags2 &= ~TDP2_EXTERR;
 		if ((error = pcd->pcd_config_pmc(cpu, adjri, pmc)) != 0) {
 			(void)pcd->pcd_release_pmc(cpu, adjri, pmc);
 			pmc_destroy_pmc_descriptor(pmc);
 			pmc_restore_cpu_binding(&pb);
-			if (pmc_capture_hwpmc_exterr(td, &alloc_ke))
-				return (pmc_return_saved_exterr(&alloc_ke,
-				    EPERM));
 			return (EXTERROR(EPERM,
 			    "PMC configuration failed for row %ju on CPU %ju",
 			    (uintmax_t)n, (uintmax_t)cpu));
@@ -3597,7 +3557,7 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 	if (error != 0) {
 		pmc_release_pmc_descriptor(pmc);
 		pmc_destroy_pmc_descriptor(pmc);
-		return (error);
+		return (EXTERROR(error, "Failed to register PMC owner"));
 	}
 
 	/*

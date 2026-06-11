@@ -16,7 +16,6 @@
 #include <errno.h>
 #include <exterr.h>
 #include <pmc.h>
-#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -81,8 +80,8 @@ require_hwpmc(void)
 	atf_tc_skip("hwpmc is unavailable: %s", strerror(errno));
 }
 
-static bool
-have_class(enum pmc_class class)
+static void
+require_class(enum pmc_class class, const char *name)
 {
 	const struct pmc_cpuinfo *pci;
 	uint32_t i;
@@ -90,18 +89,8 @@ have_class(enum pmc_class class)
 	ATF_REQUIRE_EQ(0, pmc_cpuinfo(&pci));
 	for (i = 0; i < pci->pm_nclass; i++) {
 		if (pci->pm_classes[i].pm_class == class)
-			return (true);
+			return;
 	}
-	return (false);
-}
-
-static void
-require_class(enum pmc_class class, const char *name)
-{
-
-	if (have_class(class))
-		return;
-
 	atf_tc_skip("%s PMCs are unavailable on this system", name);
 }
 
@@ -384,6 +373,10 @@ ATF_TC_BODY(ibs_missing_system_capability, tc)
 	require_exterr("IBS requires SYSTEM capability");
 }
 
+/*
+ * An out-of-range ibs_type is a row discriminator mismatch on every IBS
+ * row (bare EINVAL), so the generic loop-exhaustion message is surfaced.
+ */
 ATF_TC_WITHOUT_HEAD(ibs_invalid_type);
 ATF_TC_BODY(ibs_invalid_type, tc)
 {
@@ -401,7 +394,7 @@ ATF_TC_BODY(ibs_invalid_type, tc)
 	pa.pm_md.pm_ibs.ibs_type = UINT32_MAX;
 
 	ATF_REQUIRE_ERRNO(EINVAL, hwpmc_call(PMC_OP_PMCALLOCATE, &pa) == -1);
-	require_exterr("IBS type");
+	require_exterr("No PMC row accepted");
 }
 
 ATF_TC_WITHOUT_HEAD(ibs_invalid_config_bits);
