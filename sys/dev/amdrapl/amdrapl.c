@@ -495,6 +495,18 @@ amd_rapl_identify(driver_t *driver, device_t parent)
 {
 	device_t child;
 
+	/*
+	 * One global instance: identify runs for every cpuN parent, so gate on
+	 * cpu0 (and on RAPL hardware) here rather than rejecting in probe,
+	 * which would leave a dead child under every other CPU.
+	 */
+	if (device_get_unit(parent) != 0)
+		return;
+	if (cpu_vendor_id != CPU_VENDOR_AMD &&
+	    cpu_vendor_id != CPU_VENDOR_HYGON)
+		return;
+	if (!(amd_pminfo & AMDPM_RAPL))
+		return;
 	/* Don't attach twice. */
 	if (device_find_child(parent, AMD_RAPL_DRIVER_NAME, DEVICE_UNIT_ANY) !=
 	    NULL)
@@ -502,7 +514,7 @@ amd_rapl_identify(driver_t *driver, device_t parent)
 	child = device_add_child(parent, AMD_RAPL_DRIVER_NAME, DEVICE_UNIT_ANY);
 	if (child == NULL)
 		device_printf(parent,
-		    "add " AMD_RAPL_DRIVER_NAME "child failed\n");
+		    "add " AMD_RAPL_DRIVER_NAME " child failed\n");
 }
 
 static int
