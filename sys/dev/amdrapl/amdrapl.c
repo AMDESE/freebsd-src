@@ -27,10 +27,6 @@
 
 #define	AMD_RAPL_DRIVER_NAME	"amd_rapl"
 
-#define	MSR_RAPL_PWRUNIT		0xC0010299
-#define	MSR_RAPL_CORE_ENERGY_STATUS	0xC001029A
-#define	MSR_RAPL_PACKAGE_ENERGY_STATUS	0xC001029B
-
 /*
  * Worst-case package watts, for sizing the overflow-guard timer. The 32-bit
  * energy counter must not wrap twice between guard samples; a high value keeps
@@ -209,7 +205,7 @@ amd_rapl_read_core_energy(void *arg)
 	struct amd_rapl_softc *sc = arg;
 	uint64_t cur;
 
-	if (rdmsr_safe(MSR_RAPL_CORE_ENERGY_STATUS, &cur) != 0)
+	if (rdmsr_safe(MSR_AMD_CORE_ENERGY_STATUS, &cur) != 0)
 		return;
 	amd_rapl_update_delta(sc, &sc->core_value[sc->cpu_core_slot[curcpu]],
 	    cur);
@@ -249,7 +245,7 @@ amd_rapl_read_package_energy(void *arg)
 	struct amd_rapl_softc *sc = arg;
 	uint64_t cur;
 
-	if (rdmsr_safe(MSR_RAPL_PACKAGE_ENERGY_STATUS, &cur) != 0)
+	if (rdmsr_safe(MSR_AMD_PKG_ENERGY_STATUS, &cur) != 0)
 		return;
 	amd_rapl_update_delta(sc, &sc->package_value[sc->cpu_pkg_slot[curcpu]],
 	    cur);
@@ -664,13 +660,13 @@ amd_rapl_attach(device_t dev)
 	 * panics the host. Nothing is allocated yet, so a fault is a clean ENXIO
 	 * abort (only the _SAFE path even sets the return value).
 	 */
-	error = x86_msr_op(MSR_RAPL_PWRUNIT,
+	error = x86_msr_op(MSR_AMD_RAPL_POWER_UNIT,
 	    MSR_OP_RENDEZVOUS_ONE | MSR_OP_READ | MSR_OP_SAFE |
 		MSR_OP_CPUID(probe_cpu),
 	    0, &value);
 	if (error != 0) {
 		device_printf(dev, "power-unit MSR (0x%x) read faulted: %d\n",
-		    MSR_RAPL_PWRUNIT, error);
+		    MSR_AMD_RAPL_POWER_UNIT, error);
 		return (ENXIO);
 	}
 	sc->energy_unit = (value >> 8) & 0x1f;
@@ -694,9 +690,9 @@ amd_rapl_attach(device_t dev)
 	 * a VM may emulate one domain and not the other. If neither responds, abort
 	 * before any allocation for a clean ENXIO.
 	 */
-	sc->has_package = amd_rapl_msr_present(MSR_RAPL_PACKAGE_ENERGY_STATUS,
+	sc->has_package = amd_rapl_msr_present(MSR_AMD_PKG_ENERGY_STATUS,
 	    probe_cpu);
-	sc->has_core = amd_rapl_msr_present(MSR_RAPL_CORE_ENERGY_STATUS,
+	sc->has_core = amd_rapl_msr_present(MSR_AMD_CORE_ENERGY_STATUS,
 	    probe_cpu);
 	if (!sc->has_package && !sc->has_core) {
 		device_printf(dev,
