@@ -876,6 +876,7 @@ static device_method_t amd_rapl_methods[] = {
 	DEVMETHOD(device_detach, amd_rapl_detach),
 	DEVMETHOD(device_suspend, amd_rapl_suspend),
 	DEVMETHOD(device_resume, amd_rapl_resume),
+	DEVMETHOD_END
 };
 
 static driver_t amd_rapl_driver = {
