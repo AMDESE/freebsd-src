@@ -352,6 +352,10 @@ amd_rapl_arm_guard(struct amd_rapl_softc *sc)
 static void
 amd_rapl_note_read_cores(struct amd_rapl_softc *sc)
 {
+	/* Suspended: counters may be mid-reset, keep the baseline untouched
+	 * until resume re-primes (it clears dying last). */
+	if (sc->dying)
+		return;
 	amd_rapl_sample_cores(sc);
 	atomic_store_rel_64(&sc->last_read, (uint64_t)sbinuptime());
 	amd_rapl_arm_guard(sc);
@@ -364,6 +368,9 @@ amd_rapl_note_read_cores(struct amd_rapl_softc *sc)
 static void
 amd_rapl_note_read_package(struct amd_rapl_softc *sc)
 {
+	/* See amd_rapl_note_read_cores(). */
+	if (sc->dying)
+		return;
 	amd_rapl_sample_package(sc);
 	atomic_store_rel_64(&sc->last_read, (uint64_t)sbinuptime());
 	amd_rapl_arm_guard(sc);
