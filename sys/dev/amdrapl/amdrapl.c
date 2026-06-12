@@ -121,8 +121,9 @@ amd_rapl_count_ujoules(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 }
 
 /*
- * Power = energy / time, reported in milliwatts. uJ / ms is exactly mW
- * (1 uJ/ms = 1 mW): no scaling factor, and the result stays within a uint64_t.
+ * Power = energy / time, reported in milliwatts: uJ * 1000 / us. Microsecond
+ * resolution keeps short windows accurate -- flooring to whole milliseconds
+ * overstated power up to 2x for sub-10ms sample spacings.
  *
  * diff_time is the wall-clock gap between the two samples that produced diff
  * (see amd_rapl_update_delta). Deriving the denominator from the measured
@@ -132,7 +133,7 @@ amd_rapl_count_ujoules(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 static uint64_t
 amd_rapl_count_watt(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 {
-	uint64_t dt_ms, energy_uj, diff;
+	uint64_t dt_us, energy_uj, diff;
 	sbintime_t dt;
 	seqc_t s;
 
@@ -145,11 +146,13 @@ amd_rapl_count_watt(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 		dt = val->diff_time;
 	} while (seqc_consistent(&val->seqc, s) == false);
 
-	dt_ms = dt / SBT_1MS;
-	if (dt_ms == 0)
+	/* Split seconds and fraction so multi-hour gaps cannot overflow. */
+	dt_us = (uint64_t)(dt >> 32) * 1000000 +
+	    (((dt & UINT32_MAX) * 1000000) >> 32);
+	if (dt_us == 0)
 		return (0);
 	energy_uj = amd_rapl_raw_to_uj(sc, diff);
-	return (energy_uj / dt_ms);
+	return (energy_uj * 1000 / dt_us);
 }
 
 static void
