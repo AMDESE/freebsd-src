@@ -43,9 +43,10 @@
  * Idle-disarm threshold, in guard intervals. The demand-gated guard self-disarms
  * after no sysctl read for this many guard periods. Must exceed any plausible
  * slow-poll interval, else a slow consumer lets the guard lapse mid-window and
- * loses counter wraps. Tunable via idle_guard_mult; floor 2.
+ * latches lapsed. 10 periods cover a 5-minute poll cadence at the typical
+ * ~33 s guard interval. Tunable via idle_guard_mult; floor 2.
  */
-#define	AMD_RAPL_IDLE_GUARD_MULT	4
+#define	AMD_RAPL_IDLE_GUARD_MULT	10
 
 /* Ceiling for idle_guard_mult: keeps mult * guard_sbt below INT64_MAX. */
 #define	AMD_RAPL_IDLE_GUARD_MULT_MAX	1000000
@@ -191,8 +192,8 @@ amd_rapl_update_delta(struct amd_rapl_softc *sc, struct amd_rapl_value *val,
 	 * The wrap correction above recovers exactly one 32-bit wrap. If the sample
 	 * gap exceeds one worst-case wrap period the counter may have wrapped more
 	 * than once unseen (only after the demand-gated guard self-disarms during
-	 * read silence), so accum -- and the *_energy_uj derived from it --
-	 * under-counts. Latch a sticky flag, reported via *_energy_lapsed.
+	 * read silence), so accum -- and the *_energy_uj derived from it -- may
+	 * under-count. Latch a sticky flag, reported via *_energy_lapsed.
 	 */
 	if (val->diff_time > sc->lapse_sbt)
 		val->lapsed = true;
@@ -458,8 +459,8 @@ sysctl_amd_rapl_display_cores_uj(SYSCTL_HANDLER_ARGS)
 
 /*
  * Report each domain's sticky idle-lapse flag as a comma-separated 0/1 list
- * parallel to *_energy_uj. A 1 means a sample gap once exceeded one wrap period,
- * so that domain's *_energy_uj lost at least one 2^32 wrap and under-reports.
+ * parallel to *_energy_uj. A 1 means a sample gap once exceeded one worst-case
+ * wrap period, so that domain's *_energy_uj may have lost a 2^32 wrap.
  * Status read only: does not sample or re-arm the guard (the flag advances only
  * on a sample, which the *_energy_uj paths drive), so a bare poll costs no IPIs.
  */
@@ -752,8 +753,9 @@ amd_rapl_attach(device_t dev)
 		    "package_energy_lapsed",
 		    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, 0, sysctl_amd_rapl_display_package_lapsed, "A",
-		    "Per-domain 0/1: 1 means package_energy_uj lost a counter wrap "
-		    "during read silence and under-reports (see force_guard)");
+		    "Per-domain 0/1: 1 means a sample gap exceeded one worst-case "
+		    "wrap period and package_energy_uj may have lost a counter "
+		    "wrap (see force_guard)");
 	}
 	if (sc->has_core) {
 		SYSCTL_ADD_PROC(&sc->clist,
@@ -774,8 +776,9 @@ amd_rapl_attach(device_t dev)
 		    "cores_energy_lapsed",
 		    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, 0, sysctl_amd_rapl_display_cores_lapsed, "A",
-		    "Per-core 0/1: 1 means cores_energy_uj lost a counter wrap "
-		    "during read silence and under-reports (see force_guard)");
+		    "Per-core 0/1: 1 means a sample gap exceeded one worst-case "
+		    "wrap period and cores_energy_uj may have lost a counter "
+		    "wrap (see force_guard)");
 	}
 	SYSCTL_ADD_UINT(&sc->clist,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
