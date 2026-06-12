@@ -369,6 +369,25 @@ amd_rapl_note_read_package(struct amd_rapl_softc *sc)
 	amd_rapl_arm_guard(sc);
 }
 
+/*
+ * force_guard write hook. Only an armed callout consults the flag, so enabling
+ * it after the guard self-disarmed would otherwise do nothing until the next
+ * energy read; arm it here.
+ */
+static int
+sysctl_amd_rapl_force_guard(SYSCTL_HANDLER_ARGS)
+{
+	struct amd_rapl_softc *sc = arg1;
+	int error;
+
+	error = sysctl_handle_bool(oidp, &sc->force_guard, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (sc->force_guard)
+		amd_rapl_arm_guard(sc);
+	return (0);
+}
+
 static int
 sysctl_amd_rapl_display_package(SYSCTL_HANDLER_ARGS)
 {
@@ -791,9 +810,10 @@ amd_rapl_attach(device_t dev)
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "max_energy_uj", CTLFLAG_RD, &sc->max_energy_uj, 0,
 	    "Energy in microjoules of the maximum hardware counter value (2^32-1)");
-	SYSCTL_ADD_BOOL(&sc->clist,
+	SYSCTL_ADD_PROC(&sc->clist,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
-	    "force_guard", CTLFLAG_RWTUN, &sc->force_guard, 0,
+	    "force_guard", CTLTYPE_U8 | CTLFLAG_RWTUN | CTLFLAG_MPSAFE,
+	    sc, 0, sysctl_amd_rapl_force_guard, "CU",
 	    "Pin the overflow-guard sampler always-on. When 0 (default) the guard "
 	    "self-disarms while no consumer is reading and *_energy_uj counters are "
 	    "cumulative across active-monitoring windows rather than since attach");
