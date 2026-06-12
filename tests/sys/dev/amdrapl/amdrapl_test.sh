@@ -8,6 +8,8 @@
 #
 # Exercise the dev.amd_rapl.0.*_energy_uj sysctls. Every test skips cleanly when
 # the driver or AMD RAPL hardware is absent, so the suite is safe in generic CI.
+# Reading the energy counters is root-only (power side-channel hardening), so
+# the value-reading tests set require.user root.
 
 PKG_OID="dev.amd_rapl.0.package_energy_uj"
 CORE_OID="dev.amd_rapl.0.cores_energy_uj"
@@ -17,7 +19,8 @@ MAX_OID="dev.amd_rapl.0.max_energy_uj"
 # .ko filename (driver is amd_rapl(4), module is amdrapl.ko).
 MODNAME="amdrapl"
 
-# Skip unless the package energy sysctl is present.
+# Skip unless the package energy sysctl is present. Reads a privileged OID,
+# so callers must require root.
 require_amdrapl()
 {
 	if ! sysctl -n "${PKG_OID}" >/dev/null 2>&1; then
@@ -28,11 +31,21 @@ require_amdrapl()
 
 # Skip unless the per-core energy sysctl is present. Package and per-core
 # domains are probed independently, so a host may export one without the other.
+# Reads a privileged OID, so callers must require root.
 require_cores()
 {
 	if ! sysctl -n "${CORE_OID}" >/dev/null 2>&1; then
 		atf_skip "amd_rapl(4) per-core energy sysctl not present" \
 		    "(no AMD RAPL hardware, driver not loaded, or core domain absent)"
+	fi
+}
+
+# Skip unless the driver is attached. energy_unit is registered on attach and,
+# unlike the energy counters, is world-readable.
+require_attached()
+{
+	if ! sysctl -n "${UNIT_OID}" >/dev/null 2>&1; then
+		atf_skip "amd_rapl(4) not attached"
 	fi
 }
 
@@ -82,6 +95,7 @@ atf_test_case package_energy_monotonic
 package_energy_monotonic_head()
 {
 	atf_set "descr" "package_energy_uj never decreases between reads"
+	atf_set "require.user" "root"
 }
 package_energy_monotonic_body()
 {
@@ -101,6 +115,7 @@ atf_test_case package_energy_advances
 package_energy_advances_head()
 {
 	atf_set "descr" "package_energy_uj strictly increases on live hardware"
+	atf_set "require.user" "root"
 }
 package_energy_advances_body()
 {
@@ -120,6 +135,7 @@ atf_test_case cores_energy_monotonic
 cores_energy_monotonic_head()
 {
 	atf_set "descr" "per-core energy_uj (core 0) never decreases"
+	atf_set "require.user" "root"
 }
 cores_energy_monotonic_body()
 {
@@ -136,6 +152,7 @@ atf_test_case cores_field_count_matches_cores
 cores_field_count_matches_cores_head()
 {
 	atf_set "descr" "per-core energy list has one field per physical core"
+	atf_set "require.user" "root"
 }
 cores_field_count_matches_cores_body()
 {
@@ -159,6 +176,7 @@ atf_test_case cores_sum_within_package
 cores_sum_within_package_head()
 {
 	atf_set "descr" "summed per-core energy delta does not exceed the package delta"
+	atf_set "require.user" "root"
 }
 cores_sum_within_package_body()
 {
@@ -188,6 +206,7 @@ atf_test_case package_power_sane
 package_power_sane_head()
 {
 	atf_set "descr" "energy-derived package power is within a plausible range"
+	atf_set "require.user" "root"
 }
 package_power_sane_body()
 {
@@ -215,7 +234,7 @@ energy_unit_sane_head()
 }
 energy_unit_sane_body()
 {
-	require_amdrapl
+	require_attached
 	unit=$(sysctl -n "${UNIT_OID}")
 	# (value >> 8) & 0x1f is a 5-bit field; a zero unit (1 J/count) is bogus.
 	if [ "${unit}" -lt 1 ] || [ "${unit}" -gt 31 ]; then
@@ -230,7 +249,7 @@ max_energy_consistent_head()
 }
 max_energy_consistent_body()
 {
-	require_amdrapl
+	require_attached
 	unit=$(sysctl -n "${UNIT_OID}")
 	maxuj=$(sysctl -n "${MAX_OID}")
 	# Mirror the kernel: microjoules of the 0xffffffff maximum counter value.
@@ -245,6 +264,7 @@ atf_test_case package_domain_parity
 package_domain_parity_head()
 {
 	atf_set "descr" "package energy_uj, mwatt, and lapsed lists agree on field count"
+	atf_set "require.user" "root"
 }
 package_domain_parity_body()
 {
@@ -265,6 +285,7 @@ atf_test_case cores_domain_parity
 cores_domain_parity_head()
 {
 	atf_set "descr" "per-core energy_uj, mwatt, and lapsed lists agree on field count"
+	atf_set "require.user" "root"
 }
 cores_domain_parity_body()
 {

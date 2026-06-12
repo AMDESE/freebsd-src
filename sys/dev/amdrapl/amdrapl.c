@@ -14,6 +14,7 @@
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
+#include <sys/priv.h>
 #include <sys/sbuf.h>
 #include <sys/seqc.h>
 #include <sys/smp.h>
@@ -398,6 +399,11 @@ sysctl_amd_rapl_display_package(SYSCTL_HANDLER_ARGS)
 	struct amd_rapl_softc *sc = arg1;
 	int err, i;
 
+	/* Fine-grained energy telemetry is a power side channel (PLATYPUS,
+	 * CVE-2020-8694): privileged readers only, like Linux. */
+	err = priv_check(req->td, PRIV_DRIVER);
+	if (err != 0)
+		return (err);
 	/* Size pass: report a worst-case length so the data pass can never
 	 * outgrow the caller's buffer, and skip the sampling rendezvous. */
 	if (req->oldptr == NULL)
@@ -423,6 +429,9 @@ sysctl_amd_rapl_display_cores(SYSCTL_HANDLER_ARGS)
 	struct amd_rapl_softc *sc = arg1;
 	int err, i;
 
+	err = priv_check(req->td, PRIV_DRIVER);
+	if (err != 0)
+		return (err);
 	/* Size pass: worst-case length, no sampling rendezvous (see the
 	 * package handler). */
 	if (req->oldptr == NULL)
@@ -448,6 +457,9 @@ sysctl_amd_rapl_display_package_uj(SYSCTL_HANDLER_ARGS)
 	struct amd_rapl_softc *sc = arg1;
 	int err, i;
 
+	err = priv_check(req->td, PRIV_DRIVER);
+	if (err != 0)
+		return (err);
 	/* Size pass: worst-case length, no sampling rendezvous. */
 	if (req->oldptr == NULL)
 		return (SYSCTL_OUT(req, 0, 21 * sc->npackages + 1));
@@ -472,6 +484,9 @@ sysctl_amd_rapl_display_cores_uj(SYSCTL_HANDLER_ARGS)
 	struct amd_rapl_softc *sc = arg1;
 	int err, i;
 
+	err = priv_check(req->td, PRIV_DRIVER);
+	if (err != 0)
+		return (err);
 	/* Size pass: worst-case length, no sampling rendezvous. */
 	if (req->oldptr == NULL)
 		return (SYSCTL_OUT(req, 0, 21 * sc->ncores + 1));
