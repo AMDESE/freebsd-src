@@ -823,6 +823,10 @@
         ..
         compat32
         ..
+        dev
+            amdrapl
+            ..
+        ..
         devrandom
         ..
         dtrace
