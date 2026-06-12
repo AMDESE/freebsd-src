@@ -36,6 +36,7 @@ require_cores()
 	fi
 }
 
+# Raw comma-separated per-package list.
 pkg_uj()
 {
 	sysctl -n "${PKG_OID}"
@@ -60,6 +61,13 @@ field_count()
 	sysctl -n "$1" | awk -F, '{print NF}'
 }
 
+# Per-field deltas of two same-length CSV lists ($2 - $1), one per line.
+csv_deltas()
+{
+	echo "$1 $2" | awk '{n = split($1, a, ","); split($2, b, ","); \
+	    for (i = 1; i <= n; i++) printf "%d\n", b[i] - a[i]}'
+}
+
 # Fail unless every comma-separated field of the named sysctl is 0 or 1.
 require_boolean_list()
 {
@@ -81,9 +89,12 @@ package_energy_monotonic_body()
 	v1=$(pkg_uj)
 	sleep 2
 	v2=$(pkg_uj)
-	if [ "${v2}" -lt "${v1}" ]; then
-		atf_fail "package_energy_uj decreased: ${v1} -> ${v2}"
-	fi
+	# Check each package field; the lists are CSV on multi-socket hosts.
+	for d in $(csv_deltas "${v1}" "${v2}"); do
+		if [ "${d}" -lt 0 ]; then
+			atf_fail "package_energy_uj decreased: ${v1} -> ${v2}"
+		fi
+	done
 }
 
 atf_test_case package_energy_advances
@@ -97,9 +108,12 @@ package_energy_advances_body()
 	v1=$(pkg_uj)
 	sleep 2
 	v2=$(pkg_uj)
-	if [ "${v2}" -le "${v1}" ]; then
-		atf_fail "package consumed no energy over 2s: ${v1} -> ${v2}"
-	fi
+	for d in $(csv_deltas "${v1}" "${v2}"); do
+		if [ "${d}" -le 0 ]; then
+			atf_fail "a package consumed no energy over 2s:" \
+			    "${v1} -> ${v2}"
+		fi
+	done
 }
 
 atf_test_case cores_energy_monotonic
@@ -181,16 +195,17 @@ package_power_sane_body()
 	v1=$(pkg_uj)
 	sleep 3
 	v2=$(pkg_uj)
-	duj=$((v2 - v1))
-	if [ "${duj}" -le 0 ]; then
-		atf_fail "no energy accumulated over 3s (delta=${duj} uj)"
-	fi
-	# Integer watts = microjoules / 1e6 / seconds.
-	watts=$((duj / 1000000 / 3))
-	if [ "${watts}" -gt 2000 ]; then
-		atf_fail "implausible package power: ${watts}W" \
-		    "(delta=${duj} uj over 3s)"
-	fi
+	for duj in $(csv_deltas "${v1}" "${v2}"); do
+		if [ "${duj}" -le 0 ]; then
+			atf_fail "no energy accumulated over 3s (delta=${duj} uj)"
+		fi
+		# Integer watts = microjoules / 1e6 / seconds.
+		watts=$((duj / 1000000 / 3))
+		if [ "${watts}" -gt 2000 ]; then
+			atf_fail "implausible package power: ${watts}W" \
+			    "(delta=${duj} uj over 3s)"
+		fi
+	done
 }
 
 atf_test_case energy_unit_sane
