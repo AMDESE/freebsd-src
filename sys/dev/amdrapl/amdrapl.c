@@ -771,7 +771,10 @@ amd_rapl_attach(device_t dev)
 		    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 		    "package_mwatt",
 		    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
-		    sc, 0, sysctl_amd_rapl_display_package, "A", "");
+		    sc, 0, sysctl_amd_rapl_display_package, "A",
+		    "Average package power in milliwatts over the most recent "
+		    "sampling interval (the previous read or overflow-guard "
+		    "tick), comma-separated per domain");
 		SYSCTL_ADD_PROC(&sc->clist,
 		    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 		    "package_energy_uj",
@@ -794,7 +797,10 @@ amd_rapl_attach(device_t dev)
 		    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 		    "cores_mwatt",
 		    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
-		    sc, 0, sysctl_amd_rapl_display_cores, "A", "");
+		    sc, 0, sysctl_amd_rapl_display_cores, "A",
+		    "Average power in milliwatts over the most recent sampling "
+		    "interval (the previous read or overflow-guard tick), "
+		    "comma-separated per physical core");
 		SYSCTL_ADD_PROC(&sc->clist,
 		    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 		    "cores_energy_uj",
