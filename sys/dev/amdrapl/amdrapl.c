@@ -173,14 +173,10 @@ amd_rapl_update_delta(struct amd_rapl_softc *sc, struct amd_rapl_value *val,
 		return;
 	}
 	/*
-	 * Coalesce sub-millisecond re-samples. sysctl(8) calls a string handler
-	 * twice per read -- once with oldptr==NULL to size, once to fill -- so the
-	 * read path samples this slot twice, microseconds apart. Folding the second
-	 * hit in collapses diff_time below the 1ms amd_rapl_count_watt() divides by,
-	 * zeroing power. Drop it without touching prev/prev_time: the next real
-	 * sample spans the full interval and accum loses no energy, and both passes
-	 * read back an identical diff and format the same string (a length mismatch
-	 * between passes fails the data pass with ENOMEM).
+	 * Coalesce sub-millisecond re-samples (overlapping readers) so a read
+	 * burst cannot shrink the power window toward zero. prev/prev_time stay
+	 * put: the next real sample spans the full interval and accum loses no
+	 * energy.
 	 */
 	if (now - val->prev_time < SBT_1MS) {
 		seqc_write_end(&val->seqc);
@@ -402,11 +398,12 @@ sysctl_amd_rapl_display_package(SYSCTL_HANDLER_ARGS)
 	struct amd_rapl_softc *sc = arg1;
 	int err, i;
 
-	/* Sample on read so power reflects the interval since the last read, not
-	 * the (seconds-long) guard cadence. The watt math divides by the measured
-	 * interval, so arbitrary read spacing is fine. The sysctl size/data double
-	 * call samples twice in quick succession; amd_rapl_update_delta() drops the
-	 * sub-millisecond second hit so the interval is not collapsed. */
+	/* Size pass: report a worst-case length so the data pass can never
+	 * outgrow the caller's buffer, and skip the sampling rendezvous. */
+	if (req->oldptr == NULL)
+		return (SYSCTL_OUT(req, 0, 21 * sc->npackages + 1));
+	/* Sample on read. Power spans the interval since the latest sample of
+	 * the slot -- the previous read or a guard tick, whichever is newer. */
 	amd_rapl_note_read_package(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%ju",
@@ -426,12 +423,12 @@ sysctl_amd_rapl_display_cores(SYSCTL_HANDLER_ARGS)
 	struct amd_rapl_softc *sc = arg1;
 	int err, i;
 
-	/* Sample on read so power reflects the interval since the last read, not
-	 * the (seconds-long) guard cadence. The watt math divides by the measured
-	 * interval, so arbitrary read spacing is fine. One field per physical core.
-	 * The sysctl size/data double call samples twice in quick succession;
-	 * amd_rapl_update_delta() drops the sub-millisecond second hit so the
-	 * interval is not collapsed. */
+	/* Size pass: worst-case length, no sampling rendezvous (see the
+	 * package handler). */
+	if (req->oldptr == NULL)
+		return (SYSCTL_OUT(req, 0, 21 * sc->ncores + 1));
+	/* Sample on read; one field per physical core. Power spans the
+	 * interval since the latest sample (previous read or guard tick). */
 	amd_rapl_note_read_cores(sc);
 	sb = sbuf_new_for_sysctl(&sbs, NULL, 0, req);
 	sbuf_printf(sb, "%ju",
@@ -451,6 +448,9 @@ sysctl_amd_rapl_display_package_uj(SYSCTL_HANDLER_ARGS)
 	struct amd_rapl_softc *sc = arg1;
 	int err, i;
 
+	/* Size pass: worst-case length, no sampling rendezvous. */
+	if (req->oldptr == NULL)
+		return (SYSCTL_OUT(req, 0, 21 * sc->npackages + 1));
 	/* Sample at read time so the counter is fresh, not up to one timer period
 	 * stale. */
 	amd_rapl_note_read_package(sc);
@@ -472,6 +472,9 @@ sysctl_amd_rapl_display_cores_uj(SYSCTL_HANDLER_ARGS)
 	struct amd_rapl_softc *sc = arg1;
 	int err, i;
 
+	/* Size pass: worst-case length, no sampling rendezvous. */
+	if (req->oldptr == NULL)
+		return (SYSCTL_OUT(req, 0, 21 * sc->ncores + 1));
 	/* Sample at read time so the counter is fresh, not up to one timer period
 	 * stale. One field per physical core. */
 	amd_rapl_note_read_cores(sc);
