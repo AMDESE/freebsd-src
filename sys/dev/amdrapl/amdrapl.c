@@ -47,6 +47,9 @@
  */
 #define	AMD_RAPL_IDLE_GUARD_MULT	4
 
+/* Ceiling for idle_guard_mult: keeps mult * guard_sbt below INT64_MAX. */
+#define	AMD_RAPL_IDLE_GUARD_MULT_MAX	1000000
+
 static MALLOC_DEFINE(M_AMDRAPL, "amdrapl", "AMD RAPL driver state");
 
 struct amd_rapl_value {
@@ -302,6 +305,8 @@ amd_rapl_sample(void *arg)
 	mult = sc->idle_guard_mult;
 	if (mult < 2)
 		mult = 2;
+	else if (mult > AMD_RAPL_IDLE_GUARD_MULT_MAX)
+		mult = AMD_RAPL_IDLE_GUARD_MULT_MAX;
 	/*
 	 * Re-take sc->mtx for the reschedule decision. Checking sc->dying here (set
 	 * under sc->mtx by detach/suspend) lets callout_drain win the teardown race:
@@ -792,6 +797,8 @@ amd_rapl_attach(device_t dev)
 	    "Idle disarm threshold as a multiple of the guard interval (>=2)");
 	if (sc->idle_guard_mult < 2)
 		sc->idle_guard_mult = 2;
+	else if (sc->idle_guard_mult > AMD_RAPL_IDLE_GUARD_MULT_MAX)
+		sc->idle_guard_mult = AMD_RAPL_IDLE_GUARD_MULT_MAX;
 	/*
 	 * The OIDs above are already live, so a reader could be arming the guard
 	 * concurrently via amd_rapl_arm_guard(). Per the callout_init_mtx() contract,
