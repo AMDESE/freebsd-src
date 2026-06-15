@@ -4,12 +4,9 @@
 #
 # Copyright (c) 2026 Advanced Micro Devices, Inc.
 #
-# Functional tests for the amd_rapl(4) cumulative energy counters.
-#
-# Exercise the dev.amd_rapl.0.*_energy_uj sysctls. Every test skips cleanly when
-# the driver or AMD RAPL hardware is absent, so the suite is safe in generic CI.
-# Reading the energy counters is root-only (power side-channel hardening), so
-# the value-reading tests set require.user root.
+# Functional tests for the amd_rapl(4) energy counters. Tests skip cleanly when
+# the driver or hardware is absent. Reading the counters is root-only, so the
+# value-reading tests set require.user root.
 
 PKG_OID="dev.amd_rapl.0.package_energy_uj"
 CORE_OID="dev.amd_rapl.0.cores_energy_uj"
@@ -19,8 +16,7 @@ MAX_OID="dev.amd_rapl.0.max_energy_uj"
 # .ko filename (driver is amd_rapl(4), module is amdrapl.ko).
 MODNAME="amdrapl"
 
-# Skip unless the package energy sysctl is present. Reads a privileged OID,
-# so callers must require root.
+# Skip unless the package energy sysctl is present (privileged OID).
 require_amdrapl()
 {
 	if ! sysctl -n "${PKG_OID}" >/dev/null 2>&1; then
@@ -29,9 +25,8 @@ require_amdrapl()
 	fi
 }
 
-# Skip unless the per-core energy sysctl is present. Package and per-core
-# domains are probed independently, so a host may export one without the other.
-# Reads a privileged OID, so callers must require root.
+# Skip unless the per-core energy sysctl is present; domains are probed
+# independently, so a host may export one and not the other. Privileged OID.
 require_cores()
 {
 	if ! sysctl -n "${CORE_OID}" >/dev/null 2>&1; then
@@ -40,8 +35,7 @@ require_cores()
 	fi
 }
 
-# Skip unless the driver is attached. energy_unit is registered on attach and,
-# unlike the energy counters, is world-readable.
+# Skip unless attached. energy_unit is registered on attach and world-readable.
 require_attached()
 {
 	if ! sysctl -n "${UNIT_OID}" >/dev/null 2>&1; then
@@ -161,10 +155,9 @@ cores_field_count_matches_cores_body()
 	if [ -z "${ncores}" ]; then
 		atf_skip "kern.smp.cores unavailable; cannot check per-core count"
 	fi
-	# One field per physical core. The regression emits one per logical CPU,
-	# ~2x kern.smp.cores on an SMT part. kern.smp.cores (mp_ncores) can itself
-	# undercount the driver's dedup when a core's primary SMT thread is disabled
-	# but a sibling survives, so flag only a near-2x blowup, not strict equality.
+	# One field per physical core; an SMT double-count blows this up ~2x.
+	# kern.smp.cores can itself undercount the dedup, so flag only a near-2x
+	# blowup, not strict equality.
 	fields=$(sysctl -n "${CORE_OID}" | awk -F, '{print NF}')
 	if [ "${fields}" -lt 1 ] || [ "${fields}" -gt $((ncores + ncores / 2)) ]; then
 		atf_fail "per-core field count ${fields} vs physical cores" \
@@ -182,10 +175,8 @@ cores_sum_within_package_body()
 {
 	require_amdrapl
 	require_cores
-	# The core domain is a subset of the package domain, so summed per-core
-	# energy over an interval must not exceed package energy over the same
-	# interval. An SMT-sibling double-count would push the core sum past the
-	# package total. Host-independent: needs no core or socket count.
+	# Cores are a subset of the package, so the summed core delta must not
+	# exceed the package delta; an SMT double-count would push it past.
 	pc1=$(sum_csv "${CORE_OID}")
 	pp1=$(sum_csv "${PKG_OID}")
 	sleep 3
@@ -269,9 +260,7 @@ package_domain_parity_head()
 package_domain_parity_body()
 {
 	require_amdrapl
-	# All three package lists print from the same per-domain array, so they must
-	# expose the same field count. A drift means one printer walked a different
-	# length.
+	# All three package lists share one per-domain array, so field counts agree.
 	nuj=$(field_count "${PKG_OID}")
 	nmw=$(field_count "dev.amd_rapl.0.package_mwatt")
 	nlp=$(field_count "dev.amd_rapl.0.package_energy_lapsed")
@@ -290,8 +279,7 @@ cores_domain_parity_head()
 cores_domain_parity_body()
 {
 	require_cores
-	# Like the package domain, the three per-core lists share one backing array
-	# and must share a field count.
+	# Like the package domain, the three per-core lists share one array.
 	nuj=$(field_count "${CORE_OID}")
 	nmw=$(field_count "dev.amd_rapl.0.cores_mwatt")
 	nlp=$(field_count "dev.amd_rapl.0.cores_energy_lapsed")
@@ -308,8 +296,7 @@ lapsed_is_boolean_head()
 }
 lapsed_is_boolean_body()
 {
-	# The lapsed lists are per-domain sticky flags, so each field must be a bare
-	# 0 or 1. Probe both domains independently; skip if neither is present.
+	# Each lapsed field must be a bare 0 or 1. Probe both domains; skip if neither.
 	checked=0
 	if sysctl -n dev.amd_rapl.0.package_energy_lapsed >/dev/null 2>&1; then
 		require_boolean_list dev.amd_rapl.0.package_energy_lapsed
@@ -332,18 +319,15 @@ load_unload_cycle_head()
 }
 load_unload_cycle_body()
 {
-	# energy_unit is registered unconditionally on attach, so it's the canonical
-	# "attached" probe (package/core OIDs are domain-gated).
+	# energy_unit is the canonical "attached" probe (domain OIDs are gated).
 	if ! sysctl -n "${UNIT_OID}" >/dev/null 2>&1; then
 		atf_skip "amd_rapl(4) not attached; nothing to cycle"
 	fi
-	# Only a loadable module can be cycled. A built-in driver has no .ko to
-	# kldunload, so skip rather than fail.
+	# Built-in driver has no .ko to cycle; skip rather than fail.
 	if ! kldstat -n "${MODNAME}" >/dev/null 2>&1; then
 		atf_skip "amd_rapl(4) is built into the kernel; cannot kldunload"
 	fi
-	# Teardown is the riskiest path (callout drain, cpuset/sysctl free). A panic
-	# here takes the host down -- which is itself the signal.
+	# Teardown is the riskiest path; a panic here takes the host down.
 	if ! kldunload "${MODNAME}"; then
 		atf_fail "kldunload ${MODNAME} failed"
 	fi
@@ -359,8 +343,7 @@ load_unload_cycle_body()
 }
 load_unload_cycle_cleanup()
 {
-	# Restore the loaded state for later tests, wherever the body bailed.
-	# Reloading an already-loaded module is a harmless no-op.
+	# Restore the loaded state for later tests (reload is a harmless no-op).
 	kldload "${MODNAME}" >/dev/null 2>&1 || true
 }
 
