@@ -35,23 +35,22 @@
 #define	AMD_RAPL_GUARD_MIN_MS		10
 #define	AMD_RAPL_GUARD_MAX_MS		60000
 
-/* Idle-disarm threshold in guard intervals; self-disarm after this many quiet periods. Tunable; floor 2. */
 #define	AMD_RAPL_IDLE_GUARD_MULT	10
 
-/* Ceiling for idle_guard_mult: keeps mult * guard_sbt below INT64_MAX. */
+/* Ceiling for idle_guard_mult */
 #define	AMD_RAPL_IDLE_GUARD_MULT_MAX	1000000
 
 static MALLOC_DEFINE(M_AMDRAPL, "amdrapl", "AMD RAPL driver state");
 
 struct amd_rapl_value {
-	seqc_t seqc;		/* serializes the multi-field snapshot read */
+	seqc_t seqc;
 	uint64_t prev;
 	sbintime_t prev_time;
 	uint64_t diff;
 	sbintime_t diff_time;
 	uint64_t accum;
 	bool primed;
-	bool lapsed;		/* a sample gap exceeded one wrap period */
+	bool lapsed;
 };
 
 struct amd_rapl_softc {
@@ -80,8 +79,7 @@ struct amd_rapl_softc {
 };
 
 /*
- * Raw energy counter to microjoules. Split off whole Joules first; the naive
- * raw * 1000000 / 2^unit overflows uint64_t after weeks of uptime.
+ * Convert a raw energy counter to microjoules without overflowing uint64_t.
  */
 static uint64_t
 amd_rapl_raw_to_uj(struct amd_rapl_softc *sc, uint64_t raw)
@@ -107,11 +105,7 @@ amd_rapl_count_ujoules(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 	return (amd_rapl_raw_to_uj(sc, accum));
 }
 
-/*
- * Power in milliwatts: uJ * 1000 / us, over the measured interval (diff_time)
- * so a changing cadence can't corrupt it. Microsecond resolution; flooring to
- * ms overstated power up to 2x for sub-10ms spacing.
- */
+/* Power in milliwatts: energy (uJ) over the measured interval (us). */
 static uint64_t
 amd_rapl_count_watt(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 {
@@ -119,8 +113,8 @@ amd_rapl_count_watt(struct amd_rapl_softc *sc, struct amd_rapl_value *val)
 	sbintime_t dt;
 	seqc_t s;
 
-	/* Snapshot diff and diff_time together; a concurrent writer must not
-	 * pair this numerator with a different denominator. */
+	/* Read diff and diff_time as a pair; a concurrent writer will 
+	 * be safe */
 	do {
 		s = seqc_read(&val->seqc);
 		diff = val->diff;
@@ -140,7 +134,7 @@ amd_rapl_update_delta(struct amd_rapl_softc *sc, struct amd_rapl_value *val,
 {
 	sbintime_t now = sbinuptime();
 
-	cur &= UINT32_MAX;	/* hardware energy counter is 32-bit */
+	cur &= UINT32_MAX;
 	seqc_write_begin(&val->seqc);
 	if (!val->primed) {
 		val->prev = cur;
@@ -151,11 +145,7 @@ amd_rapl_update_delta(struct amd_rapl_softc *sc, struct amd_rapl_value *val,
 		seqc_write_end(&val->seqc);
 		return;
 	}
-	/*
-	 * Coalesce sub-ms re-samples so a read burst can't shrink the power
-	 * window toward zero; prev stays put and the next sample spans the full
-	 * interval, so no energy is lost.
-	 */
+	/* Skip sub-ms re-samples. */
 	if (now - val->prev_time < SBT_1MS) {
 		seqc_write_end(&val->seqc);
 		return;
@@ -165,11 +155,8 @@ amd_rapl_update_delta(struct amd_rapl_softc *sc, struct amd_rapl_value *val,
 	else
 		val->diff = (UINT32_MAX - val->prev) + cur + 1;
 	val->diff_time = now - val->prev_time;
-	/*
-	 * The wrap correction recovers exactly one 32-bit wrap. A gap beyond one
-	 * worst-case wrap period (only once the guard self-disarms) may hide
-	 * extra wraps and under-count accum; latch a sticky flag (*_energy_lapsed).
-	 */
+
+	/* Wrap correction recovers only one 32-bit wrap. */
 	if (val->diff_time > sc->lapse_sbt)
 		val->lapsed = true;
 	val->accum += val->diff;
@@ -191,10 +178,10 @@ amd_rapl_read_core_energy(void *arg)
 }
 
 /*
- * Sample every per-core counter. The per-core MSR is shared by a core's SMT
+ * Sample every core counter. The per-core MSR is shared by a core's SMT
  * siblings, so rendezvous only the core leads (one CPU per physical core), not
- * all_cpus. That counts the core domain once, not per sibling. The rendezvous IPI
- * mutex serializes invocations. Must NOT hold sc->mtx (no rendezvous under it).
+ * all_cpus. The rendezvous IPI mutex serializes invocations; do NOT hold
+ * sc->mtx (no rendezvous under it).
  */
 static void
 amd_rapl_sample_cores(struct amd_rapl_softc *sc)
@@ -203,11 +190,7 @@ amd_rapl_sample_cores(struct amd_rapl_softc *sc)
 	    amd_rapl_read_core_energy, smp_no_rendezvous_barrier, sc);
 }
 
-/*
- * Read this CPU's socket-scoped package MSR and fold it into its slot. Runs as
- * a rendezvous action on each package lead so the read and accumulation happen
- * with preemption disabled, never reordered against a concurrent sampler.
- */
+/* Read this CPU's package MSR and put it into its slot. */
 static void
 amd_rapl_read_package_energy(void *arg)
 {
@@ -221,9 +204,8 @@ amd_rapl_read_package_energy(void *arg)
 }
 
 /*
- * Sample every package counter. Socket-scoped MSR, so rendezvous only the
- * package leads (one per socket). Like amd_rapl_sample_cores(), must NOT hold
- * sc->mtx.
+ * Sample every package counter. Socket's MSR, so rendezvous only the
+ * package leads, must NOT hold sc->mtx.
  */
 static void
 amd_rapl_sample_package(struct amd_rapl_softc *sc)
@@ -245,7 +227,7 @@ amd_rapl_clamp_mult(u_int mult)
 	return (mult);
 }
 
-/* Arm the guard callout at the sampling cadence. Caller holds sc->mtx. */
+/* Arm the guard callout. Caller holds sc->mtx. */
 static void
 amd_rapl_schedule_guard(struct amd_rapl_softc *sc)
 {
@@ -253,11 +235,7 @@ amd_rapl_schedule_guard(struct amd_rapl_softc *sc)
 	    amd_rapl_sample, sc, 0);
 }
 
-/*
- * Periodic overflow-guard sampler. Read-path sampling keeps the counters fresh;
- * this only bounds 32-bit wrap during read silence. CALLOUT_RETURNUNLOCKED:
- * drops sc->mtx before the rendezvous.
- */
+/* Periodic overflow guard: bounds 32-bit wrap during read silence. */
 static void
 amd_rapl_sample(void *arg)
 {
@@ -270,19 +248,16 @@ amd_rapl_sample(void *arg)
 		amd_rapl_sample_cores(sc);
 	if (sc->has_package)
 		amd_rapl_sample_package(sc);
-	/*
-	 * Demand-gate: keep firing only while a consumer reads. force_guard pins
-	 * it always-on; else self-disarm after idle_guard_mult quiet periods, and
-	 * the read paths re-arm it. This final tick sampled, so accum is fresh.
+	
+	/* 
+	 * Demand-gate: fire while consumers read; self-disarm after 
+	 * idle_guard_mult quiet periods unless force_guard. 
 	 */
 	now = sbinuptime();
 	last = (sbintime_t)atomic_load_acq_64(&sc->last_read);
-	/* Clamp live (not just at attach) so a runtime tunable write takes effect. */
 	mult = amd_rapl_clamp_mult(sc->idle_guard_mult);
-	/*
-	 * Reschedule under sc->mtx. The dying check lets callout_drain win the
-	 * teardown race: once dying is set we never re-arm.
-	 */
+
+	/* Reschedule under sc->mtx. Once dying is set, never re-arm */
 	mtx_lock(&sc->mtx);
 	if (!sc->dying &&
 	    (sc->force_guard || (now - last) < (sbintime_t)mult * sc->guard_sbt))
@@ -291,9 +266,7 @@ amd_rapl_sample(void *arg)
 }
 
 /*
- * Re-arm the guard if not already pending. A currently-executing handler is not
- * "pending", so this re-arms it too. That closes the lost-wakeup window where
- * the handler stops just as a reader arrives. Requires sc->mtx.
+ * Re-arm the guard if not already pending. Requires sc->mtx.
  */
 static void
 amd_rapl_arm_guard(struct amd_rapl_softc *sc)
@@ -332,10 +305,7 @@ amd_rapl_note_read_package(struct amd_rapl_softc *sc)
 	amd_rapl_arm_guard(sc);
 }
 
-/*
- * force_guard write hook. Arm here: only an armed callout reads the flag, so
- * enabling it after a self-disarm would otherwise wait for the next read.
- */
+/* force_guard write hook. */
 static int
 sysctl_amd_rapl_force_guard(SYSCTL_HANDLER_ARGS)
 {
@@ -350,8 +320,7 @@ sysctl_amd_rapl_force_guard(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
-/* Accessor for the lapsed status OIDs; same signature as the value accessors
- * so one table can drive every per-domain sysctl. */
+/* Accessor for the lapsed status OIDs. */
 static uint64_t
 amd_rapl_count_lapsed(struct amd_rapl_softc *sc __unused,
     struct amd_rapl_value *val)
@@ -369,8 +338,8 @@ enum amd_rapl_oid_id {
 };
 
 struct amd_rapl_oid {
-	bool		is_core;	/* core vs package array + count */
-	bool		sample;		/* privileged + sample on read; false = bare poll */
+	bool		is_core;
+	bool		sample;
 	uint64_t	(*get)(struct amd_rapl_softc *, struct amd_rapl_value *);
 };
 
@@ -404,7 +373,7 @@ sysctl_amd_rapl_display(SYSCTL_HANDLER_ARGS)
 		err = priv_check(req->td, PRIV_DRIVER);
 		if (err != 0)
 			return (err);
-		/* Size pass: worst-case length, no sampling rendezvous. */
+		/* Size pass. */
 		if (req->oldptr == NULL)
 			return (SYSCTL_OUT(req, 0, 21 * n + 1));
 		if (o->is_core)
@@ -426,10 +395,7 @@ amd_rapl_identify(driver_t *driver, device_t parent)
 {
 	device_t child;
 
-	/*
-	 * One global instance: identify runs per cpuN parent, so gate on cpu0
-	 * here instead of leaving a dead child under every other CPU.
-	 */
+	/* One global instance. */
 	if (device_get_unit(parent) != 0)
 		return;
 	if (cpu_vendor_id != CPU_VENDOR_AMD &&
@@ -437,7 +403,6 @@ amd_rapl_identify(driver_t *driver, device_t parent)
 		return;
 	if (!(amd_pminfo & AMDPM_RAPL))
 		return;
-	/* Don't attach twice. */
 	if (device_find_child(parent, AMD_RAPL_DRIVER_NAME, DEVICE_UNIT_ANY) !=
 	    NULL)
 		return;
@@ -466,11 +431,8 @@ amd_rapl_probe(device_t dev)
 }
 
 /*
- * Build a dense per-CPU -> slot map and elect one lead CPU per slot. Distinct
- * ids from id_of() get a slot in first-seen order; the first CPU seen in each
- * slot becomes its lead. Used to sample a socket-scoped or SMT-shared MSR once
- * per real socket/core. It tracks physical topology rather than NUMA domains or
- * logical CPUs, which would over-count.
+ * Map each CPU to a slot and pick one lead CPU per slot, so a socket-scoped or
+ * SMT-shared MSR is sampled once per real socket/core.
  */
 static void
 amd_rapl_build_map(int (*id_of)(int cpu), int **cpu_slot, int *count,
@@ -504,10 +466,7 @@ amd_rapl_build_map(int (*id_of)(int cpu), int **cpu_slot, int *count,
 	free(id_of_slot, M_TEMP);
 }
 
-/*
- * Fault-safe RAPL MSR presence probe. MSR_OP_SAFE catches a #GP (a hypervisor
- * advertising the RAPL bit but not emulating the MSR) as absent, not a panic.
- */
+/* RAPL MSR presence probe. */
 static bool
 amd_rapl_msr_present(u_int msr, u_int cpuid)
 {
@@ -520,7 +479,7 @@ amd_rapl_msr_present(u_int msr, u_int cpuid)
 /*
  * Guard interval from the hardware energy unit. The counter wraps after
  * max_energy_uj; at AMD_RAPL_GUARD_WATT that is max_energy_uj/(P*1e6) seconds,
- * so sample at half that to preclude an unseen double-wrap. Clamped to a band.
+ * so sample at half that to avoid an unseen double-wrap.
  */
 static sbintime_t
 amd_rapl_guard_sbt(struct amd_rapl_softc *sc)
@@ -544,11 +503,8 @@ amd_rapl_attach(device_t dev)
 	int error;
 
 	sc->dev = dev;
-	/*
-	 * Read the power-unit MSR fault-safely: without MSR_OP_SAFE the rdmsr #GP
-	 * inside the rendezvous IPI has no pcb_onfault and panics the host. Nothing
-	 * allocated yet, so a fault is a clean ENXIO abort.
-	 */
+
+	/* Read the power-unit MSR fault-safely. */
 	error = x86_msr_op(MSR_AMD_RAPL_POWER_UNIT,
 	    MSR_OP_RENDEZVOUS_ONE | MSR_OP_READ | MSR_OP_SAFE |
 		MSR_OP_CPUID(probe_cpu),
@@ -561,19 +517,12 @@ amd_rapl_attach(device_t dev)
 	sc->energy_unit = (value >> 8) & 0x1f;
 	sc->max_energy_uj = amd_rapl_raw_to_uj(sc, UINT32_MAX);
 	sc->guard_sbt = amd_rapl_guard_sbt(sc);
-	/*
-	 * Lapse threshold = one wrap period = twice the guard interval. Derive it
-	 * from the clamped guard_sbt, not the raw unit, so it never drops below the
-	 * sampling cadence and latches lapsed on every normal sample.
-	 */
+
+	/* Lapse threshold = one wrap period = twice the guard interval. */
 	sc->lapse_sbt = 2 * sc->guard_sbt;
 	sc->idle_guard_mult = AMD_RAPL_IDLE_GUARD_MULT;
 	sc->force_guard = false;
 	sc->dying = false;
-	/*
-	 * Export only the domains that respond: a VM may emulate one and not the
-	 * other. Abort before any allocation if neither responds.
-	 */
 	sc->has_package = amd_rapl_msr_present(MSR_AMD_PKG_ENERGY_STATUS,
 	    probe_cpu);
 	sc->has_core = amd_rapl_msr_present(MSR_AMD_CORE_ENERGY_STATUS,
@@ -584,7 +533,7 @@ amd_rapl_attach(device_t dev)
 		return (ENXIO);
 	}
 	atomic_store_rel_64(&sc->last_read, (uint64_t)sbinuptime());
-	/* Package = physical socket (cpu_get_pkg_id), not NUMA domain. */
+	/* Package = physical socket (cpu_get_pkg_id). */
 	amd_rapl_build_map(cpu_get_pkg_id, &sc->cpu_pkg_slot, &sc->npackages,
 	    &sc->package_leads);
 	/* Core = physical core (cpu_get_core_id); SMT siblings share a slot. */
@@ -596,11 +545,6 @@ amd_rapl_attach(device_t dev)
 	    M_AMDRAPL, M_WAITOK | M_ZERO);
 	mtx_init(&sc->mtx, AMD_RAPL_DRIVER_NAME, NULL, MTX_DEF);
 	callout_init_mtx(&sc->sampling_timer, &sc->mtx, CALLOUT_RETURNUNLOCKED);
-	/*
-	 * Private sysctl context, not the device auto ctx (newbus frees that only
-	 * after detach returns). detach frees it first to drain in-flight handlers
-	 * before we destroy the mutex / free the arrays they dereference.
-	 */
 	sysctl_ctx_init(&sc->clist);
 	if (sc->has_package) {
 		SYSCTL_ADD_PROC(&sc->clist,
@@ -674,10 +618,6 @@ amd_rapl_attach(device_t dev)
 	    "idle_guard_mult", CTLFLAG_RWTUN, &sc->idle_guard_mult, 0,
 	    "Idle disarm threshold as a multiple of the guard interval (>=2)");
 	sc->idle_guard_mult = amd_rapl_clamp_mult(sc->idle_guard_mult);
-	/*
-	 * OIDs are already live, so a reader may arm the guard concurrently; arm
-	 * under sc->mtx so the two callout_reset paths serialize.
-	 */
 	mtx_lock(&sc->mtx);
 	amd_rapl_schedule_guard(sc);
 	mtx_unlock(&sc->mtx);
@@ -691,11 +631,8 @@ amd_rapl_detach(device_t dev)
 
 	/*
 	 * Order matters:
-	 * 1. sysctl_ctx_free() unregisters the OIDs and drains in-flight handlers,
-	 *    so no reader can touch sc after it returns. (The device auto ctx is
-	 *    freed only after detach returns, too late for the arrays below.)
-	 * 2. sc->dying stops amd_rapl_sample() rescheduling so callout_drain()
-	 *    converges; it also catches a guard re-armed by a step-1 handler.
+	 * 1. sysctl_ctx_free() unregisters OIDs and drains in-flight handlers.
+	 * 2. sc->dying stops amd_rapl_sample() rescheduling.
 	 */
 	sysctl_ctx_free(&sc->clist);
 	mtx_lock(&sc->mtx);
@@ -728,11 +665,7 @@ amd_rapl_resume(device_t dev)
 	struct amd_rapl_softc *sc = device_get_softc(dev);
 	int i;
 
-	/*
-	 * Re-baseline so the first post-resume sample is a zero delta: the counters
-	 * reset across suspend, and without this the wrap correction would fold a
-	 * spurious ~2^32 delta into accum. accum is preserved, so energy continues.
-	 */
+	/* Re-baseline so the first post-resume sample is a zero delta. */
 	for (i = 0; i < sc->ncores; i++)
 		sc->core_value[i].primed = false;
 	for (i = 0; i < sc->npackages; i++)
