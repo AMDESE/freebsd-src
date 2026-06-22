@@ -154,7 +154,7 @@ amd_rapl_update_delta(struct amd_rapl_softc *sc, struct amd_rapl_value *val,
 	/*
 	 * Coalesce sub-ms re-samples so a read burst can't shrink the power
 	 * window toward zero; prev stays put and the next sample spans the full
-	 * interval, losing no energy.
+	 * interval, so no energy is lost.
 	 */
 	if (now - val->prev_time < SBT_1MS) {
 		seqc_write_end(&val->seqc);
@@ -193,7 +193,7 @@ amd_rapl_read_core_energy(void *arg)
 /*
  * Sample every per-core counter. The per-core MSR is shared by a core's SMT
  * siblings, so rendezvous only the core leads (one CPU per physical core), not
- * all_cpus -- counts the core domain once, not per sibling. The rendezvous IPI
+ * all_cpus. That counts the core domain once, not per sibling. The rendezvous IPI
  * mutex serializes invocations. Must NOT hold sc->mtx (no rendezvous under it).
  */
 static void
@@ -272,8 +272,8 @@ amd_rapl_sample(void *arg)
 		amd_rapl_sample_package(sc);
 	/*
 	 * Demand-gate: keep firing only while a consumer reads. force_guard pins
-	 * it always-on; else self-disarm after idle_guard_mult quiet periods, with
-	 * the read paths re-arming. This final tick sampled, so accum is fresh.
+	 * it always-on; else self-disarm after idle_guard_mult quiet periods, and
+	 * the read paths re-arm it. This final tick sampled, so accum is fresh.
 	 */
 	now = sbinuptime();
 	last = (sbintime_t)atomic_load_acq_64(&sc->last_read);
@@ -292,8 +292,8 @@ amd_rapl_sample(void *arg)
 
 /*
  * Re-arm the guard if not already pending. A currently-executing handler is not
- * "pending", so this re-arms it too, closing the lost-wakeup window where the
- * handler stops just as a reader arrives. Requires sc->mtx.
+ * "pending", so this re-arms it too. That closes the lost-wakeup window where
+ * the handler stops just as a reader arrives. Requires sc->mtx.
  */
 static void
 amd_rapl_arm_guard(struct amd_rapl_softc *sc)
@@ -387,7 +387,7 @@ static const struct amd_rapl_oid amd_rapl_oids[] = {
  * One handler for every per-domain CSV sysctl, keyed by arg2 (an amd_rapl_oids
  * index). Energy/power OIDs are a power side channel (PLATYPUS, CVE-2020-8694),
  * so they require privilege and sample on read; the lapsed status OIDs are an
- * unprivileged bare poll that neither samples nor re-arms, costing no IPIs.
+ * unprivileged bare poll that neither samples nor re-arms, so it costs no IPIs.
  */
 static int
 sysctl_amd_rapl_display(SYSCTL_HANDLER_ARGS)
@@ -469,8 +469,8 @@ amd_rapl_probe(device_t dev)
  * Build a dense per-CPU -> slot map and elect one lead CPU per slot. Distinct
  * ids from id_of() get a slot in first-seen order; the first CPU seen in each
  * slot becomes its lead. Used to sample a socket-scoped or SMT-shared MSR once
- * per real socket/core, tracking physical topology rather than NUMA domains or
- * logical CPUs (which would over-count).
+ * per real socket/core. It tracks physical topology rather than NUMA domains or
+ * logical CPUs, which would over-count.
  */
 static void
 amd_rapl_build_map(int (*id_of)(int cpu), int **cpu_slot, int *count,
@@ -693,7 +693,7 @@ amd_rapl_detach(device_t dev)
 	 * Order matters:
 	 * 1. sysctl_ctx_free() unregisters the OIDs and drains in-flight handlers,
 	 *    so no reader can touch sc after it returns. (The device auto ctx is
-	 *    freed only after detach returns -- too late for the arrays below.)
+	 *    freed only after detach returns, too late for the arrays below.)
 	 * 2. sc->dying stops amd_rapl_sample() rescheduling so callout_drain()
 	 *    converges; it also catches a guard re-armed by a step-1 handler.
 	 */
