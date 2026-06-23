@@ -823,6 +823,28 @@ cpu_mp_announce(void)
 }
 
 /*
+ * Physical package (socket) id of a logical CPU: its APIC id with the
+ * per-package bits shifted out. For drivers mapping per-socket hardware (e.g.
+ * AMD RAPL package MSRs) onto real sockets, not NUMA domains.
+ */
+int
+cpu_get_pkg_id(int cpu)
+{
+	return (cpu_apic_ids[cpu] >> pkg_id_shift);
+}
+
+/*
+ * Physical core id of a logical CPU: its APIC id with the SMT-thread bits
+ * shifted out, so a core's two siblings share an id. For drivers mapping
+ * per-core hardware (e.g. the SMT-shared AMD RAPL per-core MSR) onto real cores.
+ */
+int
+cpu_get_core_id(int cpu)
+{
+	return (cpu_apic_ids[cpu] >> core_id_shift);
+}
+
+/*
  * Add a scheduling group, a group of logical processors sharing
  * a particular cache (and, thus having an affinity), to the scheduling
  * topology.

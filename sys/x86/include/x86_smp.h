@@ -107,6 +107,8 @@ void	ipi_self_from_nmi(u_int vector);
 void	set_interrupt_apic_ids(void);
 void	mem_range_AP_init(void);
 void	topo_probe(void);
+int	cpu_get_pkg_id(int cpu);
+int	cpu_get_core_id(int cpu);
 
 /* functions in mp_machdep.c */
 void	smp_cache_flush(smp_invl_cb_t curcpu_cb);
