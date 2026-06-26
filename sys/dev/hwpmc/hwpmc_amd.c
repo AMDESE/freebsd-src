@@ -791,7 +791,7 @@ amd_intr_v2(struct trapframe *tf)
 	pmc_value_t v;
 	uint64_t status, mask;
 	uint32_t active = 0, count = 0;
-	int i, retval, cpu;
+	int i, error, retval, cpu;
 
 	cpu = curcpu;
 	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
@@ -840,7 +840,18 @@ amd_intr_v2(struct trapframe *tf)
 		wrmsr(amd_pmcdesc[i].pm_perfctr,
 		    AMD_RELOAD_COUNT_TO_PERFCTR_VALUE(v));
 
-		(void)pmc_process_interrupt(PMC_HR, pm, tf);
+		/*
+		 * On logging failure (sample buffer full) leave this counter
+		 * disarmed for back-pressure: clearing its EVSEL ENABLE bit
+		 * keeps it quiescent through the AND gate even though
+		 * amd_v2_enable_all() re-asserts its GLOBAL_CTL bit below.  The
+		 * MI layer restarts it via pcd_start_pmc.  Mirrors the classic
+		 * amd_intr and the Intel global-control handler.
+		 */
+		error = pmc_process_interrupt(PMC_HR, pm, tf);
+		if (error != 0)
+			wrmsr(amd_pmcdesc[i].pm_evsel,
+			    pm->pm_md.pm_amd.pm_amd_evsel & ~AMD_PMC_ENABLE);
 	}
 
 	/*
