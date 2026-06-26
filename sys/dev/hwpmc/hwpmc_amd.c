@@ -841,8 +841,11 @@ amd_intr_v2(struct trapframe *tf)
 	}
 
 	/*
-	 * Acknowledge serviced overflow (and freeze) bits.  Writing 1s to
-	 * GLOBAL_STATUS_CLR clears the matching GLOBAL_STATUS bits.
+	 * Acknowledge the serviced overflow bits.  Writing 1s to
+	 * GLOBAL_STATUS_CLR clears the matching GLOBAL_STATUS bits.  status is
+	 * already masked to amd_global_cntr_mask, so only core-counter overflow
+	 * bits are cleared; the freeze state is released by the GLOBAL_CTL
+	 * re-assert in amd_v2_enable_all() below.
 	 */
 	wrmsr(AMD_PMC_GLOBAL_STATUS_CLR, status);
 
