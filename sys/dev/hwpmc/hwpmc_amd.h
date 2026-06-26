@@ -35,6 +35,7 @@
 #define	CPUID_EXTPERFMON	0x80000022
 #define	EXTPERFMON_CORE_PMCS(x)	((x) & 0x0F)
 #define	EXTPERFMON_DF_PMCS(x)	(((x) >> 10) & 0x3F)
+#define	EXTPERFMON_PERFMONV2(x)	((x) & 0x1)	/* leaf 0x80000022 EAX bit 0 */
 
 /* AMD K8 PMCs */
 #define	AMD_PMC_EVSEL_0		0xC0010000
@@ -61,6 +62,15 @@
 #define	AMD_PMC_CORE_BASE	0xC0010200
 #define	AMD_PMC_CORE_DEFAULT	6
 #define	AMD_PMC_CORE_MAX	16
+
+/*
+ * PerfMonV2 global control MSRs (Family 19h Zen3+ / Family 1Ah).
+ * These cover CORE counters only; L3/DF stay on the classic per-counter path.
+ */
+#define	AMD_PMC_GLOBAL_STATUS		0xC0000300	/* RO  */
+#define	AMD_PMC_GLOBAL_CTL		0xC0000301	/* RW  */
+#define	AMD_PMC_GLOBAL_STATUS_CLR	0xC0000302	/* WO  */
+/* GLOBAL_STATUS.LBRS_FROZEN (bit 58) goes here in the follow-up LBR v2 task. */
 
 #define	AMD_PMC_COUNTERMASK	0xFF000000
 #define AMD_PMC_PRECISERETIRE	(1ULL << 43) /* Only valid for PERF_CTL2 */
