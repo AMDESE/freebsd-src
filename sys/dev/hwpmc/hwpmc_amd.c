@@ -62,6 +62,8 @@ struct amd_descr {
 
 static int amd_npmcs;
 static int amd_core_npmcs, amd_l3_npmcs, amd_df_npmcs;
+static bool amd_perfmon_v2;		/* PerfMonV2 global-control path selected */
+static uint64_t amd_global_cntr_mask;	/* (1 << amd_core_npmcs) - 1 */
 static struct amd_descr amd_pmcdesc[AMD_NPMCS_MAX];
 struct amd_event_code_map {
 	enum pmc_event	pe_ev;	 /* enum value */
@@ -201,6 +203,10 @@ SYSCTL_U64(_kern_hwpmc, OID_AUTO, amd_l3_extra_mask, CTLFLAG_RDTUN,
 SYSCTL_U64(_kern_hwpmc, OID_AUTO, amd_df_extra_mask, CTLFLAG_RDTUN,
     &amd_df_extra_mask, 0,
     "Extra allowed bits in AMD DF PMU control (override; default 0)");
+
+SYSCTL_BOOL(_kern_hwpmc, OID_AUTO, amd_perfmon_v2, CTLFLAG_RD,
+    &amd_perfmon_v2, 0,
+    "AMD PerfMonV2 global-control path selected (read-only)");
 
 static void
 amd_init_policy(void)
