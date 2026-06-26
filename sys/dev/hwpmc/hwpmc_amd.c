@@ -1182,6 +1182,9 @@ pmc_amd_initialize(void)
 			amd_core_npmcs = EXTPERFMON_CORE_PMCS(regs[1]);
 			amd_df_npmcs = EXTPERFMON_DF_PMCS(regs[1]);
 		}
+		/* EAX bit 0 is the PerfMonV2 feature flag (regs[0]). */
+		if (EXTPERFMON_PERFMONV2(regs[0]) && family >= 0x19)
+			amd_perfmon_v2 = true;
 	}
 
 	/* Enable the newer core counters */
@@ -1210,6 +1213,9 @@ pmc_amd_initialize(void)
 		d->pm_subclass = PMC_AMD_SUB_CLASS_CORE;
 	}
 	amd_npmcs = amd_core_npmcs;
+
+	if (amd_perfmon_v2)
+		amd_global_cntr_mask = (1ULL << amd_core_npmcs) - 1;
 
 	if ((amd_feature2 & AMDID2_PTSCEL2I) != 0) {
 		/* Enable the LLC/L3 counters */
@@ -1304,6 +1310,28 @@ pmc_amd_initialize(void)
 	pmc_mdep->pmd_intr	= amd_intr;
 	pmc_mdep->pmd_switch_in	= amd_switch_in;
 	pmc_mdep->pmd_switch_out = amd_switch_out;
+
+	/*
+	 * On PerfMonV2 silicon, override the classic per-counter start/stop and
+	 * the MSR-polling interrupt handler with the global-control variants.
+	 * L3/DF stay on the classic path (the global MSRs are core-only).
+	 *
+	 * Invariant: the v2 path drives counter enable through GLOBAL_CTL only;
+	 * the per-counter EVSEL ENABLE bit must stay clear (amd_start_pmc_v2
+	 * never sets it).  amd_v2_enable_all() re-asserts the full mask, so a
+	 * counter stopped via amd_stop_pmc_v2 is held off solely by its disarmed
+	 * EVSEL.
+	 */
+	if (amd_perfmon_v2) {
+		pcd->pcd_start_pmc = amd_start_pmc_v2;
+		pcd->pcd_stop_pmc  = amd_stop_pmc_v2;
+		pmc_mdep->pmd_intr = amd_intr_v2;
+		printf("hwpmc: AMD PerfMonV2 path enabled "
+		    "(%d core PMCs, mask 0x%jx)\n",
+		    amd_core_npmcs, (uintmax_t)amd_global_cntr_mask);
+	} else {
+		printf("hwpmc: AMD classic PMU path\n");
+	}
 
 	pmc_mdep->pmd_npmc	+= amd_npmcs;
 
