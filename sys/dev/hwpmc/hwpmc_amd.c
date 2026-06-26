@@ -243,6 +243,23 @@ amd_config_mask(enum sub_class subclass, uint64_t caps)
 }
 
 /*
+ * PerfMonV2 global enable/disable. A single write to GLOBAL_CTL starts or
+ * stops all core counters at once (mirrors Linux amd_pmu_core_enable_all /
+ * amd_pmu_core_disable_all). amd_global_cntr_mask is computed at init.
+ */
+static __inline void
+amd_v2_enable_all(void)
+{
+	wrmsr(AMD_PMC_GLOBAL_CTL, amd_global_cntr_mask);
+}
+
+static __inline void
+amd_v2_disable_all(void)
+{
+	wrmsr(AMD_PMC_GLOBAL_CTL, 0);
+}
+
+/*
  * Read a PMC value from the MSR.
  */
 static int
