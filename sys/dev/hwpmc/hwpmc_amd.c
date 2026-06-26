@@ -773,6 +773,107 @@ done:
 }
 
 /*
+ * Interrupt handler (PerfMonV2 core path).
+ *
+ * Reads GLOBAL_STATUS once instead of polling every counter.  Core counters are
+ * frozen via GLOBAL_CTL for the duration so the status snapshot and reloads are
+ * race-free, mirroring Linux amd_pmu_v2_handle_irq.  The IBS early-out and the
+ * NMI-latency nmi_counter accounting are FreeBSD-specific and preserved.
+ */
+static int
+amd_intr_v2(struct trapframe *tf)
+{
+	struct amd_cpu *pac;
+	struct pmc *pm;
+	pmc_value_t v;
+	uint64_t status, mask;
+	uint32_t active = 0, count = 0;
+	int i, retval, cpu;
+
+	cpu = curcpu;
+	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
+	    ("[amd,%d] out of range CPU %d", __LINE__, cpu));
+
+	PMCDBG3(MDP, INT, 1, "cpu=%d tf=%p um=%d", cpu, tf, TRAPF_USERMODE(tf));
+
+	retval = 0;
+	pac = amd_pcpu[cpu];
+
+	/* IBS shares the handler entry; service it first. */
+	retval = pmc_ibs_intr(tf);
+	if (retval)
+		goto done;
+
+	/* Freeze core counters while we read status and reload. */
+	amd_v2_disable_all();
+
+	/* Single read of the overflow bitmap; drop reserved bits. */
+	status = rdmsr(AMD_PMC_GLOBAL_STATUS);
+	status &= amd_global_cntr_mask;
+
+	for (i = 0; i < amd_npmcs; i++) {
+		if (amd_pmcdesc[i].pm_subclass != PMC_AMD_SUB_CLASS_CORE)
+			break;
+
+		if ((pm = pac->pc_amdpmcs[i].phw_pmc) == NULL ||
+		    !PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm))) {
+			continue;
+		}
+
+		/* Consider pmc with valid handle as active. */
+		active++;
+
+		mask = (1ULL << i);
+		if ((status & mask) == 0)
+			continue;
+
+		retval = 1;	/* Found an interrupting PMC. */
+
+		if (pm->pm_state != PMC_STATE_RUNNING)
+			continue;
+
+		/* Reload the counter. */
+		v = pm->pm_sc.pm_reloadcount;
+		wrmsr(amd_pmcdesc[i].pm_perfctr,
+		    AMD_RELOAD_COUNT_TO_PERFCTR_VALUE(v));
+
+		(void)pmc_process_interrupt(PMC_HR, pm, tf);
+	}
+
+	/*
+	 * Acknowledge serviced overflow (and freeze) bits.  Writing 1s to
+	 * GLOBAL_STATUS_CLR clears the matching GLOBAL_STATUS bits.
+	 */
+	wrmsr(AMD_PMC_GLOBAL_STATUS_CLR, status);
+
+	/* Resume core counters. */
+	amd_v2_enable_all();
+
+	/*
+	 * NMI-latency accounting (FreeBSD-specific): a serviced overflow in an
+	 * earlier NMI can leave a later NMI with nothing to find.  Track a
+	 * per-cpu count and absorb those stray NMIs.
+	 */
+	if (retval) {
+		DPCPU_SET(nmi_counter, min(2, active));
+	} else {
+		if ((count = DPCPU_GET(nmi_counter))) {
+			retval = 1;
+			DPCPU_SET(nmi_counter, --count);
+		}
+	}
+
+done:
+	if (retval)
+		counter_u64_add(pmc_stats.pm_intr_processed, 1);
+	else
+		counter_u64_add(pmc_stats.pm_intr_ignored, 1);
+
+	PMCDBG1(MDP, INT, 2, "retval=%d", retval);
+	return (retval);
+}
+
+/*
  * Describe a PMC.
  */
 static int
