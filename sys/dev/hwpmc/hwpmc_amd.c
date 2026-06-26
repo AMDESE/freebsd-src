@@ -561,16 +561,18 @@ amd_start_pmc(int cpu __diagused, int ri, struct pmc *pm)
 /*
  * Start a PMC (PerfMonV2 core path).
  *
- * The MI core still calls us per-counter, but enable state lives in the
- * global-control MSR rather than the per-counter EVSEL ENABLE bit.  We program
- * the event into the EVSEL (without the classic ENABLE bit) and re-assert the
- * full counter mask in GLOBAL_CTL.  Per-counter ENABLE is unused on this path,
- * so the classic AMD_PMC_IS_STOPPED assertion does not apply.
+ * On PerfMonV2 a core counter increments only when BOTH its per-counter EVSEL
+ * ENABLE bit AND its bit in GLOBAL_CTL are set.  We therefore arm this counter
+ * by writing its EVSEL with the ENABLE bit set (the per-counter discriminator)
+ * and assert the full counter mask in GLOBAL_CTL (the global freeze/thaw the
+ * interrupt handler toggles).  Counters whose EVSEL ENABLE bit is clear stay
+ * quiescent even with their GLOBAL_CTL bit set.
  */
 static int
 amd_start_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
 {
 	const struct amd_descr *pd;
+	uint64_t config;
 
 	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
 	    ("[amd,%d] illegal CPU value %d", __LINE__, cpu));
@@ -581,8 +583,9 @@ amd_start_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
 
 	PMCDBG2(MDP, STA, 1, "amd-start-v2 cpu=%d ri=%d", cpu, ri);
 
-	/* Program the event selector; ENABLE is driven via GLOBAL_CTL. */
-	wrmsr(pd->pm_evsel, pm->pm_md.pm_amd.pm_amd_evsel);
+	/* Arm the counter; GLOBAL_CTL gates when it actually counts. */
+	config = pm->pm_md.pm_amd.pm_amd_evsel | AMD_PMC_ENABLE;
+	wrmsr(pd->pm_evsel, config);
 
 	/* Assert the global counter mask to (re)start core counters. */
 	amd_v2_enable_all();
@@ -1320,11 +1323,11 @@ pmc_amd_initialize(void)
 	 * the MSR-polling interrupt handler with the global-control variants.
 	 * L3/DF stay on the classic path (the global MSRs are core-only).
 	 *
-	 * Invariant: the v2 path drives counter enable through GLOBAL_CTL only;
-	 * the per-counter EVSEL ENABLE bit must stay clear (amd_start_pmc_v2
-	 * never sets it).  amd_v2_enable_all() re-asserts the full mask, so a
-	 * counter stopped via amd_stop_pmc_v2 is held off solely by its disarmed
-	 * EVSEL.
+	 * Enable model: a core counter increments only when BOTH its EVSEL
+	 * ENABLE bit AND its GLOBAL_CTL bit are set.  The per-counter EVSEL
+	 * ENABLE bit is the per-counter discriminator (set by amd_start_pmc_v2,
+	 * cleared by amd_stop_pmc_v2); GLOBAL_CTL is the global freeze/thaw the
+	 * interrupt handler toggles around overflow servicing.
 	 */
 	if (amd_perfmon_v2) {
 		pcd->pcd_start_pmc = amd_start_pmc_v2;
