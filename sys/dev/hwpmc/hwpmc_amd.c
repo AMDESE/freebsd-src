@@ -635,6 +635,34 @@ amd_stop_pmc(int cpu __diagused, int ri, struct pmc *pm)
 }
 
 /*
+ * Stop a PMC (PerfMonV2 core path).
+ *
+ * Clearing the counter's EVSEL removes its event programming; GLOBAL_CTL is
+ * left asserting the mask so other active counters keep running.  There is no
+ * OVERFLOW_WAIT_COUNT busy-wait here: the GLOBAL_STATUS read in amd_intr_v2 is
+ * authoritative for overflow, so the classic NMI-latency poll is unnecessary.
+ */
+static int
+amd_stop_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
+{
+	const struct amd_descr *pd;
+
+	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
+	    ("[amd,%d] illegal CPU value %d", __LINE__, cpu));
+	KASSERT(ri >= 0 && ri < amd_npmcs,
+	    ("[amd,%d] illegal row-index %d", __LINE__, ri));
+
+	pd = &amd_pmcdesc[ri];
+
+	PMCDBG1(MDP, STO, 1, "amd-stop-v2 ri=%d", ri);
+
+	/* Disarm this counter's event; leaves other counters' GLOBAL_CTL bits. */
+	wrmsr(pd->pm_evsel, pm->pm_md.pm_amd.pm_amd_evsel & ~AMD_PMC_ENABLE);
+
+	return (0);
+}
+
+/*
  * Interrupt handler.  This function needs to return '1' if the
  * interrupt was this CPU's PMCs or '0' otherwise.  It is not allowed
  * to sleep or do anything a 'fast' interrupt handler is not allowed
