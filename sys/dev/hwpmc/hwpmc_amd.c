@@ -1182,7 +1182,11 @@ pmc_amd_initialize(void)
 			amd_core_npmcs = EXTPERFMON_CORE_PMCS(regs[1]);
 			amd_df_npmcs = EXTPERFMON_DF_PMCS(regs[1]);
 		}
-		/* EAX bit 0 is the PerfMonV2 feature flag (regs[0]). */
+		/*
+		 * EAX bit 0 is the PerfMonV2 feature flag (regs[0]).  V2 is
+		 * Family 19h (Zen3+) and 1Ah; the family guard rejects a
+		 * spurious feature bit on older or virtualized CPUs.
+		 */
 		if (EXTPERFMON_PERFMONV2(regs[0]) && family >= 0x19)
 			amd_perfmon_v2 = true;
 	}
