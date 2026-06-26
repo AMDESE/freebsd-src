@@ -559,6 +559,38 @@ amd_start_pmc(int cpu __diagused, int ri, struct pmc *pm)
 }
 
 /*
+ * Start a PMC (PerfMonV2 core path).
+ *
+ * The MI core still calls us per-counter, but enable state lives in the
+ * global-control MSR rather than the per-counter EVSEL ENABLE bit.  We program
+ * the event into the EVSEL (without the classic ENABLE bit) and re-assert the
+ * full counter mask in GLOBAL_CTL.  Per-counter ENABLE is unused on this path,
+ * so the classic AMD_PMC_IS_STOPPED assertion does not apply.
+ */
+static int
+amd_start_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
+{
+	const struct amd_descr *pd;
+
+	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
+	    ("[amd,%d] illegal CPU value %d", __LINE__, cpu));
+	KASSERT(ri >= 0 && ri < amd_npmcs,
+	    ("[amd,%d] illegal row-index %d", __LINE__, ri));
+
+	pd = &amd_pmcdesc[ri];
+
+	PMCDBG2(MDP, STA, 1, "amd-start-v2 cpu=%d ri=%d", cpu, ri);
+
+	/* Program the event selector; ENABLE is driven via GLOBAL_CTL. */
+	wrmsr(pd->pm_evsel, pm->pm_md.pm_amd.pm_amd_evsel);
+
+	/* Assert the global counter mask to (re)start core counters. */
+	amd_v2_enable_all();
+
+	return (0);
+}
+
+/*
  * Stop a PMC.
  */
 static int
