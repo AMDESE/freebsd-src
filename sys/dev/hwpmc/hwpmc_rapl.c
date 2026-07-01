@@ -94,8 +94,7 @@ static uint32_t rapl_energy_unit;
 
 /*
  * Base global row index of the RAPL class, cached at initialize() time so the
- * pcpu_init/fini helpers can wire pc_hwpmcs[] without needing the
- * PMC_MDEP_CLASS_INDEX_RAPL constant (which the MD-wiring task adds later).
+ * pcpu_init/fini helpers can wire pc_hwpmcs[] without recomputing it.
  */
 static int rapl_ri;
 
@@ -615,7 +614,7 @@ rapl_compute_guard_sbt(void)
 }
 
 int
-pmc_rapl_initialize(struct pmc_mdep *md, int maxcpu)
+pmc_rapl_initialize(struct pmc_mdep *md, int maxcpu, int classindex)
 {
 	struct pmc_classdep *pcd;
 	uint32_t unit_msr, pkg_msr, cores_msr, dram_msr;
@@ -677,7 +676,7 @@ pmc_rapl_initialize(struct pmc_mdep *md, int maxcpu)
 	rapl_pcpu = malloc(sizeof(struct rapl_cpu *) * maxcpu, M_PMC,
 	    M_ZERO | M_WAITOK);
 
-	pcd = &md->pmd_classdep[PMC_MDEP_CLASS_INDEX_RAPL];
+	pcd = &md->pmd_classdep[classindex];
 
 	pcd->pcd_caps	= RAPL_CAPS;
 	pcd->pcd_class	= PMC_CLASS_RAPL;
@@ -708,6 +707,14 @@ void
 pmc_rapl_finalize(struct pmc_mdep *md __diagused)
 {
 	PMCDBG0(MDP, INI, 1, "rapl-finalize");
+
+	/*
+	 * initialize() may have skipped this class (no RAPL MSRs), leaving
+	 * rapl_pcpu NULL and the mutexes/callout uninitialized. Nothing was set
+	 * up, so there is nothing to tear down.
+	 */
+	if (rapl_pcpu == NULL)
+		return;
 
 	/*
 	 * Stop the guard before tearing down per-cpu state. finalize is not
