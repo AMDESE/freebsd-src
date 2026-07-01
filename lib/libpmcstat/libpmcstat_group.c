@@ -101,8 +101,21 @@ pmcstat_parse_event_group(const char *spec, char ***out_events, size_t *n_out)
 			p++;
 	}
 	if (n < 2) {
-		/* Single-element brace list -> not really a group. */
-		pmcstat_free_event_group(events, n);
+		/*
+		 * Fewer than two events is not a real group.  For a
+		 * single-element brace list like "{instructions}", hand the
+		 * brace-stripped, whitespace-trimmed inner event back to the
+		 * caller (return 1) so it can allocate it as a plain event;
+		 * passing the literal "{...}" -- including the '{' -- down to
+		 * pmc_allocate() makes the kernel reject it with EINVAL.  An
+		 * empty list ("{}") has nothing to return.
+		 */
+		if (n == 1) {
+			*out_events = events;
+			*n_out = 1;
+		} else {
+			pmcstat_free_event_group(events, n);
+		}
 		return (1);
 	}
 	*out_events = events;

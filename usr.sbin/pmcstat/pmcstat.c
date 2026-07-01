@@ -666,6 +666,23 @@ main(int argc, char **argv)
 					    nsib);
 					break;
 				}
+				/*
+				 * rv == 1: a single-element brace list such as
+				 * "{instructions}" -- not a real group.  The
+				 * parser stripped the braces and surrounding
+				 * whitespace; use that cleaned spec for the
+				 * fall-through single-event path below.  Passing
+				 * the literal "{...}" optarg (with its '{') to
+				 * pmc_allocate() is what the kernel rejects with
+				 * EINVAL.
+				 */
+				if (nsib == 1 && siblings != NULL) {
+					optarg = strdup(siblings[0]);
+					if (optarg == NULL)
+						errx(EX_SOFTWARE,
+						    "ERROR: Out of memory.");
+				}
+				pmcstat_free_event_group(siblings, nsib);
 				/* not really a group; fall through */
 			}
 			caps = 0;

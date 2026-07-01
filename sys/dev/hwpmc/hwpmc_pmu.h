@@ -109,6 +109,16 @@ struct pmu_group {
 						 * pp_pmu_groups; cleared on
 						 * release. */
 	uint32_t			pg_used_rows_mask;
+	/*
+	 * System-wide (PMC_MODE_SC) group state.  Process-mode groups
+	 * hang off a pmc_process (pg_pp) and rotate in a per-pp kthread;
+	 * system-mode groups are bound to a single CPU and rotate in a
+	 * per-CPU kthread instead (see the pmu_syscpu[] registry in
+	 * hwpmc_pmu.c).  pg_system selects which world a group lives in.
+	 */
+	bool				pg_system;	/* system-wide group */
+	bool				pg_sys_listed;	/* on pmu_syscpu list */
+	int				pg_cpu;		/* bound CPU (system) */
 };
 
 /*
@@ -121,6 +131,21 @@ bool hwpmc_can_allocate_row(int ri, enum pmc_mode mode);
 bool hwpmc_can_allocate_rowindex(struct proc *p, unsigned int ri, int cpu);
 void hwpmc_mark_row_thread(int ri);
 void hwpmc_mark_row_free(int ri);
+void hwpmc_mark_row_standalone(int ri);
+void hwpmc_unmark_row_standalone(int ri);
+
+/*
+ * Program / unprogram one system-wide PMC row's hardware on its bound
+ * CPU.  Both helpers do the pmc_select_cpu() bind dance internally and
+ * use pm->pm_gv.pm_savedvalue as the cumulative running total: start_row
+ * preloads the HW counter with the saved total before enabling it, and
+ * stop_row reads the HW counter back into the saved total before
+ * disabling it.  This keeps counts continuous across multiplex windows
+ * without going through the per-process csw machinery (system PMCs are
+ * never context switched).
+ */
+void hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm);
+void hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm);
 
 /*
  * The PMU grouping/multiplex scheduler is currently implemented only on
@@ -182,6 +207,22 @@ void pmu_group_on_release(struct pmc *pm);
 void pmu_group_csw_in(struct thread *td, struct pmc_process *pp);
 void pmu_group_csw_out(struct thread *td, int cpu);
 int pmu_group_read_value(struct pmc *pm, pmc_value_t *value);
+
+/*
+ * System-wide (PMC_MODE_SC) group lifecycle.  The process-mode hooks
+ * above key everything off a pmc_process; system-wide groups have no
+ * target process and are instead bound to a single CPU and rotated by a
+ * per-CPU kthread.  pmc_start / pmc_stop in hwpmc_mod.c route system
+ * group siblings here instead of through the normal per-CPU start/stop.
+ * pmu_sys_group_pre_release MUST be called at the very top of
+ * pmc_release_pmc_descriptor (before the row is touched): it tears down
+ * rotation and atomically schedules the whole group out so every sibling
+ * becomes UNASSIGNED, after which the framework's deferred-release path
+ * handles each sibling without double-releasing a HW row.
+ */
+int pmu_sys_group_on_start(struct pmc *pm);
+void pmu_sys_group_on_stop(struct pmc *pm);
+void pmu_sys_group_pre_release(struct pmc *pm);
 
 /*
  * Cleanup hook for callers that are about to free a pmc_process out from
@@ -276,6 +317,22 @@ pmu_group_lookup(struct pmc_owner *po __unused, uint32_t pg_id __unused)
 
 static __inline void
 pmu_pp_release_all(struct pmc_process *pp __unused)
+{
+}
+
+static __inline int
+pmu_sys_group_on_start(struct pmc *pm __unused)
+{
+	return (0);
+}
+
+static __inline void
+pmu_sys_group_on_stop(struct pmc *pm __unused)
+{
+}
+
+static __inline void
+pmu_sys_group_pre_release(struct pmc *pm __unused)
 {
 }
 

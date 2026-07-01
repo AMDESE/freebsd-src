@@ -48,6 +48,28 @@ static void pmu_pp_kick_rotate(struct pmc_process *pp);
 static int pmu_group_attach_siblings(pmu_group_t *pg,
     struct pmc_process *pp);
 
+/*
+ * System-wide (PMC_MODE_SC) multiplex state.  Process-mode groups hang
+ * off a pmc_process and rotate in a per-pp kthread; system-wide groups
+ * are bound to a single CPU and rotate in a per-CPU kthread keyed by
+ * this registry.  pg_proc_next (the same LIST_ENTRY the per-pp path
+ * uses) links a system group onto sc_groups -- the two worlds are
+ * mutually exclusive for any given group (pg_system selects which).
+ */
+struct pmu_syscpu {
+	LIST_HEAD(, pmu_group)	sc_groups;	/* groups bound to this CPU */
+	pmu_group_t		*sc_cursor;	/* round-robin start point */
+	struct thread		*sc_td;		/* rotation kthread */
+	bool			sc_running;	/* kthread should keep going */
+};
+static struct pmu_syscpu pmu_syscpu[MAXCPU];
+
+static void pmu_syscpu_rotate_thread(void *arg);
+static int pmu_sys_schedule_in(int cpu, pmu_group_t *pg);
+static void pmu_sys_schedule_out(int cpu, pmu_group_t *pg);
+static void pmu_syscpu_kick_rotate(int cpu);
+static void pmu_syscpu_rotate_one(int cpu);
+
 pmu_event_t *
 pmu_event_from_pmc(struct pmc *pm)
 {
@@ -181,6 +203,39 @@ pmu_group_commit(pmu_group_t *pg)
 
 	po = pg->pg_owner;
 	p = po != NULL ? po->po_owner : NULL;
+
+	/*
+	 * System-wide group.  There is no target process: the group is
+	 * pinned to a single CPU (validated identical across siblings).
+	 * Unlike the process path below -- which binds a fitting group to
+	 * HW rows right here at commit -- system groups defer ALL HW
+	 * placement to pmu_sys_group_on_start() and the per-CPU rotation
+	 * kthread, because programming a system counter requires the
+	 * pmc_select_cpu() bind dance that only runs in thread context.
+	 * Commit therefore only proves the group can ever fit.
+	 */
+	if (PMC_IS_SYSTEM_MODE(pg->pg_leader->pe_alloc.pm_mode)) {
+		pg->pg_system = true;
+		pg->pg_cpu = pg->pg_leader->pe_alloc.pm_cpu;
+
+		class_total = pmu_count_class_total(pg);
+		if (class_total == 0)
+			return (EOPNOTSUPP);
+		if (pg->pg_nevents > class_total)
+			return (ENOSPC);
+
+		hw_slots = pmu_count_core_hw_slots(pg, p);
+		PMCDBG5(PMC, OPS, 1,
+		    "group_commit: SYS gid=%u cpu=%d nevents=%u "
+		    "hw_slots=%u defer_ok=%d", pg->pg_id, pg->pg_cpu,
+		    pg->pg_nevents, hw_slots, (int)pg->pg_defer_ok);
+		if (pg->pg_nevents > hw_slots && !pg->pg_defer_ok)
+			return (ENOSPC);
+
+		pg->pg_committed = true;
+		return (0);
+	}
+
 	if (p != NULL) {
 		class_total = pmu_count_class_total(pg);
 		if (class_total == 0)
@@ -503,6 +558,28 @@ pmu_group_on_release(struct pmc *pm)
 	pg = pe->pe_group;
 	if (pg == NULL)
 		goto destroy;
+
+	/*
+	 * System-wide group.  All HW teardown and rotation-kthread
+	 * shutdown already happened in pmu_sys_group_pre_release(), which
+	 * pmc_release_pmc_descriptor() invokes before it touches the row.
+	 * By the time we get here every sibling is UNASSIGNED and the
+	 * group is off its CPU's rotation list, so we only unwind the
+	 * pmu_event / pmu_group bookkeeping.
+	 */
+	if (pg->pg_system) {
+		TAILQ_REMOVE(&pg->pg_events, pe, pe_sibling);
+		pe->pe_group = NULL;
+		if (pg->pg_leader == pe)
+			pg->pg_leader = TAILQ_FIRST(&pg->pg_events);
+		if (pg->pg_nevents > 0)
+			pg->pg_nevents--;
+		if (pg->pg_nevents == 0) {
+			pg->pg_used_rows_mask = 0;
+			pmu_group_release(pg);
+		}
+		goto destroy;
+	}
 
 	/*
 	 * The pp we hung off pp_pmu_groups is recorded as pg->pg_pp.
@@ -1001,6 +1078,377 @@ pmu_pp_rotate_thread(void *arg)
 	}
 	pp->pp_pmu_rot_td = NULL;
 	wakeup(&pp->pp_pmu_rot_td);
+	hwpmc_pmu_sx_xunlock();
+	kthread_exit();
+}
+
+/*
+ * ============================================================
+ * System-wide (PMC_MODE_SC) grouping + per-CPU multiplex.
+ * ============================================================
+ *
+ * The functions above schedule groups onto a target process and
+ * multiplex them with a per-pp kthread.  The mirror image below
+ * schedules system-wide groups onto a single CPU and multiplexes them
+ * with a per-CPU kthread.  The structural logic is identical (atomic
+ * all-or-none schedule in/out, fair round-robin rotation with a moving
+ * cursor); the only real difference is HOW the hardware is touched:
+ *
+ *   - process mode programs the counter lazily at csw_in time via
+ *     pp_pmcs[] / pmc_rotation_attach;
+ *
+ *   - system mode programs the counter eagerly here, because a
+ *     system-wide PMC is never context switched -- it just runs on its
+ *     bound CPU until stopped.  hwpmc_pmu_sys_start_row/stop_row do the
+ *     pmc_select_cpu() bind dance and carry the cumulative count in
+ *     pm->pm_gv.pm_savedvalue so values are continuous across windows.
+ */
+
+/*
+ * Atomically schedule a system group in on its CPU: reserve a HW row
+ * for every sibling (all-or-none) and program+start each one.  Returns
+ * 0 on success, ENOSPC if the group does not currently fit (it stays
+ * deferred for the rotation kthread), or another errno on hard failure.
+ * Caller holds pmc_sx exclusive.
+ */
+static int
+pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
+{
+	pmu_event_t *pe;
+	struct proc *owner;
+	u_int hw_slots;
+	int error;
+
+	if (pg == NULL || pg->pg_assigned)
+		return (0);
+
+	/*
+	 * The owner proc (e.g. pmcstat) is used ONLY for the
+	 * pmc_can_allocate_rowindex() bookkeeping check inside the
+	 * assigner -- system rows are bound to pg_cpu, not to a process.
+	 */
+	owner = pg->pg_owner != NULL ? pg->pg_owner->po_owner : NULL;
+	if (owner == NULL)
+		return (EINVAL);
+
+	hw_slots = pmu_count_core_hw_slots(pg, owner);
+	if (pg->pg_nevents > hw_slots)
+		return (ENOSPC);
+
+	error = pmu_assign_group(pg, owner, cpu);
+	if (error != 0) {
+		PMCDBG3(PMC, OPS, 1,
+		    "sys_schedule_in: assign gid=%u cpu=%d err=%d",
+		    pg->pg_id, cpu, error);
+		return (error);
+	}
+
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (pe->pe_state != PMU_EVENT_STATE_ACTIVE)
+			continue;
+		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
+		hwpmc_pmu_sys_start_row(cpu, pe->pe_pmc);
+	}
+	PMCDBG3(PMC, OPS, 4, "sys_schedule_in: gid=%u cpu=%d nevents=%u IN",
+	    pg->pg_id, cpu, pg->pg_nevents);
+	return (0);
+}
+
+/*
+ * Atomically schedule a system group out: stop+read every sibling's HW
+ * (folding the window count into pm_gv.pm_savedvalue) and release every
+ * row in one pass.  Caller holds pmc_sx exclusive.
+ */
+static void
+pmu_sys_schedule_out(int cpu, pmu_group_t *pg)
+{
+	pmu_event_t *pe;
+
+	if (pg == NULL || !pg->pg_assigned)
+		return;
+
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (pe->pe_state != PMU_EVENT_STATE_ACTIVE)
+			continue;
+		hwpmc_pmu_sys_stop_row(cpu, pe->pe_pmc);
+		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
+	}
+	pmu_unassign_group(pg, cpu);
+	PMCDBG2(PMC, OPS, 4, "sys_schedule_out: gid=%u cpu=%d OUT",
+	    pg->pg_id, cpu);
+}
+
+/*
+ * pmc_start() entry point for a system-wide group sibling.  Registers
+ * the group on its CPU's rotation list, drives the initial HW placement
+ * (first sibling only -- the rest are no-ops because the group is
+ * already running), and starts the per-CPU rotation kthread if the CPU
+ * is oversubscribed.  Idempotent across siblings.
+ */
+int
+pmu_sys_group_on_start(struct pmc *pm)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	int cpu;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || pe->pe_group == NULL)
+		return (0);
+	pg = pe->pe_group;
+	if (!pg->pg_committed)
+		return (EDOOFUS);
+	if (!pg->pg_system)
+		return (EINVAL);
+
+	cpu = pg->pg_cpu;
+	if (cpu < 0 || cpu >= MAXCPU)
+		return (EINVAL);
+
+	if (!pg->pg_sys_listed) {
+		LIST_INSERT_HEAD(&pmu_syscpu[cpu].sc_groups, pg, pg_proc_next);
+		pg->pg_sys_listed = true;
+	}
+
+	if (!pg->pg_running) {
+		int sin_err __unused;
+
+		pg->pg_running = true;
+		sin_err = pmu_sys_schedule_in(cpu, pg);
+		PMCDBG3(PMC, OPS, 2,
+		    "sys_on_start: gid=%u cpu=%d schedule_in=%d",
+		    pg->pg_id, cpu, sin_err);
+	}
+
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
+
+	pmu_syscpu_kick_rotate(cpu);
+	return (0);
+}
+
+/*
+ * pmc_stop() entry point for a system-wide group sibling.  Takes the
+ * whole group off hardware (freezing its cumulative count in
+ * pm_gv.pm_savedvalue) and frees its rows so a peer can use them.  The
+ * group stays on the CPU's rotation list; the rotation kthread skips it
+ * because pg_running is now false.  A subsequent pmc_start re-binds it.
+ */
+void
+pmu_sys_group_on_stop(struct pmc *pm)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || pe->pe_group == NULL)
+		return;
+	pg = pe->pe_group;
+	if (!pg->pg_system || !pg->pg_running)
+		return;
+
+	pg->pg_running = false;
+	if (pg->pg_assigned)
+		pmu_sys_schedule_out(pg->pg_cpu, pg);
+
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
+}
+
+/*
+ * Called at the very top of pmc_release_pmc_descriptor(), BEFORE the
+ * framework touches the row, for any system-wide group sibling.  Tears
+ * down the per-CPU rotation kthread (when this is the last group on the
+ * CPU), schedules the whole group out so every sibling becomes
+ * UNASSIGNED, and unlinks the group from the CPU's rotation list.  After
+ * this returns the framework sees PMC_ROW_IS_UNASSIGNED() for the
+ * releasing pm and takes its deferred-release path, so it never
+ * double-releases a HW row we already freed.  Idempotent across the
+ * group's siblings.  Caller holds pmc_sx exclusive.
+ */
+void
+pmu_sys_group_pre_release(struct pmc *pm)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	struct pmu_syscpu *sc;
+	int cpu;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || pe->pe_group == NULL)
+		return;
+	pg = pe->pe_group;
+	if (!pg->pg_system)
+		return;
+
+	cpu = pg->pg_cpu;
+	if (cpu < 0 || cpu >= MAXCPU)
+		return;
+	sc = &pmu_syscpu[cpu];
+
+	/*
+	 * Tear down the rotation kthread before mutating group state, but
+	 * only when this group is the last one on the CPU (otherwise other
+	 * groups still need rotation).  The sx_sleep below transiently
+	 * drops pmc_sx; the kthread wakes, sees sc_running == false, clears
+	 * sc_td and exits.
+	 */
+	if (pg->pg_sys_listed && sc->sc_running &&
+	    LIST_FIRST(&sc->sc_groups) == pg &&
+	    LIST_NEXT(pg, pg_proc_next) == NULL) {
+		sc->sc_running = false;
+		wakeup(sc);
+		while (sc->sc_td != NULL)
+			(void)hwpmc_pmu_sx_sleep(&sc->sc_td, 1, "muxsrel");
+	}
+
+	if (pg->pg_assigned)
+		pmu_sys_schedule_out(cpu, pg);
+	pg->pg_running = false;
+
+	if (pg->pg_sys_listed) {
+		if (sc->sc_cursor == pg)
+			sc->sc_cursor = LIST_NEXT(pg, pg_proc_next);
+		LIST_REMOVE(pg, pg_proc_next);
+		pg->pg_sys_listed = false;
+	}
+}
+
+/*
+ * Spawn the per-CPU rotation kthread the first time a CPU is
+ * oversubscribed (>= 2 running groups, at least one of them deferred).
+ * Idempotent: returns immediately once the kthread is up.
+ */
+static void
+pmu_syscpu_kick_rotate(int cpu)
+{
+	struct pmu_syscpu *sc;
+	pmu_group_t *pg;
+	int n_running, n_deferred, error;
+
+	sc = &pmu_syscpu[cpu];
+	if (sc->sc_running)
+		return;
+
+	n_running = n_deferred = 0;
+	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
+		if (!pg->pg_running)
+			continue;
+		n_running++;
+		if (!pg->pg_assigned)
+			n_deferred++;
+	}
+	if (n_deferred == 0 || n_running < 2)
+		return;
+
+	sc->sc_running = true;
+	error = kthread_add(pmu_syscpu_rotate_thread,
+	    (void *)(intptr_t)cpu, NULL, &sc->sc_td, 0, 0,
+	    "pmu_rot_cpu_%d", cpu);
+	if (error != 0) {
+		sc->sc_running = false;
+		sc->sc_td = NULL;
+		PMCDBG2(PMC, OPS, 1,
+		    "syscpu_kick_rotate: cpu=%d kthread_add err=%d",
+		    cpu, error);
+	}
+}
+
+/*
+ * Run one rotation window for a CPU.  Identical fair round-robin
+ * algorithm as pmu_pp_rotate_one(), keyed on the per-CPU group list:
+ * evict everything, then schedule groups back in starting at the cursor
+ * until one no longer fits (that group pins the next tick's cursor).
+ * Caller holds pmc_sx exclusive.
+ */
+static void
+pmu_syscpu_rotate_one(int cpu)
+{
+	struct pmu_syscpu *sc;
+	pmu_group_t *pg, *cursor;
+	bool found_cursor, need_rotate;
+	u_int ngroups, seen;
+	int sin_err;
+
+	sc = &pmu_syscpu[cpu];
+	if (LIST_EMPTY(&sc->sc_groups))
+		return;
+
+	need_rotate = false;
+	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
+		if (pg->pg_running && !pg->pg_assigned) {
+			need_rotate = true;
+			break;
+		}
+	}
+	if (!need_rotate)
+		return;
+
+	/* Phase 1: evict every currently scheduled group. */
+	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
+		if (pg->pg_assigned)
+			pmu_sys_schedule_out(cpu, pg);
+	}
+
+	/* Phase 2 setup: validate the cursor is still on the list. */
+	ngroups = 0;
+	cursor = sc->sc_cursor;
+	found_cursor = false;
+	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
+		if (pg == cursor)
+			found_cursor = true;
+		ngroups++;
+	}
+	if (!found_cursor)
+		cursor = LIST_FIRST(&sc->sc_groups);
+
+	/* Phase 2: round-robin schedule_in from cursor, wrap once. */
+	pg = cursor;
+	seen = 0;
+	while (seen < ngroups) {
+		if (pg == NULL)
+			pg = LIST_FIRST(&sc->sc_groups);
+		if (pg->pg_running && !pg->pg_assigned) {
+			sin_err = pmu_sys_schedule_in(cpu, pg);
+			if (sin_err == ENOSPC) {
+				sc->sc_cursor = pg;
+				return;
+			}
+		}
+		seen++;
+		pg = LIST_NEXT(pg, pg_proc_next);
+	}
+
+	sc->sc_cursor = LIST_NEXT(cursor, pg_proc_next);
+	if (sc->sc_cursor == NULL)
+		sc->sc_cursor = LIST_FIRST(&sc->sc_groups);
+}
+
+/*
+ * Per-CPU rotation kthread.  Wakes every kern.hwpmc.mux_period_ms, runs
+ * one rotation tick, and goes back to sleep.  Exits when the last group
+ * leaves the CPU (pmu_sys_group_pre_release clears sc_running and wakes
+ * us).
+ */
+static void
+pmu_syscpu_rotate_thread(void *arg)
+{
+	int cpu = (int)(intptr_t)arg;
+	struct pmu_syscpu *sc = &pmu_syscpu[cpu];
+	int period_ticks;
+
+	hwpmc_pmu_sx_xlock();
+	while (sc->sc_running) {
+		period_ticks = (pmu_mux_period_ms * hz) / 1000;
+		if (period_ticks < 1)
+			period_ticks = 1;
+		(void)hwpmc_pmu_sx_sleep(sc, period_ticks, "muxsys");
+		if (!sc->sc_running)
+			break;
+		pmu_syscpu_rotate_one(cpu);
+	}
+	sc->sc_td = NULL;
+	wakeup(&sc->sc_td);
 	hwpmc_pmu_sx_xunlock();
 	kthread_exit();
 }

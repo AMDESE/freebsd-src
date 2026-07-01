@@ -61,7 +61,7 @@ pmu_count_core_hw_slots(pmu_group_t *pg, struct proc *p)
 	struct pmc_classdep *pcd;
 	enum pmc_mode mode;
 	u_int n, slots;
-	int adjri;
+	int adjri, chk_cpu;
 
 	mdep = hwpmc_get_mdep();
 	if (mdep == NULL || pg == NULL || pg->pg_leader == NULL)
@@ -69,6 +69,14 @@ pmu_count_core_hw_slots(pmu_group_t *pg, struct proc *p)
 
 	pe = pg->pg_leader;
 	mode = pe->pe_alloc.pm_mode;
+	/*
+	 * Virtual groups float across CPUs (PMC_CPU_ANY); system-wide
+	 * groups are pinned to one CPU and must count free rows on that
+	 * specific CPU so that two system groups oversubscribing the same
+	 * core are correctly detected.
+	 */
+	chk_cpu = PMC_IS_SYSTEM_MODE(mode) ? pe->pe_alloc.pm_cpu :
+	    PMC_CPU_ANY;
 	slots = 0;
 	for (n = 0; n < mdep->pmd_npmc; n++) {
 		/*
@@ -85,7 +93,7 @@ pmu_count_core_hw_slots(pmu_group_t *pg, struct proc *p)
 		    pcd->pcd_class != pe->pe_alloc.pm_class)
 			continue;
 		if (!hwpmc_can_allocate_row(n, mode) ||
-		    !hwpmc_can_allocate_rowindex(p, n, PMC_CPU_ANY))
+		    !hwpmc_can_allocate_rowindex(p, n, chk_cpu))
 			continue;
 		if (pe->pe_alloc.pm_class == PMC_CLASS_K8 &&
 		    amd_can_assign_pmc(adjri, pe->pe_pmc, &pe->pe_alloc) != 0)
@@ -143,7 +151,8 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 	struct pmc_mdep *mdep;
 	enum pmc_mode mode;
 	uint32_t allowed;
-	int adjri, n;
+	int adjri, n, idcpu;
+	bool sys;
 
 	/*
 	 * pe_cons.pc_allowed_rows / *used_mask / pc_fixed_row all live in
@@ -155,6 +164,13 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 	pm = pe->pe_pmc;
 	mode = pe->pe_alloc.pm_mode;
 	allowed = pe->pe_cons.pc_allowed_rows;
+	/*
+	 * Virtual rows are CPU-agnostic and encode PMC_CPU_ANY; system
+	 * rows are bound to the caller-supplied CPU and must encode it so
+	 * PMC_TO_CPU() resolves correctly on the start/stop/read paths.
+	 */
+	sys = PMC_IS_SYSTEM_MODE(mode);
+	idcpu = sys ? cpu : PMC_CPU_ANY;
 
 	if ((pe->pe_cons.pc_flags & PMC_SC_F_FIXED) != 0) {
 		adjri = pe->pe_cons.pc_fixed_row;
@@ -188,7 +204,7 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 		if (pcd == NULL || n >= (int)mdep->pmd_npmc)
 			goto skip;
 		if (!hwpmc_can_allocate_row(n, mode) ||
-		    !hwpmc_can_allocate_rowindex(p, n, PMC_CPU_ANY))
+		    !hwpmc_can_allocate_rowindex(p, n, idcpu))
 			goto skip;
 		if (pe->pe_alloc.pm_class == PMC_CLASS_K8 &&
 		    amd_can_assign_pmc(adjri, pm, &pe->pe_alloc) != 0)
@@ -197,9 +213,17 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 			goto skip;
 
 		*used_mask |= 1u << adjri;
-		pm->pm_id = PMC_ID_MAKE_ID(PMC_CPU_ANY, mode,
+		pm->pm_id = PMC_ID_MAKE_ID(idcpu, mode,
 		    pe->pe_alloc.pm_class, n);
-		hwpmc_mark_row_thread(n);
+		/*
+		 * Mark the row's disposition to match its world: system
+		 * rows are STANDALONE (so a process-mode PMC can never grab
+		 * the same row on this CPU), virtual rows are THREAD.
+		 */
+		if (sys)
+			hwpmc_mark_row_standalone(n);
+		else
+			hwpmc_mark_row_thread(n);
 		pe->pe_state = PMU_EVENT_STATE_ACTIVE;
 		pe->pe_assigned_row = n;
 		return (0);
@@ -226,13 +250,16 @@ pmu_unassign_group(pmu_group_t *pg, int cpu)
 	struct pmc_classdep *pcd;
 	enum pmc_mode mode;
 	int adjri, n;
+	bool sys;
+
+	sys = (pg != NULL && pg->pg_system);
 
 	/*
 	 * AMD's pcd_release_pmc is logically a no-op but its KASSERT
 	 * still requires cpu >= 0.  PMC_CPU_ANY (-1) is a perfectly
 	 * legitimate "any CPU" value for virtual-mode PMCs, so coerce
 	 * it to CPU 0 here rather than fan it out across the per-class
-	 * back-ends.
+	 * back-ends.  System groups always pass their real bound CPU.
 	 */
 	if (cpu < 0)
 		cpu = 0;
@@ -248,7 +275,11 @@ pmu_unassign_group(pmu_group_t *pg, int cpu)
 			(void)pcd->pcd_release_pmc(cpu, adjri, pm);
 		pm->pm_id = PMC_ID_MAKE_ID(PMC_CPU_ANY, mode,
 		    pe->pe_alloc.pm_class, PMC_ROW_UNASSIGNED);
-		hwpmc_mark_row_free(n);
+		/* Undo the disposition we took in pmu_assign_one(). */
+		if (sys)
+			hwpmc_unmark_row_standalone(n);
+		else
+			hwpmc_mark_row_free(n);
 		pe->pe_state = PMU_EVENT_STATE_INACTIVE;
 		pe->pe_assigned_row = -1;
 	}
@@ -345,7 +376,9 @@ pmu_validate_group(pmu_group_t *pg)
 {
 	pmu_event_t *pe;
 	pmc_sched_constraint_t cons;
-	int rc;
+	enum pmc_mode lmode;
+	bool sys;
+	int lcpu, rc;
 
 	if (pg == NULL || pg->pg_leader == NULL)
 		return (EINVAL);
@@ -355,7 +388,33 @@ pmu_validate_group(pmu_group_t *pg)
 		return (EINVAL);
 	}
 
+	/*
+	 * Every sibling must share the leader's world.  A group is
+	 * either fully virtual (per-process) or fully system-wide; mixed
+	 * groups make no sense because they would rotate on different
+	 * schedulers.  For system-wide groups we additionally require a
+	 * single bound CPU -- all-or-none placement is per-CPU, so
+	 * siblings on different CPUs could never be co-scheduled.
+	 *
+	 * System-wide SAMPLING (PMC_MODE_SS) groups are NOT supported by
+	 * this layer yet: multiplex rotation of sampling counters needs
+	 * sample-routing / po_sscount handling that is deliberately out of
+	 * scope here.  Reject them cleanly so userland falls back instead
+	 * of silently mis-sampling.
+	 */
+	lmode = pg->pg_leader->pe_alloc.pm_mode;
+	sys = PMC_IS_SYSTEM_MODE(lmode);
+	lcpu = pg->pg_leader->pe_alloc.pm_cpu;
+	if (sys && lmode != PMC_MODE_SC) {
+		PMCDBG2(PMC, OPS, 1,
+		    "validate: gid=%u system sampling groups unsupported "
+		    "(mode=%d)", pg->pg_id, (int)lmode);
+		return (EOPNOTSUPP);
+	}
+
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		enum pmc_mode m = pe->pe_alloc.pm_mode;
+
 		if (pe->pe_pmc == NULL)
 			return (EINVAL);
 		if (!PMC_ROW_IS_UNASSIGNED(pe->pe_pmc)) {
@@ -366,8 +425,25 @@ pmu_validate_group(pmu_group_t *pg)
 		}
 		if ((pe->pe_alloc.pm_flags & PMC_F_GROUP_DEFER) == 0)
 			return (EINVAL);
-		if (!PMC_IS_VIRTUAL_MODE(pe->pe_alloc.pm_mode))
+		if (PMC_IS_SYSTEM_MODE(m) != sys) {
+			PMCDBG1(PMC, OPS, 1,
+			    "validate: gid=%u mixed system/virtual siblings",
+			    pg->pg_id);
 			return (EINVAL);
+		}
+		if (sys) {
+			if (m != PMC_MODE_SC)
+				return (EOPNOTSUPP);
+			if (pe->pe_alloc.pm_cpu != lcpu) {
+				PMCDBG3(PMC, OPS, 1,
+				    "validate: gid=%u system siblings span "
+				    "cpus (%d != %d)", pg->pg_id,
+				    pe->pe_alloc.pm_cpu, lcpu);
+				return (EINVAL);
+			}
+		} else if (!PMC_IS_VIRTUAL_MODE(m)) {
+			return (EINVAL);
+		}
 		rc = pmu_event_get_constraint(pe, &cons);
 		if (rc != 0) {
 			PMCDBG3(PMC, OPS, 1,
