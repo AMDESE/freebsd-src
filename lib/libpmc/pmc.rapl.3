@@ -1,0 +1,89 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 Advanced Micro Devices, Inc.
+.\"
+.Dd July 1, 2026
+.Dt PMC.RAPL 3
+.Os
+.Sh NAME
+.Nm pmc.rapl
+.Nd measurements using RAPL energy counters
+.Sh LIBRARY
+.Lb libpmc
+.Sh SYNOPSIS
+.In pmc.h
+.Sh DESCRIPTION
+.Tn AMD
+and
+.Tn Intel
+processors report cumulative energy consumption through the RAPL
+(Running Average Power Limit) machine specific registers.
+The
+.Li PMC_CLASS_RAPL
+class exposes these registers as read-only 64-bit counters that may
+only be allocated in system-wide counting mode
+.Pq Li PMC_MODE_SC .
+Counter values are cumulative energy in microjoules; the hardware
+energy unit, including the fixed DRAM unit used by
+.Tn Intel
+server processors, is applied in the kernel.
+.Pp
+The hardware counters are 32 bits wide and wrap frequently under load.
+The kernel folds them into 64-bit accumulators and samples every
+counter periodically while at least one RAPL PMC is allocated, so the
+exported values stay monotonic across counter wrap-around.
+.Pp
+RAPL events do not support further event qualifiers.
+.Ss Event Specifiers
+The following event names are supported:
+.Bl -tag -width indent
+.It Li rapl-energy-pkg
+Energy consumed by the processor package (socket) the counter is bound
+to.
+.It Li rapl-energy-cores
+On
+.Tn AMD
+processors, energy consumed by the physical core the counter is bound
+to.
+On
+.Tn Intel
+processors, energy consumed by the PP0 (all cores) power plane of the
+package, i.e. a package-scoped value.
+.It Li rapl-energy-dram
+Energy consumed by the DRAM domain of the package.
+Present only on
+.Tn Intel
+processors that implement the DRAM domain, typically server parts.
+.El
+.Ss Counter Scope
+RAPL counters measure package or core power domains, not individual
+CPUs: every CPU of a domain reads the same underlying counter.
+Consumers should bind one PMC per domain of interest and must not sum
+readings taken from CPUs sharing a domain.
+The class advertises the
+.Li PMC_CAP_DOMWIDE
+capability, which makes
+.Xr pmcstat 8
+allocate one counter per NUMA domain instead of one per CPU.
+On systems configured with several NUMA domains per package, the
+package-scoped events of domains within one package alias each other.
+.Ss Privilege
+Allocating a RAPL PMC always requires the
+.Li PRIV_PMC_SYSTEM
+privilege, regardless of the
+.Va security.bsd.unprivileged_syspmcs
+sysctl: fine-grained energy readings form a power side channel
+(PLATYPUS, CVE-2020-8694 and CVE-2020-12912).
+Unprivileged allocation requests fail with
+.Er EPERM .
+.Sh SEE ALSO
+.Xr pmc 3 ,
+.Xr pmc.tsc 3 ,
+.Xr pmc_allocate 3 ,
+.Xr pmc_read 3 ,
+.Xr pmclog 3 ,
+.Xr hwpmc 4 ,
+.Xr pmcstat 8
+.Sh HISTORY
+The RAPL PMC class first appeared in
+.Fx 16.0 .
