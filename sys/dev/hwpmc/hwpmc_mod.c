@@ -1041,9 +1041,37 @@ hwpmc_pmu_accumulate_remove(int cpu, int ri, struct pmc *pm,
 void
 pmc_rotation_drain(struct pmc *pm)
 {
+	struct pmc_binding pb;
+	int cpu;
 #ifdef INVARIANTS
 	int maxloop = 100 * pmc_cpu_max();
 #endif
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+
+	/*
+	 * pm_runcount is bumped at csw_in and dropped at csw_out, so it
+	 * only falls when the CPUs currently holding this PMC in hardware
+	 * actually context-switch.  The old implementation just pause()d
+	 * on the *calling* CPU and hoped the remote targets would switch
+	 * on their own.  That is unsafe for the multiplex rotation: a
+	 * counting-mode target thread that is the only runnable thread on
+	 * its core is never involuntarily preempted, so it never runs
+	 * csw_out, pm_runcount never reaches zero, and this loop spins
+	 * until the INVARIANTS cap trips and panics (or, on a production
+	 * kernel, stalls for a long time while holding pmc_sx).
+	 *
+	 * Drive the drain actively instead: walk every active CPU and, if
+	 * the counter is still loaded somewhere, migrate onto that CPU.
+	 * pmc_select_cpu() binds us there at PRI_MIN, which preempts the
+	 * resident target thread and forces its csw_out (that runs during
+	 * the switch *to* us, so by the time we execute on the CPU the
+	 * runcount for that CPU has already dropped).  Because rotation
+	 * has already stamped every sibling STOPPED before draining, the
+	 * preempted thread's next csw_in will not re-load the counter, so
+	 * a single visit per CPU is enough and runcount is monotone.
+	 */
+	pmc_save_cpu_binding(&pb);
 	while (counter_u64_fetch(pm->pm_runcount) > 0) {
 #ifdef INVARIANTS
 		KASSERT(maxloop-- > 0,
@@ -1051,8 +1079,16 @@ pmc_rotation_drain(struct pmc *pm)
 		    __LINE__, pm,
 		    (uintmax_t)counter_u64_fetch(pm->pm_runcount)));
 #endif
-		pmc_force_context_switch();
+		for (cpu = 0; cpu < pmc_cpu_max(); cpu++) {
+			if (counter_u64_fetch(pm->pm_runcount) == 0)
+				break;
+			if (!pmc_cpu_is_active(cpu))
+				continue;
+			pmc_select_cpu(cpu);
+			pmc_force_context_switch();
+		}
 	}
+	pmc_restore_cpu_binding(&pb);
 }
 
 /*
@@ -2940,11 +2976,37 @@ pmc_destroy_pmc_descriptor(struct pmc *pm)
 static void
 pmc_wait_for_pmc_idle(struct pmc *pm)
 {
+	struct pmc_binding pb;
+	bool active_drain;
+	int cpu;
 #ifdef INVARIANTS
 	volatile int maxloop;
 
 	maxloop = 100 * pmc_cpu_max();
 #endif
+
+	/*
+	 * A virtual-mode PMC (including a process mux-group sibling) can
+	 * still be loaded on the hardware of any CPU that is running one
+	 * of its target threads.  pm_runcount only drops when those CPUs
+	 * run csw_out, so passively pause()ing here is unsafe: a
+	 * counting-mode target that is the only runnable thread on its
+	 * core is never involuntarily preempted, never csw_out's, and
+	 * this loop would spin until the INVARIANTS cap panics (or stall
+	 * for a long time under pmc_sx on a production kernel).  This is
+	 * the same failure the multiplex rotation drain hits, and the
+	 * virtual mux release path reaches it here (pm_state was just set
+	 * DELETED) before pmu_group_on_release runs.  Actively migrate
+	 * onto every loaded CPU to force its resident target off; see
+	 * pmc_rotation_drain for the full rationale.  System-mode PMCs
+	 * have already been de-configured off hardware by the caller, so
+	 * only their sample-queue references remain -- the pmclog_flush
+	 * path below handles those and no migration is needed.
+	 */
+	active_drain = PMC_IS_VIRTUAL_MODE(PMC_TO_MODE(pm));
+	if (active_drain)
+		pmc_save_cpu_binding(&pb);
+
 	/*
 	 * Loop (with a forced context switch) till the PMC's runcount
 	 * comes down to zero.
@@ -2959,8 +3021,20 @@ pmc_wait_for_pmc_idle(struct pmc *pm)
 		     "pmc to be free", __LINE__, PMC_TO_ROWINDEX(pm),
 		     (uintmax_t)counter_u64_fetch(pm->pm_runcount)));
 #endif
-		pmc_force_context_switch();
+		if (active_drain) {
+			for (cpu = 0; cpu < pmc_cpu_max(); cpu++) {
+				if (counter_u64_fetch(pm->pm_runcount) == 0)
+					break;
+				if (!pmc_cpu_is_active(cpu))
+					continue;
+				pmc_select_cpu(cpu);
+				pmc_force_context_switch();
+			}
+		} else
+			pmc_force_context_switch();
 	}
+	if (active_drain)
+		pmc_restore_cpu_binding(&pb);
 }
 
 /*
@@ -2988,6 +3062,18 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
 	KASSERT(pm, ("[pmc,%d] null pmc", __LINE__));
+
+	/*
+	 * System-wide group sibling: evict the whole group off hardware
+	 * and tear down its per-CPU rotation BEFORE we read ri/mode or
+	 * touch the row below.  After this returns the releasing pm is
+	 * UNASSIGNED, so it falls into the deferred-release path that does
+	 * no HW work (the rows were already freed here), which is exactly
+	 * what avoids a double release of a row the rotation layer owns.
+	 */
+	if (pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL &&
+	    pm->pm_pmu->pe_group->pg_system)
+		pmu_sys_group_pre_release(pm);
 
 	ri = PMC_TO_ROWINDEX(pm);
 	mode = PMC_TO_MODE(pm);
@@ -3298,6 +3384,78 @@ hwpmc_mark_row_free(int ri)
 	PMC_MARK_ROW_FREE(ri);
 }
 
+void
+hwpmc_mark_row_standalone(int ri)
+{
+	PMC_MARK_ROW_STANDALONE(ri);
+}
+
+void
+hwpmc_unmark_row_standalone(int ri)
+{
+	PMC_UNMARK_ROW_STANDALONE(ri);
+}
+
+/*
+ * Program and start one system-wide PMC's hardware on its bound CPU.
+ * Used by the PMU grouping layer's per-CPU multiplex rotation (see
+ * hwpmc_pmu.c).  pm->pm_gv.pm_savedvalue carries the cumulative count
+ * across rotation windows: it is preloaded into the HW counter here so
+ * that a subsequent read returns the running total, and read back out in
+ * hwpmc_pmu_sys_stop_row() when the group is evicted.
+ */
+void
+hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
+{
+	struct pmc_binding pb;
+	struct pmc_classdep *pcd;
+	int adjri, ri;
+
+	ri = PMC_TO_ROWINDEX(pm);
+	pcd = pmc_ri_to_classdep(md, ri, &adjri);
+	if (pcd == NULL || !pmc_cpu_is_active(cpu))
+		return;
+
+	pmc_save_cpu_binding(&pb);
+	pmc_select_cpu(cpu);
+	critical_enter();
+	(void)pcd->pcd_write_pmc(cpu, adjri, pm, pm->pm_gv.pm_savedvalue);
+	pm->pm_pcpu_state[cpu].pps_cpustate = 1;
+	(void)pcd->pcd_start_pmc(cpu, adjri, pm);
+	critical_exit();
+	pmc_restore_cpu_binding(&pb);
+}
+
+/*
+ * Stop one system-wide PMC's hardware on its bound CPU and fold the
+ * final hardware reading into pm->pm_gv.pm_savedvalue so the cumulative
+ * count survives the multiplex eviction.
+ */
+void
+hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm)
+{
+	struct pmc_binding pb;
+	struct pmc_classdep *pcd;
+	pmc_value_t v;
+	int adjri, ri;
+
+	ri = PMC_TO_ROWINDEX(pm);
+	pcd = pmc_ri_to_classdep(md, ri, &adjri);
+	if (pcd == NULL || !pmc_cpu_is_active(cpu))
+		return;
+
+	pmc_save_cpu_binding(&pb);
+	pmc_select_cpu(cpu);
+	critical_enter();
+	pm->pm_pcpu_state[cpu].pps_cpustate = 0;
+	(void)pcd->pcd_stop_pmc(cpu, adjri, pm);
+	v = pm->pm_gv.pm_savedvalue;
+	if (pcd->pcd_read_pmc(cpu, adjri, pm, &v) == 0)
+		pm->pm_gv.pm_savedvalue = v;
+	critical_exit();
+	pmc_restore_cpu_binding(&pb);
+}
+
 static bool
 pmc_can_allocate_row(int ri, enum pmc_mode mode)
 {
@@ -3431,6 +3589,24 @@ pmc_start(struct pmc *pm)
 	    ("[pmc,%d] null pm", __LINE__));
 
 	mode = PMC_TO_MODE(pm);
+
+	/*
+	 * System-wide group sibling: hand the whole group to the PMU
+	 * layer, which programs every sibling's HW on its bound CPU (or
+	 * defers it to the per-CPU multiplex rotation).  This must run
+	 * before the unassigned-row fast path below: a deferred sibling
+	 * carries ri == PMC_ROW_UNASSIGNED while an already-bound one does
+	 * not, and both have to funnel through the group layer rather than
+	 * the normal per-CPU system start path.
+	 */
+	if (!PMC_IS_VIRTUAL_MODE(mode) && pm->pm_pmu != NULL &&
+	    pm->pm_pmu->pe_group != NULL) {
+		error = pmu_sys_group_on_start(pm);
+		if (error == 0)
+			pm->pm_state = PMC_STATE_RUNNING;
+		return (error);
+	}
+
 	/*
 	 * Multiplexed group siblings are only periodically bound to a
 	 * HW row by the rotation kthread; in between they live with
@@ -3594,6 +3770,17 @@ pmc_stop(struct pmc *pm)
 	 */
 	if (PMC_IS_VIRTUAL_MODE(PMC_TO_MODE(pm))) {
 		pmu_group_on_stop(pm);
+		return (0);
+	}
+
+	/*
+	 * System-wide group sibling: the PMU layer stops every sibling's
+	 * HW on its bound CPU (and frees the rows).  We must not fall
+	 * through to the normal per-CPU stop below, which would dereference
+	 * row 255 for a currently-evicted multiplex sibling.
+	 */
+	if (pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL) {
+		pmu_sys_group_on_stop(pm);
 		return (0);
 	}
 
@@ -3792,9 +3979,20 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 	pmc->pm_flags = flags;
 
 	if ((flags & PMC_F_GROUP_DEFER) != 0) {
-		if (!PMC_IS_VIRTUAL_MODE(mode)) {
+		u_int defcpu;
+
+		/*
+		 * Deferred grouping/multiplex supports per-process virtual
+		 * groups (TC/TS) and system-wide COUNTING groups (SC).
+		 * System-wide SAMPLING (SS) multiplex needs sample-routing
+		 * and po_sscount handling the PMU grouping layer does not
+		 * implement yet (see pmu_validate_group()), so reject it
+		 * cleanly here rather than allocate a row that could never
+		 * be scheduled in.
+		 */
+		if (!PMC_IS_VIRTUAL_MODE(mode) && mode != PMC_MODE_SC) {
 			pmc_destroy_pmc_descriptor(pmc);
-			return (EINVAL);
+			return (EOPNOTSUPP);
 		}
 		/*
 		 * The class must publish a grouping constraint provider
@@ -3806,7 +4004,16 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 			pmc_destroy_pmc_descriptor(pmc);
 			return (EOPNOTSUPP);
 		}
-		pmc->pm_id = PMC_ID_MAKE_ID(PMC_CPU_ANY, mode, class,
+		/*
+		 * Virtual siblings float across CPUs (PMC_CPU_ANY); a
+		 * system-wide sibling is pinned to its caller-supplied CPU
+		 * (already validated active above).  pmu_group_commit()
+		 * reads the bound CPU back from pe_alloc.pm_cpu and the
+		 * assigner re-encodes it into pm_id when the group is
+		 * scheduled in -- the row stays UNASSIGNED until then.
+		 */
+		defcpu = PMC_IS_SYSTEM_MODE(mode) ? cpu : PMC_CPU_ANY;
+		pmc->pm_id = PMC_ID_MAKE_ID(defcpu, mode, class,
 		    PMC_ROW_UNASSIGNED);
 		if (PMC_IS_SAMPLING_MODE(mode)) {
 			if (pa->pm_count < MAX(1, pmc_mincount))
@@ -3831,9 +4038,10 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 			return (error);
 		}
 		/*
-		 * Deferred PMCs share the same encoded pm_id (CPU_ANY,
-		 * mode, class, ROW_UNASSIGNED) so we cannot use pm_id as
-		 * the per-PMC user-facing handle.  Allocate a unique
+		 * Deferred PMCs all carry ROW_UNASSIGNED in pm_id (and a
+		 * shared CPU field -- CPU_ANY for virtual, the bound CPU
+		 * for system), so pm_id is not unique per PMC and cannot
+		 * serve as the user-facing handle.  Allocate a unique
 		 * value in the row-index byte so pmc_find_pmc() can
 		 * distinguish individual deferred PMCs and so userland
 		 * receives a distinct id from each pmc_allocate_group().
@@ -3853,7 +4061,7 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 				return (ENOSPC);
 			}
 			serial = po2->po_next_deferred_serial++;
-			pmc->pm_handle = PMC_ID_MAKE_ID(PMC_CPU_ANY, mode,
+			pmc->pm_handle = PMC_ID_MAKE_ID(defcpu, mode,
 			    class, serial);
 		}
 		pa->pm_pmcid = pmc->pm_handle;
@@ -4210,6 +4418,27 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 
 		mtx_pool_unlock_spin(pmc_mtxpool, pm);
 	} else { /* System mode PMCs */
+		/*
+		 * Evicted system-wide multiplex sibling: it holds no HW row
+		 * right now (ri == 255), so the pcd_read path below would
+		 * dereference row 255 and panic.  pm_gv.pm_savedvalue is the
+		 * cumulative count maintained by hwpmc_pmu_sys_stop_row()
+		 * across rotation windows; return it directly.  A sibling
+		 * that is currently scheduled in has its running total
+		 * preloaded into the HW counter, so the normal read below
+		 * returns the right value with no special-casing.
+		 */
+		if (pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL &&
+		    PMC_ROW_IS_UNASSIGNED(pm)) {
+			mtx_pool_lock_spin(pmc_mtxpool, pm);
+			if ((prw->pm_flags & PMC_F_OLDVALUE) != 0)
+				*valp = pm->pm_gv.pm_savedvalue;
+			if ((prw->pm_flags & PMC_F_NEWVALUE) != 0)
+				pm->pm_gv.pm_savedvalue = prw->pm_value;
+			mtx_pool_unlock_spin(pmc_mtxpool, pm);
+			return (0);
+		}
+
 		cpu = PMC_TO_CPU(pm);
 		ri  = PMC_TO_ROWINDEX(pm);
 		pcd = pmc_ri_to_classdep(md, ri, &adjri);
