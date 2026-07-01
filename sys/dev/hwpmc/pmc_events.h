@@ -62,11 +62,6 @@ __PMC_EV_ALIAS("cycles",	TSC_TSC)
 #define	PMC_EV_RAPL_FIRST	PMC_EV_RAPL_ENERGY_PKG
 #define	PMC_EV_RAPL_LAST	PMC_EV_RAPL_ENERGY_DRAM
 
-#define	__PMC_EV_ALIAS_RAPL()					\
-__PMC_EV_ALIAS("rapl-energy-pkg",	RAPL_ENERGY_PKG)	\
-__PMC_EV_ALIAS("rapl-energy-cores",	RAPL_ENERGY_CORES)	\
-__PMC_EV_ALIAS("rapl-energy-dram",	RAPL_ENERGY_DRAM)
-
 /*
  * Software events are dynamically defined.
  */
