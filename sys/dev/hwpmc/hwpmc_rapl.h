@@ -14,10 +14,8 @@
 struct pmc_mdep;
 
 /*
- * Maximum number of RAPL counter rows per CPU. One row per supported energy
- * event: package, "cores" and DRAM. AMD exposes package + cores (2); Intel
- * adds DRAM (3). The actual count is determined per-vendor at initialize time
- * and stored in the class-dep's pcd_num.
+ * Max RAPL rows per CPU: package, "cores" and (Intel only) DRAM. The actual
+ * per-vendor count is determined at initialize time (pcd_num).
  */
 #define	RAPL_MAX_NPMCS	3
 

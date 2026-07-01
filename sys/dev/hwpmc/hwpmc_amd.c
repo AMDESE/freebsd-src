@@ -1013,9 +1013,8 @@ pmc_amd_initialize(void)
 
 	/*
 	 * These processors have two or three classes of PMCs: the TSC,
-	 * programmable PMCs, and AMD IBS.  One extra class is always reserved
-	 * for the RAPL energy counters; that slot is simply left unused if no
-	 * RAPL MSRs are present (see the pmc_rapl_initialize call below).
+	 * programmable PMCs, and AMD IBS.  One extra class slot is reserved
+	 * for the optional RAPL energy counters.
 	 */
 	if ((amd_feature2 & AMDID2_IBS) != 0) {
 		nclasses = 4;
@@ -1072,12 +1071,7 @@ pmc_amd_initialize(void)
 			goto error;
 	}
 
-	/*
-	 * Initialize the RAPL energy counters.  RAPL occupies the last class
-	 * slot reserved above.  Its probe fails benignly (ENXIO) when no RAPL
-	 * MSRs are present; in that case drop the reserved slot from the class
-	 * count so it is never reported, and continue without RAPL.
-	 */
+	/* RAPL takes the reserved last slot; drop it if the probe fails. */
 	error = pmc_rapl_initialize(pmc_mdep, ncpus, pmc_mdep->pmd_nclass - 1);
 	if (error != 0)
 		pmc_mdep->pmd_nclass--;

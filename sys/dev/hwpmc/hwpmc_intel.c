@@ -280,11 +280,7 @@ pmc_intel_initialize(void)
 		return (NULL);
 	}
 
-	/*
-	 * Reserve one extra class slot for the (optional) RAPL energy
-	 * counters.  The slot is left unused if no RAPL MSRs are present
-	 * (see the pmc_rapl_initialize call below).
-	 */
+	/* Reserve one extra class slot for the optional RAPL counters. */
 	nclasses++;
 
 	/* Allocate base class and initialize machine dependent struct */
@@ -342,12 +338,7 @@ pmc_intel_initialize(void)
 		break;
 	}
 
-	/*
-	 * Initialize the RAPL energy counters.  RAPL occupies the last class
-	 * slot reserved above.  Its probe fails benignly (ENXIO) when no RAPL
-	 * MSRs are present; in that case drop the reserved slot from the class
-	 * count so it is never reported, and continue without RAPL.
-	 */
+	/* RAPL takes the reserved last slot; drop it if the probe fails. */
 	if (error == 0 &&
 	    pmc_rapl_initialize(pmc_mdep, ncpus, pmc_mdep->pmd_nclass - 1) != 0)
 		pmc_mdep->pmd_nclass--;
