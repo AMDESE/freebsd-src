@@ -3340,7 +3340,7 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 	uint32_t caps, flags;
 	u_int cpu;
 	int adjri, n;
-	int error;
+	int alloc_error, error;
 
 	class = pa->pm_class;
 	caps  = pa->pm_caps;
@@ -3350,6 +3350,7 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 
 	p = td->td_proc;
 	have_alloc_ke = false;
+	alloc_error = 0;
 
 	/* Requested mode must exist. */
 	if ((mode != PMC_MODE_SS && mode != PMC_MODE_SC &&
@@ -3492,13 +3493,18 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 			    !PMC_IS_SHAREABLE_PMC(cpu, n))
 				continue;
 
-			if (pcd->pcd_allocate_pmc(cpu, adjri, pmc, pa) == 0) {
+			error = pcd->pcd_allocate_pmc(cpu, adjri, pmc, pa);
+			if (error == 0) {
 				/* Success. */
 				break;
 			}
-			if (!have_alloc_ke && pcd->pcd_class == class &&
-			    pmc_capture_hwpmc_exterr(td, &alloc_ke))
-				have_alloc_ke = true;
+			if (pcd->pcd_class == class) {
+				if (alloc_error == 0 && error != EINVAL)
+					alloc_error = error;
+				if (!have_alloc_ke &&
+				    pmc_capture_hwpmc_exterr(td, &alloc_ke))
+					have_alloc_ke = true;
+			}
 		}
 	} else {
 		/* Process virtual mode */
@@ -3509,14 +3515,19 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 			    !pmc_can_allocate_rowindex(p, n, PMC_CPU_ANY))
 				continue;
 
-			if (pcd->pcd_allocate_pmc(td->td_oncpu, adjri, pmc,
-			    pa) == 0) {
+			error = pcd->pcd_allocate_pmc(td->td_oncpu, adjri, pmc,
+			    pa);
+			if (error == 0) {
 				/* Success. */
 				break;
 			}
-			if (!have_alloc_ke && pcd->pcd_class == class &&
-			    pmc_capture_hwpmc_exterr(td, &alloc_ke))
-				have_alloc_ke = true;
+			if (pcd->pcd_class == class) {
+				if (alloc_error == 0 && error != EINVAL)
+					alloc_error = error;
+				if (!have_alloc_ke &&
+				    pmc_capture_hwpmc_exterr(td, &alloc_ke))
+					have_alloc_ke = true;
+			}
 		}
 	}
 
@@ -3527,8 +3538,17 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 
 	if (n == md->pmd_npmc) {
 		pmc_destroy_pmc_descriptor(pmc);
+		/*
+		 * Prefer a specific errno reported by a row of the requested
+		 * class (e.g. EPERM) over the generic EINVAL.
+		 */
+		if (alloc_error == 0)
+			alloc_error = EINVAL;
 		if (have_alloc_ke)
-			return (pmc_return_saved_exterr(&alloc_ke, EINVAL));
+			return (pmc_return_saved_exterr(&alloc_ke,
+			    alloc_error));
+		if (alloc_error != EINVAL)
+			return (alloc_error);
 		return (EXTERROR(EINVAL,
 		    "No PMC row accepted the allocation request"));
 	}
