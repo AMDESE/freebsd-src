@@ -5,10 +5,10 @@
  *
  * AMD/Intel RAPL energy counters exposed as an hwpmc(4) PMC class.
  *
- * Structurally a clone of the TSC class (hwpmc_tsc.c): read-only, system
- * scope only (PMC_MODE_SC), 64-bit virtual counter reporting microjoules.
- * The energy-unit decode, overflow-safe tick->uJ conversion, 32-bit wrap
- * recovery and overflow-guard callout are ported from amdrapl(4).
+ * Modeled on the TSC class (hwpmc_tsc.c): read-only, system-scope
+ * (PMC_MODE_SC), 64-bit counter reporting microjoules.  The unit decode,
+ * overflow-safe tick->uJ conversion, wrap recovery and guard callout come
+ * from amdrapl(4).
  */
 
 #include <sys/param.h>
@@ -31,10 +31,6 @@
 #include <x86/x86_var.h>
 
 #include <dev/hwpmc/hwpmc_rapl.h>
-
-/*
- * RAPL support.
- */
 
 /* Energy counters are per-package/core domains, not per CPU: DOMWIDE. */
 #define	RAPL_CAPS	(PMC_CAP_READ | PMC_CAP_DOMWIDE)
@@ -62,9 +58,9 @@ struct rapl_value {
 };
 
 /*
- * Per-CPU state. rc_mtx serializes rc_value folds between the bound read
- * path and the guard rendezvous IPI; both run on this CPU only, and both
- * contexts forbid sleeping, so it must be MTX_SPIN.
+ * Per-CPU state.  rc_mtx serializes rc_value folds between the bound read
+ * path and the guard IPI.  Both run on this CPU and cannot sleep, so it is
+ * MTX_SPIN.
  */
 struct rapl_cpu {
 	struct pmc_hw	rc_hw[RAPL_MAX_NPMCS];
@@ -84,10 +80,11 @@ static int rapl_npmcs;
 static int rapl_ri;
 
 /*
- * Overflow guard: a periodic callout sampling every CPU with an allocated
- * RAPL PMC so a 32-bit wrap is never missed while a consumer exists (hwpmc
- * allows reads in the ALLOCATED and STOPPED states, not just RUNNING).
- * Armed by the first allocated RAPL PMC, drained by the last release.
+ * Overflow guard: a periodic callout that samples every CPU holding a RAPL
+ * PMC so a 32-bit wrap is never missed.  It runs for the PMC's whole life,
+ * not just while RUNNING, because hwpmc also allows reads in the ALLOCATED
+ * and STOPPED states.  Armed by the first allocation, drained by the last
+ * release.
  */
 static struct callout	rapl_guard_callout;
 static sbintime_t	rapl_guard_sbt;
@@ -110,8 +107,8 @@ rapl_raw_to_uj(uint64_t raw, uint32_t shift)
 }
 
 /*
- * Fold a fresh 32-bit MSR reading into a row's 64-bit accumulator, recovering
- * at most one wrap. Caller holds the row's rc_mtx.
+ * Fold a fresh 32-bit MSR reading into the row's 64-bit accumulator,
+ * recovering at most one wrap.  Caller holds the row's rc_mtx.
  */
 static void
 rapl_update_delta(struct rapl_value *val, uint64_t cur)
@@ -140,8 +137,8 @@ rapl_update_delta(struct rapl_value *val, uint64_t cur)
 }
 
 /*
- * Sample one row's MSR on the current CPU (the read path is bound there by
- * hwpmc; the guard arrives via rendezvous) and return the folded accumulator.
+ * Sample one row's MSR on the current CPU and return the folded accumulator.
+ * The read path is bound here by hwpmc; the guard arrives via rendezvous.
  */
 static uint64_t
 rapl_sample_row(int cpu, int ri)
@@ -220,9 +217,9 @@ rapl_allocate_pmc(int cpu, int ri, struct pmc *pm __unused,
 
 	/*
 	 * Energy counters are a power side channel (PLATYPUS, CVE-2020-8694 /
-	 * CVE-2020-12912), so require PRIV_PMC_SYSTEM unconditionally: the
-	 * core's own check is bypassed by security.bsd.unprivileged_syspmcs=1
-	 * and energy telemetry must not honor that bypass.
+	 * CVE-2020-12912).  Require PRIV_PMC_SYSTEM here unconditionally: the
+	 * core check honors security.bsd.unprivileged_syspmcs=1, and energy
+	 * telemetry must not.
 	 */
 	if (priv_check(curthread, PRIV_PMC_SYSTEM) != 0)
 		return (EPERM);
@@ -358,8 +355,8 @@ rapl_pcpu_fini(struct pmc_mdep *md __unused, int cpu)
 	    rapl_pcpu[cpu]->rc_nalloc, cpu));
 
 	/*
-	 * All PMCs were released before per-cpu teardown, so the last release
-	 * has already drained the guard: no handler can touch this state.
+	 * Every PMC was released before teardown, so the last release already
+	 * drained the guard: no handler can touch this state.
 	 */
 	mtx_destroy(&rapl_pcpu[cpu]->rc_mtx);
 	free(rapl_pcpu[cpu], M_PMC);
@@ -392,10 +389,10 @@ rapl_read_pmc(int cpu, int ri, struct pmc *pm, pmc_value_t *v)
 	PMCDBG1(MDP,REA,1, "rapl-read id=%d", ri);
 
 	/*
-	 * hwpmc has bound this thread to PMC_TO_CPU(pm) == cpu inside a
-	 * critical section, so rdmsr reads the domain the consumer asked for.
-	 * SMT siblings and same-package CPUs alias to the same counter;
-	 * userland binds one PMC per domain (see PMC_CAP_DOMWIDE).
+	 * hwpmc bound this thread to cpu == PMC_TO_CPU(pm) in a critical
+	 * section, so rdmsr reads the domain the consumer asked for.  SMT
+	 * siblings and same-package CPUs alias one counter; userland binds
+	 * one PMC per domain (see PMC_CAP_DOMWIDE).
 	 */
 	*v = rapl_raw_to_uj(rapl_sample_row(cpu, ri), rapl_events[ri].re_unit);
 
@@ -427,8 +424,8 @@ rapl_release_pmc(int cpu, int ri, struct pmc *pmc __unused)
 	mtx_unlock(&rapl_alloc_mtx);
 
 	/*
-	 * Last release: drain the guard (sleepable here), after which no
-	 * handler is in flight and none can rearm until the next allocation.
+	 * Last release: drain the guard (sleepable here).  Afterward no
+	 * handler is in flight, and none rearms until the next allocation.
 	 */
 	if (last)
 		callout_drain(&rapl_guard_callout);
@@ -503,9 +500,9 @@ rapl_add_event(enum pmc_event ev, uint32_t msr, uint32_t unit,
 }
 
 /*
- * Guard interval for a given energy unit. The counter wraps after 2^32-1
- * ticks; at RAPL_GUARD_WATT that is max_energy_uj/(P*1e6) seconds, sampled at
- * half that so a double-wrap cannot pass unseen.
+ * Guard interval for a given energy unit.  The counter wraps after 2^32-1
+ * ticks, which at RAPL_GUARD_WATT is max_energy_uj/(P*1e6) seconds.  Sample
+ * at half that so a double wrap cannot pass unseen.
  */
 static sbintime_t
 rapl_compute_guard_sbt(uint32_t shift)
@@ -522,7 +519,7 @@ rapl_compute_guard_sbt(uint32_t shift)
 }
 
 /*
- * Intel server CPUs use a fixed 2^-16 J DRAM energy unit regardless of the
+ * Intel server CPUs use a fixed 2^-16 J DRAM energy unit, ignoring the
  * package ESU (Linux RAPL_UNIT_QUIRK_INTEL_HSW/_SPR).
  */
 static bool
