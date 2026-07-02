@@ -2,7 +2,7 @@
 .\"
 .\" Copyright (c) 2026 Advanced Micro Devices, Inc.
 .\"
-.Dd July 1, 2026
+.Dd July 2, 2026
 .Dt PMC.RAPL 3
 .Os
 .Sh NAME
@@ -60,13 +60,54 @@ RAPL counters measure package or core power domains, not individual
 CPUs: every CPU of a domain reads the same underlying counter.
 Consumers should bind one PMC per domain of interest and must not sum
 readings taken from CPUs sharing a domain.
+.Pp
 The class advertises the
 .Li PMC_CAP_DOMWIDE
 capability, which makes
 .Xr pmcstat 8
 allocate one counter per NUMA domain instead of one per CPU.
-On systems configured with several NUMA domains per package, the
-package-scoped events of domains within one package alias each other.
+NUMA domains follow the firmware memory policy and need not match
+packages, in either direction:
+.Bl -bullet
+.It
+With several NUMA domains per package (for example
+.Tn AMD
+NPS2/NPS4 or
+.Tn Intel
+Sub-NUMA Clustering),
+.Xr pmcstat 8
+allocates one counter per domain, so package-scoped counters within
+one package alias each other: each reading is individually correct
+but they must not be summed.
+.It
+With a single NUMA domain spanning several packages (for example
+.Tn AMD
+NPS0 memory interleaving, NUMA disabled in firmware, or a kernel
+built without NUMA support),
+.Xr pmcstat 8
+allocates only one counter, on the first configured CPU, and the
+remaining packages are silently not measured.
+.El
+.Pp
+For explicit placement, allocate one system-scope PMC per package
+with
+.Xr pmc_allocate 3 ,
+or give
+.Xr pmcstat 8
+one
+.Fl c Ar cpu
+and
+.Fl s Ar event
+pair per package, for example on a two-socket system whose second
+package starts at CPU 64:
+.Dl pmcstat -c 0 -s rapl-energy-pkg -c 64 -s rapl-energy-pkg
+A single
+.Fl c
+list naming several CPUs does not achieve this: for
+.Li PMC_CAP_DOMWIDE
+counters
+.Xr pmcstat 8
+honors only the first CPU of the list.
 .Ss Privilege
 Allocating a RAPL PMC always requires the
 .Li PRIV_PMC_SYSTEM
