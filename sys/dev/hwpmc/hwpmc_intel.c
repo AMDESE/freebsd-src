@@ -338,7 +338,6 @@ pmc_intel_initialize(void)
 		break;
 	}
 
-	/* RAPL takes the reserved last slot; drop it if the probe fails. */
 	if (error == 0 &&
 	    pmc_rapl_initialize(pmc_mdep, ncpus, pmc_mdep->pmd_nclass - 1) != 0)
 		pmc_mdep->pmd_nclass--;
@@ -354,7 +353,6 @@ pmc_intel_initialize(void)
 void
 pmc_intel_finalize(struct pmc_mdep *md)
 {
-	/* Safe even if the RAPL class was skipped at initialize time. */
 	pmc_rapl_finalize(md);
 
 	pmc_tsc_finalize(md);
