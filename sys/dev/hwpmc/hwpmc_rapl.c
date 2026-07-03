@@ -5,10 +5,8 @@
  *
  * AMD/Intel RAPL energy counters exposed as an hwpmc(4) PMC class.
  *
- * Modeled on the TSC class (hwpmc_tsc.c): read-only, system-scope
- * (PMC_MODE_SC), 64-bit counter reporting microjoules.  The unit decode,
- * overflow-safe tick->uJ conversion, wrap recovery and guard callout come
- * from amdrapl(4).
+ * Read-only, system-scope (PMC_MODE_SC), 64-bit counters reporting
+ * microjoules.
  */
 
 #include <sys/param.h>
@@ -42,26 +40,19 @@
 #define	RAPL_GUARD_MIN_MS	10
 #define	RAPL_GUARD_MAX_MS	60000
 
-/* One hwpmc row: the RAPL event it measures, its MSR and energy unit. */
 struct rapl_event {
-	enum pmc_event	re_ev;		/* PMC_EV_RAPL_*		*/
-	uint32_t	re_msr;		/* energy-status MSR		*/
+	enum pmc_event	re_ev;
+	uint32_t	re_msr;
 	uint32_t	re_unit;	/* unit shift: 1 tick = 1/2^unit J */
 };
 
-/* Per-(cpu,row) accumulator: folds the 32-bit MSR into a monotonic u64. */
 struct rapl_value {
 	uint64_t	rv_prev;	/* last raw 32-bit MSR value	*/
-	uint64_t	rv_accum;	/* 64-bit lifetime tick accumulator */
+	uint64_t	rv_accum;
 	sbintime_t	rv_prev_time;
 	bool		rv_primed;
 };
 
-/*
- * Per-CPU state.  rc_mtx serializes rc_value folds between the bound read
- * path and the guard IPI.  Both run on this CPU and cannot sleep, so it is
- * MTX_SPIN.
- */
 struct rapl_cpu {
 	struct pmc_hw	rc_hw[RAPL_MAX_NPMCS];
 	struct rapl_value rc_value[RAPL_MAX_NPMCS];
@@ -71,27 +62,16 @@ struct rapl_cpu {
 
 static struct rapl_cpu **rapl_pcpu;
 
-/* Vendor-selected event table, populated in pmc_rapl_initialize(). */
 static struct rapl_event rapl_events[RAPL_MAX_NPMCS];
 static struct pmc_descr rapl_pmcdesc[RAPL_MAX_NPMCS];
 static int rapl_npmcs;
-
-/* Base global row index of the RAPL class, cached at initialize() time. */
 static int rapl_ri;
 
-/*
- * Overflow guard: a periodic callout that samples every CPU holding a RAPL
- * PMC so a 32-bit wrap is never missed.  It runs for the PMC's whole life,
- * not just while RUNNING, because hwpmc also allows reads in the ALLOCATED
- * and STOPPED states.  Armed by the first allocation, drained by the last
- * release.
- */
 static struct callout	rapl_guard_callout;
 static sbintime_t	rapl_guard_sbt;
-static int		rapl_nalloc;	/* allocated RAPL PMCs, all CPUs */
+static int		rapl_nalloc;
 static cpuset_t		rapl_cpus;	/* CPUs with an allocated RAPL PMC */
 
-/* Serializes rapl_nalloc/rapl_cpus and guard (re)arming. */
 static struct mtx	rapl_alloc_mtx;
 
 /* Convert energy ticks to microjoules without overflowing uint64_t. */
@@ -106,10 +86,7 @@ rapl_raw_to_uj(uint64_t raw, uint32_t shift)
 	return (whole * 1000000ULL + (frac * 1000000ULL) / unit);
 }
 
-/*
- * Fold a fresh 32-bit MSR reading into the row's 64-bit accumulator,
- * recovering at most one wrap.  Caller holds the row's rc_mtx.
- */
+/* Fold a 32-bit MSR reading into the 64-bit accumulator, can recover one wrap. */
 static void
 rapl_update_delta(struct rapl_value *val, uint64_t cur)
 {
@@ -126,7 +103,6 @@ rapl_update_delta(struct rapl_value *val, uint64_t cur)
 	/* Skip sub-ms re-samples; the next sample folds the full interval. */
 	if (now - val->rv_prev_time < SBT_1MS)
 		return;
-	/* Wrap correction recovers only one 32-bit wrap per sample. */
 	if (cur >= val->rv_prev)
 		diff = cur - val->rv_prev;
 	else
@@ -136,10 +112,7 @@ rapl_update_delta(struct rapl_value *val, uint64_t cur)
 	val->rv_prev_time = now;
 }
 
-/*
- * Sample one row's MSR on the current CPU and return the folded accumulator.
- * The read path is bound here by hwpmc; the guard arrives via rendezvous.
- */
+/* Sample one row's MSR on the current CPU and return the folded accumulator. */
 static uint64_t
 rapl_sample_row(int cpu, int ri)
 {
@@ -178,7 +151,7 @@ rapl_guard_schedule(void)
 	    rapl_guard_sbt / 10, rapl_guard_tick, NULL, 0);
 }
 
-/* Periodic overflow guard; runs in the softclock thread. */
+/* Periodic overflow guard. */
 static void
 rapl_guard_tick(void *arg __unused)
 {
@@ -215,12 +188,7 @@ rapl_allocate_pmc(int cpu, int ri, struct pmc *pm __unused,
 	if (a->pm_mode != PMC_MODE_SC)
 		return (EINVAL);
 
-	/*
-	 * Energy counters are a power side channel (PLATYPUS, CVE-2020-8694 /
-	 * CVE-2020-12912).  Require PRIV_PMC_SYSTEM here unconditionally: the
-	 * core check honors security.bsd.unprivileged_syspmcs=1, and energy
-	 * telemetry must not.
-	 */
+	/* Power side channel (PLATYPUS): require privilege even if syspmcs bypass is set. */
 	if (priv_check(curthread, PRIV_PMC_SYSTEM) != 0)
 		return (EPERM);
 
@@ -228,7 +196,7 @@ rapl_allocate_pmc(int cpu, int ri, struct pmc *pm __unused,
 	if (a->pm_ev != rapl_events[ri].re_ev)
 		return (EINVAL);
 
-	/* Run the overflow guard across the PMC's whole lifetime. */
+	/* Arm the guard on the first allocation (per-CPU and global). */
 	mtx_lock(&rapl_alloc_mtx);
 	if (rapl_pcpu[cpu]->rc_nalloc++ == 0)
 		CPU_SET(cpu, &rapl_cpus);
@@ -354,10 +322,7 @@ rapl_pcpu_fini(struct pmc_mdep *md __unused, int cpu)
 	    ("[rapl,%d] %d PMCs still allocated on cpu %d", __LINE__,
 	    rapl_pcpu[cpu]->rc_nalloc, cpu));
 
-	/*
-	 * Every PMC was released before teardown, so the last release already
-	 * drained the guard: no handler can touch this state.
-	 */
+	/* Last release already drained the guard, so no handler can race here. */
 	mtx_destroy(&rapl_pcpu[cpu]->rc_mtx);
 	free(rapl_pcpu[cpu], M_PMC);
 	rapl_pcpu[cpu] = NULL;
@@ -388,12 +353,7 @@ rapl_read_pmc(int cpu, int ri, struct pmc *pm, pmc_value_t *v)
 
 	PMCDBG1(MDP,REA,1, "rapl-read id=%d", ri);
 
-	/*
-	 * hwpmc bound this thread to cpu == PMC_TO_CPU(pm) in a critical
-	 * section, so rdmsr reads the domain the consumer asked for.  SMT
-	 * siblings and same-package CPUs alias one counter; userland binds
-	 * one PMC per domain (see PMC_CAP_DOMWIDE).
-	 */
+	/* Bound to cpu by hwpmc, so rdmsr reads this CPU's domain (see DOMWIDE). */
 	*v = rapl_raw_to_uj(rapl_sample_row(cpu, ri), rapl_events[ri].re_unit);
 
 	return (0);
@@ -423,10 +383,7 @@ rapl_release_pmc(int cpu, int ri, struct pmc *pmc __unused)
 	last = (--rapl_nalloc == 0);
 	mtx_unlock(&rapl_alloc_mtx);
 
-	/*
-	 * Last release: drain the guard (sleepable here).  Afterward no
-	 * handler is in flight, and none rearms until the next allocation.
-	 */
+	/* Last release: drain the guard (sleepable here, mutex already dropped). */
 	if (last)
 		callout_drain(&rapl_guard_callout);
 
@@ -499,11 +456,7 @@ rapl_add_event(enum pmc_event ev, uint32_t msr, uint32_t unit,
 	rapl_npmcs++;
 }
 
-/*
- * Guard interval for a given energy unit.  The counter wraps after 2^32-1
- * ticks, which at RAPL_GUARD_WATT is max_energy_uj/(P*1e6) seconds.  Sample
- * at half that so a double wrap cannot pass unseen.
- */
+/* Guard interval: half the worst-case wrap period at RAPL_GUARD_WATT. */
 static sbintime_t
 rapl_compute_guard_sbt(uint32_t shift)
 {
@@ -518,10 +471,7 @@ rapl_compute_guard_sbt(uint32_t shift)
 	return (guard_ms * SBT_1MS);
 }
 
-/*
- * Intel server CPUs use a fixed 2^-16 J DRAM energy unit, ignoring the
- * package ESU (Linux RAPL_UNIT_QUIRK_INTEL_HSW/_SPR).
- */
+/* Intel server DRAM uses a fixed 2^-16 J unit, not the package ESU. */
 static bool
 rapl_intel_fixed_dram_unit(void)
 {
@@ -579,7 +529,7 @@ pmc_rapl_initialize(struct pmc_mdep *md, int maxcpu, int classindex)
 		return (ENXIO);
 	}
 
-	/* Decode the energy unit once; bail if the unit MSR is absent. */
+	/* Decode the energy unit. */
 	if (rdmsr_safe(unit_msr, &unit_val) != 0)
 		return (ENXIO);
 	esu = (unit_val >> 8) & 0x1f;
@@ -595,7 +545,7 @@ pmc_rapl_initialize(struct pmc_mdep *md, int maxcpu, int classindex)
 		rapl_add_event(PMC_EV_RAPL_ENERGY_DRAM, dram_msr, dram_unit,
 		    "RAPL_ENERGY_DRAM");
 
-	/* No RAPL energy MSR responded: let the caller skip the class. */
+	/* No RAPL energy MSR responded. */
 	if (rapl_npmcs == 0)
 		return (ENXIO);
 
@@ -608,7 +558,7 @@ pmc_rapl_initialize(struct pmc_mdep *md, int maxcpu, int classindex)
 	CPU_ZERO(&rapl_cpus);
 
 	mtx_init(&rapl_alloc_mtx, "rapl-alloc", NULL, MTX_DEF);
-	/* MPSAFE callout with no associated mutex; the handler locks itself. */
+	/* It does not need associated mutex, the handler locks itself. */
 	callout_init(&rapl_guard_callout, 1);
 
 	rapl_pcpu = malloc(sizeof(struct rapl_cpu *) * maxcpu, M_PMC,
@@ -645,7 +595,6 @@ pmc_rapl_finalize(struct pmc_mdep *md __unused)
 {
 	PMCDBG0(MDP, INI, 1, "rapl-finalize");
 
-	/* initialize() may have skipped the class (no RAPL MSRs). */
 	if (rapl_pcpu == NULL)
 		return;
 
