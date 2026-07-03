@@ -471,7 +471,7 @@ rapl_compute_guard_sbt(uint32_t shift)
 	return (guard_ms * SBT_1MS);
 }
 
-/* Intel server DRAM uses a fixed 2^-16 J unit, not the package ESU. */
+/* Fixed 2^-16 J DRAM unit, not the ESU (HSX/KNL only -- not SPR/EMR/GNR). */
 static bool
 rapl_intel_fixed_dram_unit(void)
 {
@@ -487,10 +487,6 @@ rapl_intel_fixed_dram_unit(void)
 	case 0x6a:	/* Ice Lake-SP */
 	case 0x6c:	/* Ice Lake-D */
 	case 0x85:	/* Xeon Phi KNM */
-	case 0x8f:	/* Sapphire Rapids */
-	case 0xad:	/* Granite Rapids */
-	case 0xae:	/* Granite Rapids-D */
-	case 0xcf:	/* Emerald Rapids */
 		return (true);
 	default:
 		return (false);
