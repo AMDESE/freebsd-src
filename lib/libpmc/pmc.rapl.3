@@ -66,8 +66,8 @@ processors that implement the DRAM domain, typically server parts.
 .Ss Counter Scope
 RAPL counters measure package or core power domains, not individual
 CPUs: every CPU of a domain reads the same underlying counter.
-Consumers should bind one PMC per domain of interest and must not sum
-readings taken from CPUs sharing a domain.
+Consumers should bind one PMC per domain and must not sum readings
+from CPUs that share a domain.
 .Pp
 The class advertises the
 .Li PMC_CAP_DOMWIDE
@@ -85,7 +85,7 @@ NPS2/NPS4 or
 Sub-NUMA Clustering),
 .Xr pmcstat 8
 allocates one counter per domain, so package-scoped counters within
-one package alias each other: each reading is individually correct
+one package alias each other: each reading is correct on its own,
 but they must not be summed.
 .It
 With a single NUMA domain spanning several packages (for example
