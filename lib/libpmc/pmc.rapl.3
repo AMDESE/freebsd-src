@@ -2,7 +2,7 @@
 .\"
 .\" Copyright (c) 2026 Advanced Micro Devices, Inc.
 .\"
-.Dd July 2, 2026
+.Dd July 6, 2026
 .Dt PMC.RAPL 3
 .Os
 .Sh NAME
@@ -23,10 +23,9 @@ The
 class exposes these registers as read-only 64-bit counters that may
 only be allocated in system-wide counting mode
 .Pq Li PMC_MODE_SC .
-Counter values are cumulative energy in microjoules; the hardware
-energy unit, including the fixed DRAM unit used by
-.Tn Intel
-server processors, is applied in the kernel.
+Counter values are cumulative energy in microjoules.
+The kernel scales the raw hardware counts by the hardware energy unit,
+so no further conversion is required.
 .Pp
 A counter's accumulator is not reset when a PMC is allocated or
 released; it reflects energy consumed since the counters began
