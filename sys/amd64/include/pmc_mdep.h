@@ -70,6 +70,7 @@ struct pmc_mdep;
  * IAF		Intel fixed-function PMCs in Core2 and later CPUs.
  * UCP		Intel Uncore programmable PMCs.
  * UCF		Intel Uncore fixed-function PMCs.
+ * RAPL		AMD/Intel energy counters.
  */
 
 union pmc_md_op_pmcallocate  {

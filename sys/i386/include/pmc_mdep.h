@@ -47,6 +47,7 @@ struct pmc_mdep;
  * IAF		Intel fixed-function PMCs.
  * UCP		Intel Uncore programmable PMCs.
  * UCF		Intel Uncore fixed-function PMCs.
+ * RAPL		AMD/Intel energy counters.
  */
 
 #include <dev/hwpmc/hwpmc_amd.h>
