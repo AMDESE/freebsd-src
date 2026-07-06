@@ -36,9 +36,9 @@ An individual reading is therefore meaningful only as a difference
 between two samples.
 .Pp
 The hardware counters are 32 bits wide and wrap frequently under load.
-The kernel folds them into 64-bit accumulators and samples every
-counter periodically while at least one RAPL PMC is allocated, so the
-exported values stay monotonic across counter wrap-around.
+The RAPL PMC class instead provides virtual 64-bit counters that are
+guaranteed to be monotonic, by periodically sampling the hardware
+counters while at least one RAPL PMC is allocated.
 .Pp
 RAPL events do not support further event qualifiers.
 .Ss Event Specifiers
