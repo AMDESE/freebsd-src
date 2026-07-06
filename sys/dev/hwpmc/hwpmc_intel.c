@@ -78,6 +78,7 @@ pmc_intel_initialize(void)
 	struct pmc_mdep *pmc_mdep;
 	enum pmc_cputype cputype;
 	int error, family, model, nclasses, ncpus, stepping, verov;
+	bool rapl_present;
 
 	KASSERT(cpu_vendor_id == CPU_VENDOR_INTEL,
 	    ("[intel,%d] Initializing non-intel processor", __LINE__));
@@ -280,8 +281,10 @@ pmc_intel_initialize(void)
 		return (NULL);
 	}
 
-	/* Reserve one extra class slot for the optional RAPL counters. */
-	nclasses++;
+	/* The RAPL energy counters, when present, add one more class. */
+	rapl_present = pmc_rapl_present();
+	if (rapl_present)
+		nclasses++;
 
 	/* Allocate base class and initialize machine dependent struct */
 	pmc_mdep = pmc_mdep_alloc(nclasses);
@@ -338,7 +341,8 @@ pmc_intel_initialize(void)
 		break;
 	}
 
-	if (error == 0 &&
+	/* Drop the RAPL slot if initialization fails despite the probe. */
+	if (error == 0 && rapl_present &&
 	    pmc_rapl_initialize(pmc_mdep, ncpus, pmc_mdep->pmd_nclass - 1) != 0)
 		pmc_mdep->pmd_nclass--;
   error:

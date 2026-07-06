@@ -891,6 +891,7 @@ pmc_amd_initialize(void)
 	enum pmc_cputype cputype;
 	int error, i, ncpus, nclasses;
 	int family, model, stepping;
+	bool rapl_present;
 	struct amd_descr *d;
 
 	/*
@@ -1011,16 +1012,18 @@ pmc_amd_initialize(void)
 	amd_pcpu = malloc(sizeof(struct amd_cpu *) * pmc_cpu_max(), M_PMC,
 	    M_WAITOK | M_ZERO);
 
+	rapl_present = pmc_rapl_present();
+
 	/*
 	 * These processors have two or three classes of PMCs: the TSC,
-	 * programmable PMCs, and AMD IBS.  One extra class slot is reserved
-	 * for the optional RAPL energy counters.
+	 * programmable PMCs, and AMD IBS.  The RAPL energy counters, when
+	 * present, add one more class.
 	 */
-	if ((amd_feature2 & AMDID2_IBS) != 0) {
-		nclasses = 4;
-	} else {
-		nclasses = 3;
-	}
+	nclasses = 2;
+	if ((amd_feature2 & AMDID2_IBS) != 0)
+		nclasses++;
+	if (rapl_present)
+		nclasses++;
 
 	pmc_mdep = pmc_mdep_alloc(nclasses);
 
@@ -1071,9 +1074,9 @@ pmc_amd_initialize(void)
 			goto error;
 	}
 
-	/* RAPL takes the reserved last slot; drop it if the probe fails. */
-	error = pmc_rapl_initialize(pmc_mdep, ncpus, pmc_mdep->pmd_nclass - 1);
-	if (error != 0)
+	/* Drop the RAPL slot if initialization fails despite the probe. */
+	if (rapl_present &&
+	    pmc_rapl_initialize(pmc_mdep, ncpus, pmc_mdep->pmd_nclass - 1) != 0)
 		pmc_mdep->pmd_nclass--;
 
 	return (pmc_mdep);

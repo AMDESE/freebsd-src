@@ -19,6 +19,7 @@ struct pmc_mdep;
  */
 #define	RAPL_MAX_NPMCS	3
 
+bool	pmc_rapl_present(void);
 int	pmc_rapl_initialize(struct pmc_mdep *_md, int _maxcpu, int _classindex);
 void	pmc_rapl_finalize(struct pmc_mdep *_md);
 

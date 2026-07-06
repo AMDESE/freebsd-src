@@ -493,6 +493,29 @@ rapl_intel_fixed_dram_unit(void)
 	}
 }
 
+/* Probe for RAPL so the MD code can size the class table before init. */
+bool
+pmc_rapl_present(void)
+{
+	uint64_t val;
+	uint32_t unit_msr;
+
+	switch (cpu_vendor_id) {
+	case CPU_VENDOR_AMD:
+	case CPU_VENDOR_HYGON:
+		if ((amd_pminfo & AMDPM_RAPL) == 0)
+			return (false);
+		unit_msr = MSR_AMD_RAPL_POWER_UNIT;
+		break;
+	case CPU_VENDOR_INTEL:
+		unit_msr = MSR_RAPL_POWER_UNIT;
+		break;
+	default:
+		return (false);
+	}
+	return (rdmsr_safe(unit_msr, &val) == 0);
+}
+
 int
 pmc_rapl_initialize(struct pmc_mdep *md, int maxcpu, int classindex)
 {
