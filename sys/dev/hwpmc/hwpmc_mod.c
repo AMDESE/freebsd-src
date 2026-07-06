@@ -247,8 +247,11 @@ static void	pmc_log_process_mappings(struct pmc_owner *po, struct proc *p);
 static void	pmc_maybe_remove_owner(struct pmc_owner *po);
 static void	pmc_post_callchain_callback(void);
 static void	pmc_process_allproc(struct pmc *pm);
+static void	pmc_process_csw_start_all(int cpu);
+static void	pmc_process_csw_stop_all(int cpu);
 static void	pmc_process_csw_in(struct thread *td);
 static void	pmc_process_csw_out(struct thread *td);
+static void	pmc_process_csw_out_prepare(int cpu);
 static void	pmc_process_exec(struct thread *td,
     struct pmckern_procexec *pk);
 static void	pmc_process_exit(void *arg, struct proc *p);
@@ -1473,6 +1476,73 @@ pmc_process_exec(struct thread *td, struct pmckern_procexec *pk)
 }
 
 /*
+ * call optional per-class context-switch batch ops.
+ * classes without shared hw gate leave these callbacks NULL.
+ */
+static void
+pmc_process_csw_start_all(int cpu)
+{
+	struct pmc_classdep *pcd;
+	u_int class;
+
+	for (class = 0; class < md->pmd_nclass; class++) {
+		pcd = &md->pmd_classdep[class];
+		if (pcd->pcd_start_all != NULL)
+			(void)pcd->pcd_start_all(cpu);
+	}
+}
+
+static void
+pmc_process_csw_stop_all(int cpu)
+{
+	struct pmc_classdep *pcd;
+	u_int class;
+	bool found;
+
+	found = false;
+	for (class = 0; class < md->pmd_nclass; class++) {
+		if (md->pmd_classdep[class].pcd_stop_all != NULL) {
+			found = true;
+			break;
+		}
+	}
+	if (!found)
+		return;
+
+	pmc_process_csw_out_prepare(cpu);
+
+	for (class = 0; class < md->pmd_nclass; class++) {
+		pcd = &md->pmd_classdep[class];
+		if (pcd->pcd_stop_all != NULL)
+			(void)pcd->pcd_stop_all(cpu);
+	}
+}
+
+/*
+ * mark every configured virtual PMC undesired before stop-all closes
+ * shared gate. separate pass keeps stalled-PMC restart order for batch.
+ */
+static void
+pmc_process_csw_out_prepare(int cpu)
+{
+	struct pmc *pm;
+	struct pmc_classdep *pcd;
+	int adjri;
+	u_int ri;
+
+	for (ri = 0; ri < md->pmd_npmc; ri++) {
+		pcd = pmc_ri_to_classdep(md, ri, &adjri);
+		if (pcd->pcd_stop_all == NULL)
+			continue;
+		pm = NULL;
+		(void)pcd->pcd_get_config(cpu, adjri, &pm);
+		if (pm == NULL || !PMC_IS_VIRTUAL_MODE(PMC_TO_MODE(pm)))
+			continue;
+		pm->pm_pcpu_state[cpu].pps_cpustate = 0;
+	}
+}
+
+/*
  * Thread context switch IN.
  */
 static void
@@ -1627,6 +1697,9 @@ pmc_process_csw_in(struct thread *td)
 	 */
 	(void)(*md->pmd_switch_in)(pc, pp);
 
+	/* commit all class PMC start updates at one boundary */
+	pmc_process_csw_start_all(cpu);
+
 	critical_exit();
 }
 
@@ -1748,6 +1821,9 @@ pmc_process_csw_out(struct thread *td)
 
 	pc = pmc_pcpu[cpu];
 
+	/* close shared class gates before any PMC stop/read */
+	pmc_process_csw_stop_all(cpu);
+
 	/*
 	 * When a PMC gets unlinked from a target PMC, it will
 	 * be removed from the target's pp_pmc[] array.
@@ -1774,12 +1850,7 @@ pmc_process_csw_out(struct thread *td)
 		    ("[pmc,%d] ri mismatch pmc(%d) ri(%d)",
 			__LINE__, PMC_TO_ROWINDEX(pm), ri));
 
-		/*
-		 * Change desired state, and then stop if not stalled.
-		 * This two-step dance should avoid race conditions where
-		 * an interrupt re-enables the PMC after this code has
-		 * already checked the pm_stalled flag.
-		 */
+		/* batch-capable classes did this before gate close */
 		pm->pm_pcpu_state[cpu].pps_cpustate = 0;
 		if (pm->pm_pcpu_state[cpu].pps_stalled == 0)
 			(void)pcd->pcd_stop_pmc(cpu, adjri, pm);
@@ -5278,6 +5349,9 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 
 	PMCDBG2(PRC,EXT,2, "process-exit proc=%p pmc-process=%p", p, pp);
 
+	/* pseudo context switch out; close shared class gates too */
+	pmc_process_csw_stop_all(cpu);
+
 	/*
 	 * The exiting process could be the target of some PMCs which will be
 	 * running on currently executing CPU.
@@ -5313,13 +5387,8 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 		    ("[pmc,%d] bad runcount ri %d rc %ju", __LINE__, ri,
 		    (uintmax_t)counter_u64_fetch(pm->pm_runcount)));
 
-		/*
-		 * Change desired state, and then stop if not stalled. This
-		 * two-step dance should avoid race conditions where an
-		 * interrupt re-enables the PMC after this code has already
-		 * checked the pm_stalled flag.
-		 */
-		if (pm->pm_pcpu_state[cpu].pps_cpustate) {
+		if (pcd->pcd_stop_all != NULL ||
+		    pm->pm_pcpu_state[cpu].pps_cpustate) {
 			pm->pm_pcpu_state[cpu].pps_cpustate = 0;
 			if (!pm->pm_pcpu_state[cpu].pps_stalled) {
 				(void)pcd->pcd_stop_pmc(cpu, adjri, pm);
