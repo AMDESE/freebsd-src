@@ -242,11 +242,7 @@ amd_config_mask(enum sub_class subclass, uint64_t caps)
 	}
 }
 
-/*
- * PerfMonV2 global enable/disable. A single write to GLOBAL_CTL starts or
- * stops all core counters at once (mirrors Linux amd_pmu_core_enable_all /
- * amd_pmu_core_disable_all). amd_global_cntr_mask is computed at init.
- */
+/* PerfMonV2: write GLOBAL_CTL to start or stop all core counters at once. */
 static __inline void
 amd_v2_enable_all(void)
 {
@@ -558,16 +554,7 @@ amd_start_pmc(int cpu __diagused, int ri, struct pmc *pm)
 	return (0);
 }
 
-/*
- * Start a PMC (PerfMonV2 core path).
- *
- * On PerfMonV2 a core counter increments only when BOTH its per-counter EVSEL
- * ENABLE bit AND its bit in GLOBAL_CTL are set.  We therefore arm this counter
- * by writing its EVSEL with the ENABLE bit set (the per-counter discriminator)
- * and assert the full counter mask in GLOBAL_CTL (the global freeze/thaw the
- * interrupt handler toggles).  Counters whose EVSEL ENABLE bit is clear stay
- * quiescent even with their GLOBAL_CTL bit set.
- */
+/* Start a PMC (PerfMonV2 path): arm EVSEL, then assert the global counter mask. */
 static int
 amd_start_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
 {
@@ -637,14 +624,7 @@ amd_stop_pmc(int cpu __diagused, int ri, struct pmc *pm)
 	return (0);
 }
 
-/*
- * Stop a PMC (PerfMonV2 core path).
- *
- * Clearing the counter's EVSEL removes its event programming; GLOBAL_CTL is
- * left asserting the mask so other active counters keep running.  There is no
- * OVERFLOW_WAIT_COUNT busy-wait here: the GLOBAL_STATUS read in amd_intr_v2 is
- * authoritative for overflow, so the classic NMI-latency poll is unnecessary.
- */
+/* Stop a PMC (PerfMonV2 path): clear EVSEL ENABLE only; GLOBAL_STATUS tells the handler about overflow. */
 static int
 amd_stop_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
 {
@@ -775,14 +755,7 @@ done:
 	return (retval);
 }
 
-/*
- * Interrupt handler (PerfMonV2 core path).
- *
- * Reads GLOBAL_STATUS once instead of polling every counter.  Core counters are
- * frozen via GLOBAL_CTL for the duration so the status snapshot and reloads are
- * race-free, mirroring Linux amd_pmu_v2_handle_irq.  The IBS early-out and the
- * NMI-latency nmi_counter accounting are FreeBSD-specific and preserved.
- */
+/* Interrupt handler (PerfMonV2 path): freeze counters, read GLOBAL_STATUS once, reload, thaw. */
 static int
 amd_intr_v2(struct trapframe *tf)
 {
@@ -840,37 +813,20 @@ amd_intr_v2(struct trapframe *tf)
 		wrmsr(amd_pmcdesc[i].pm_perfctr,
 		    AMD_RELOAD_COUNT_TO_PERFCTR_VALUE(v));
 
-		/*
-		 * On logging failure (sample buffer full) leave this counter
-		 * disarmed for back-pressure: clearing its EVSEL ENABLE bit
-		 * keeps it quiescent through the AND gate even though
-		 * amd_v2_enable_all() re-asserts its GLOBAL_CTL bit below.  The
-		 * MI layer restarts it via pcd_start_pmc.  Mirrors the classic
-		 * amd_intr and the Intel global-control handler.
-		 */
+		/* On log failure, leave the counter disarmed for back-pressure; MI restarts via pcd_start_pmc. */
 		error = pmc_process_interrupt(PMC_HR, pm, tf);
 		if (error != 0)
 			wrmsr(amd_pmcdesc[i].pm_evsel,
 			    pm->pm_md.pm_amd.pm_amd_evsel & ~AMD_PMC_ENABLE);
 	}
 
-	/*
-	 * Acknowledge the serviced overflow bits.  Writing 1s to
-	 * GLOBAL_STATUS_CLR clears the matching GLOBAL_STATUS bits.  status is
-	 * already masked to amd_global_cntr_mask, so only core-counter overflow
-	 * bits are cleared; the freeze state is released by the GLOBAL_CTL
-	 * re-assert in amd_v2_enable_all() below.
-	 */
+	/* Ack overflow bits; status was already masked to core counters only. */
 	wrmsr(AMD_PMC_GLOBAL_STATUS_CLR, status);
 
 	/* Resume core counters. */
 	amd_v2_enable_all();
 
-	/*
-	 * NMI-latency accounting (FreeBSD-specific): a serviced overflow in an
-	 * earlier NMI can leave a later NMI with nothing to find.  Track a
-	 * per-cpu count and absorb those stray NMIs.
-	 */
+	/* NMI latency: an earlier NMI may have already handled the overflow; absorb the stray. */
 	if (retval) {
 		DPCPU_SET(nmi_counter, min(2, active));
 	} else {
@@ -1196,11 +1152,7 @@ pmc_amd_initialize(void)
 			amd_core_npmcs = EXTPERFMON_CORE_PMCS(regs[1]);
 			amd_df_npmcs = EXTPERFMON_DF_PMCS(regs[1]);
 		}
-		/*
-		 * EAX bit 0 is the PerfMonV2 feature flag (regs[0]).  V2 is
-		 * Family 19h (Zen3+) and 1Ah; the family guard rejects a
-		 * spurious feature bit on older or virtualized CPUs.
-		 */
+		/* EAX bit 0 is the PerfMonV2 flag; the family check blocks it on older or virtual CPUs. */
 		if (EXTPERFMON_PERFMONV2(regs[0]) && family >= 0x19)
 			amd_perfmon_v2 = true;
 	}
@@ -1329,17 +1281,7 @@ pmc_amd_initialize(void)
 	pmc_mdep->pmd_switch_in	= amd_switch_in;
 	pmc_mdep->pmd_switch_out = amd_switch_out;
 
-	/*
-	 * On PerfMonV2 silicon, override the classic per-counter start/stop and
-	 * the MSR-polling interrupt handler with the global-control variants.
-	 * L3/DF stay on the classic path (the global MSRs are core-only).
-	 *
-	 * Enable model: a core counter increments only when BOTH its EVSEL
-	 * ENABLE bit AND its GLOBAL_CTL bit are set.  The per-counter EVSEL
-	 * ENABLE bit is the per-counter discriminator (set by amd_start_pmc_v2,
-	 * cleared by amd_stop_pmc_v2); GLOBAL_CTL is the global freeze/thaw the
-	 * interrupt handler toggles around overflow servicing.
-	 */
+	/* PerfMonV2: override start/stop/intr with global-control variants; L3 and DF keep the classic path. */
 	if (amd_perfmon_v2) {
 		pcd->pcd_start_pmc = amd_start_pmc_v2;
 		pcd->pcd_stop_pmc  = amd_stop_pmc_v2;
