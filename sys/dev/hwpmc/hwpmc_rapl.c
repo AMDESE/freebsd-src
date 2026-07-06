@@ -74,6 +74,8 @@ static cpuset_t		rapl_cpus;	/* CPUs with an allocated RAPL PMC */
 
 static struct mtx	rapl_alloc_mtx;
 
+static void	rapl_guard_tick(void *arg);
+
 /* Convert energy ticks to microjoules without overflowing uint64_t. */
 static uint64_t
 rapl_raw_to_uj(uint64_t raw, uint32_t shift)
@@ -140,8 +142,6 @@ rapl_guard_handler(void *arg __unused)
 	for (ri = 0; ri < rapl_npmcs; ri++)
 		(void)rapl_sample_row(cpu, ri);
 }
-
-static void	rapl_guard_tick(void *arg);
 
 /* (Re)arm the guard callout. Caller holds rapl_alloc_mtx. */
 static void
