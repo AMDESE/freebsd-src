@@ -39,6 +39,7 @@
 #include <sys/pcpu.h>
 #include <sys/pmc.h>
 #include <sys/pmckern.h>
+#include <sys/pmclog.h>
 #include <sys/smp.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
