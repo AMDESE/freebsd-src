@@ -50,6 +50,10 @@
 
 #define	OVERFLOW_WAIT_COUNT	50
 
+/* The multipart carrier must hold a full LBR ring snapshot. */
+CTASSERT(2 * AMD_LBR_MAX_DEPTH <=
+    nitems(((struct pmc_multipart *)0)->pl_mpdata));
+
 DPCPU_DEFINE_STATIC(uint32_t, nmi_counter);
 
 /* AMD K8 PMCs */
@@ -828,7 +832,7 @@ amd_intr_v2(struct trapframe *tf)
 	pmc_value_t v;
 	uint64_t from, status, mask, to;
 	uint32_t active = 0, count = 0;
-	int i, error, retval, cpu;
+	int i, error, n, retval, cpu;
 
 	cpu = curcpu;
 	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
@@ -851,20 +855,30 @@ amd_intr_v2(struct trapframe *tf)
 	status = rdmsr(AMD_PMC_GLOBAL_STATUS);
 	status &= amd_global_cntr_mask;
 
-	/* Snapshot the branch ring (frozen since overflow) before reloading. */
+	/* Snapshot the branch ring only when an LBR row overflowed. */
 	mpd.pl_length = 0;
-	if (pac->pc_lbr_mask != 0) {
-		mpd.pl_type = PMC_CC_MULTIPART_LBR;
-		for (i = 0; i < amd_lbr_depth; i++) {
+	if ((status & pac->pc_lbr_mask) != 0) {
+		/* No freeze feature: the ring is live, stop it while reading. */
+		if (!amd_lbr_freeze)
+			wrmsr(AMD_MSR_DBG_EXTN_CFG,
+			    rdmsr(AMD_MSR_DBG_EXTN_CFG) &
+			    ~AMD_DBG_EXTN_CFG_LBRV2EN);
+		for (i = 0, n = 0; i < amd_lbr_depth; i++) {
 			from = rdmsr(AMD_MSR_SAMP_BR_FROM + 2 * i);
 			to = rdmsr(AMD_MSR_SAMP_BR_FROM + 2 * i + 1);
 			/* Skip invalid records and erratum-1452 hits. */
 			if ((to & (AMD_LBR_TO_VALID | AMD_LBR_TO_SPEC)) == 0 ||
 			    (to & AMD_LBR_TO_RESERVED) != 0)
 				continue;
-			mpd.pl_mpdata[mpd.pl_length++] = from;
-			mpd.pl_mpdata[mpd.pl_length++] = to;
+			mpd.pl_mpdata[n++] = from;
+			mpd.pl_mpdata[n++] = to;
 		}
+		mpd.pl_type = PMC_CC_MULTIPART_LBR;
+		mpd.pl_length = n;
+		if (!amd_lbr_freeze)
+			wrmsr(AMD_MSR_DBG_EXTN_CFG,
+			    rdmsr(AMD_MSR_DBG_EXTN_CFG) |
+			    AMD_DBG_EXTN_CFG_LBRV2EN);
 	}
 
 	for (i = 0; i < amd_npmcs; i++) {
@@ -1090,10 +1104,14 @@ amd_pcpu_fini(struct pmc_mdep *md, int cpu)
 	}
 #endif
 
-	/* Module-unload hygiene: force the LBR ring off. */
-	if (amd_lbr_depth > 0)
+	/* Module-unload hygiene: force the LBR ring and freeze bit off. */
+	if (amd_lbr_depth > 0) {
 		wrmsr(AMD_MSR_DBG_EXTN_CFG,
 		    rdmsr(AMD_MSR_DBG_EXTN_CFG) & ~AMD_DBG_EXTN_CFG_LBRV2EN);
+		if (amd_lbr_freeze)
+			wrmsr(MSR_DEBUGCTLMSR, rdmsr(MSR_DEBUGCTLMSR) &
+			    ~AMD_DEBUGCTL_FREEZE_LBRS_ON_PMI);
+	}
 
 	pc = pmc_pcpu[cpu];
 	KASSERT(pc != NULL, ("[amd,%d] NULL per-cpu state", __LINE__));
