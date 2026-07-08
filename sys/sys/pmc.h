@@ -986,7 +986,7 @@ struct pmc_samplebuffer {
 struct pmc_multipart {
 	char			pl_type;
 	char			pl_length;
-	uint64_t		pl_mpdata[10];
+	uint64_t		pl_mpdata[32];	/* fits 16 LBR From/To pairs */
 };
 
 /*

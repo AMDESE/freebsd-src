@@ -824,8 +824,9 @@ amd_intr_v2(struct trapframe *tf)
 {
 	struct amd_cpu *pac;
 	struct pmc *pm;
+	struct pmc_multipart mpd;
 	pmc_value_t v;
-	uint64_t status, mask;
+	uint64_t from, status, mask, to;
 	uint32_t active = 0, count = 0;
 	int i, error, retval, cpu;
 
@@ -849,6 +850,22 @@ amd_intr_v2(struct trapframe *tf)
 	/* Single read of the overflow bitmap; drop reserved bits. */
 	status = rdmsr(AMD_PMC_GLOBAL_STATUS);
 	status &= amd_global_cntr_mask;
+
+	/* Snapshot the branch ring (frozen since overflow) before reloading. */
+	mpd.pl_length = 0;
+	if (pac->pc_lbr_mask != 0) {
+		mpd.pl_type = PMC_CC_MULTIPART_LBR;
+		for (i = 0; i < amd_lbr_depth; i++) {
+			from = rdmsr(AMD_MSR_SAMP_BR_FROM + 2 * i);
+			to = rdmsr(AMD_MSR_SAMP_BR_FROM + 2 * i + 1);
+			/* Skip invalid records and erratum-1452 hits. */
+			if ((to & (AMD_LBR_TO_VALID | AMD_LBR_TO_SPEC)) == 0 ||
+			    (to & AMD_LBR_TO_RESERVED) != 0)
+				continue;
+			mpd.pl_mpdata[mpd.pl_length++] = from;
+			mpd.pl_mpdata[mpd.pl_length++] = to;
+		}
+	}
 
 	for (i = 0; i < amd_npmcs; i++) {
 		if (amd_pmcdesc[i].pm_subclass != PMC_AMD_SUB_CLASS_CORE)
@@ -877,13 +894,18 @@ amd_intr_v2(struct trapframe *tf)
 		    AMD_RELOAD_COUNT_TO_PERFCTR_VALUE(v));
 
 		/* On log failure, leave the counter disarmed for back-pressure; MI restarts via pcd_start_pmc. */
-		error = pmc_process_interrupt(PMC_HR, pm, tf);
+		if ((pm->pm_caps & PMC_CAP_LBR) != 0 && mpd.pl_length > 0)
+			error = pmc_process_interrupt_mp(PMC_HR, pm, tf, &mpd);
+		else
+			error = pmc_process_interrupt(PMC_HR, pm, tf);
 		if (error != 0)
 			wrmsr(amd_pmcdesc[i].pm_evsel,
 			    pm->pm_md.pm_amd.pm_amd_evsel & ~AMD_PMC_ENABLE);
 	}
 
-	/* Ack overflow bits; status was already masked to core counters only. */
+	/* Ack overflow bits; clearing LBRS_FROZEN also re-arms the branch ring. */
+	if (amd_lbr_depth > 0)
+		status |= AMD_PMC_GLOBAL_STATUS_LBRS_FROZEN;
 	wrmsr(AMD_PMC_GLOBAL_STATUS_CLR, status);
 
 	/* Resume core counters. */

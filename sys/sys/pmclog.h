@@ -138,6 +138,13 @@ struct pmclog_callchain {
 #define	PMC_CC_MULTIPART_CALLCHAIN	1
 #define	PMC_CC_MULTIPART_IBS_FETCH	2
 #define	PMC_CC_MULTIPART_IBS_OP		3
+/*
+ * PMC_CC_MULTIPART_LBR payload: N valid branch records, top-of-stack first,
+ * two words each: the raw From then To MSR image (AMD LbrExtV2).  The IP is
+ * bits [57:0], sign-extended from bit 57; From[63] = mispredicted;
+ * To[63] = valid, To[62] = speculative.  Invalid entries are never logged.
+ */
+#define	PMC_CC_MULTIPART_LBR		4
 
 struct pmclog_closelog {
 	PMCLOG_ENTRY_HEADER
