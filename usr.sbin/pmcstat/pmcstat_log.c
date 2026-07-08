@@ -489,6 +489,10 @@ pmcstat_print_multipart(struct pmclog_ev_callchain *cc)
 			break;
 		} else if (type == PMC_CC_MULTIPART_CALLCHAIN) {
 			return (offset);
+		} else if (offset + len > cc->pl_npc) {
+			/* Do not decode past the words the record carries. */
+			PMCSTAT_PRINT_ENTRY("truncated multipart record!");
+			break;
 #if defined(__amd64__) || defined(__i386__)
 		} else if (type == PMC_CC_MULTIPART_IBS_FETCH) {
 			pmcstat_print_ibs_fetch(cc, offset,

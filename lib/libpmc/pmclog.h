@@ -53,6 +53,30 @@ struct pmclog_ev_callchain {
 	uintfptr_t	pl_pc[PMC_CALLCHAIN_DEPTH_MAX];
 };
 
+/*
+ * Index of the first callchain slot of a multipart sample: skips the
+ * (type,len) header word and every part's payload words.
+ */
+static __inline uint32_t
+pmclog_multipart_offset(const uintfptr_t *pc)
+{
+	const uint8_t *hdr = (const uint8_t *)pc;
+	uint32_t offset = PMC_MULTIPART_HEADER_LENGTH / sizeof(uintfptr_t);
+	int i;
+
+	for (i = 0; i < PMC_MULTIPART_HEADER_ENTRIES; i++) {
+		uint8_t type = hdr[2 * i];
+
+		if (type == PMC_CC_MULTIPART_NONE ||
+		    type == PMC_CC_MULTIPART_CALLCHAIN)
+			break;
+
+		offset += hdr[2 * i + 1];
+	}
+
+	return (offset);
+}
+
 struct pmclog_ev_dropnotify {
 };
 

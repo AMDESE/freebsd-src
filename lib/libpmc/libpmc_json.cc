@@ -256,7 +256,7 @@ callchain_to_json(struct pmclog_ev *ev)
 {
 	char eventbuf[1024];
 	string result;
-	uint32_t i;
+	uint32_t i, start;
 	string startent;
 
 	startent = startentry(ev);
@@ -266,12 +266,19 @@ callchain_to_json(struct pmclog_ev *ev)
 		startent.c_str(), ev->pl_u.pl_cc.pl_pmcid, ev->pl_u.pl_cc.pl_pid,
 	    ev->pl_u.pl_cc.pl_tid, ev->pl_u.pl_cc.pl_cpuflags, ev->pl_u.pl_cc.pl_cpuflags2);
 	result = string(eventbuf);
-	for (i = 0; i < ev->pl_u.pl_cc.pl_npc - 1; i++) {
+	/* Only the PCs are addresses; skip a multipart header and payload. */
+	start = 0;
+	if ((ev->pl_u.pl_cc.pl_cpuflags & PMC_CC_F_MULTIPART) != 0)
+		start = pmclog_multipart_offset(ev->pl_u.pl_cc.pl_pc);
+	for (i = start; i + 1 < ev->pl_u.pl_cc.pl_npc; i++) {
 		snprintf(eventbuf, sizeof(eventbuf), "\"0x%016jx\", ", (uintmax_t)ev->pl_u.pl_cc.pl_pc[i]);
 		result += string(eventbuf);
 	}
-	snprintf(eventbuf, sizeof(eventbuf), "\"0x%016jx\"]}\n", (uintmax_t)ev->pl_u.pl_cc.pl_pc[i]);
-	result += string(eventbuf);
+	if (i < ev->pl_u.pl_cc.pl_npc) {
+		snprintf(eventbuf, sizeof(eventbuf), "\"0x%016jx\"]}\n", (uintmax_t)ev->pl_u.pl_cc.pl_pc[i]);
+		result += string(eventbuf);
+	} else
+		result += string("]}\n");
 	return (result);
 }
 

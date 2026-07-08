@@ -17,10 +17,17 @@ CPUs
 .Sh DESCRIPTION
 AMD Zen 4 and newer processors implement LBR v2
 .Pq LbrExtV2 ,
-a per-core ring of the last 16 taken branches recorded as
+a per-core ring of the most recent taken branches recorded as
 From/To address pairs.
-The ring freezes when a core counter overflows, so the records
-describe the branches leading up to each sampling interrupt.
+The ring holds 16 records on current parts; the detected depth is
+reported by the
+.Va kern.hwpmc.amd_lbr_depth
+sysctl.
+On CPUs with the LbrAndPmcFreeze feature the ring freezes when a core
+counter overflows, so the records describe the branches leading up to
+each sampling interrupt; see
+.Sx CAVEATS
+for hardware without it.
 .Pp
 LBR capture is not a PMC class of its own.
 It is requested with the
@@ -53,9 +60,11 @@ bit 62 of the To word flags a speculative record.
 Invalid records are dropped in the kernel and do not appear in the
 payload.
 .Sh CAVEATS
-The branch-type filter register is shared per CPU; when several LBR
-PMCs are scheduled on the same CPU the most recently started one
-determines the filter.
+The branch-type filter register and the ring itself are shared per
+CPU; when several LBR PMCs are scheduled on the same CPU the most
+recently started one determines the filter, and a process-scope PMC
+wipes the ring on every context switch-in, discarding records a
+concurrent system-scope PMC had accumulated there.
 .Pp
 For system-wide PMCs the ring is not cleared on context switches, so
 a sample taken shortly after a switch can include branches from the

@@ -178,29 +178,6 @@ pmcstat_image_unmap(struct pmcstat_process *pp, uintfptr_t start,
 }
 
 /*
- * Return the index of the first callchain slot of a multipart sample.
- */
-static uint32_t
-pmcstat_multipart_offset(struct pmclog_ev_callchain *cc)
-{
-	uint8_t *hdr = (uint8_t *)&cc->pl_pc[0];
-	uint32_t offset = PMC_MULTIPART_HEADER_LENGTH / sizeof(uintptr_t);
-	int i;
-
-	for (i = 0; i < PMC_MULTIPART_HEADER_ENTRIES; i++) {
-		uint8_t type = hdr[2 * i];
-
-		if (type == PMC_CC_MULTIPART_NONE ||
-		    type == PMC_CC_MULTIPART_CALLCHAIN)
-			break;
-
-		offset += hdr[2 * i + 1];
-	}
-
-	return (offset);
-}
-
-/*
  * Convert a hwpmc(4) log to profile information.  A system-wide
  * callgraph is generated if FLAG_DO_CALLGRAPHS is set.  gmon.out
  * files usable by gprof(1) are created if FLAG_DO_GPROF is set.
@@ -308,7 +285,8 @@ pmcstat_analyze_log(struct pmcstat_args *args,
 			/* Skip the header and payload of a multipart sample. */
 			noff = 0;
 			if ((cpuflags & PMC_CC_F_MULTIPART) != 0)
-				noff = pmcstat_multipart_offset(&ev.pl_u.pl_cc);
+				noff = pmclog_multipart_offset(
+				    ev.pl_u.pl_cc.pl_pc);
 			if (noff >= ev.pl_u.pl_cc.pl_npc) {
 				pmcstat_stats->ps_samples_skipped++;
 				break;
