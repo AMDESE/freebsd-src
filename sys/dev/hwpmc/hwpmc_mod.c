@@ -313,6 +313,12 @@ SYSCTL_COUNTER_U64(_kern_hwpmc_stats, OID_AUTO, overwrites, CTLFLAG_RW,
     &pmc_stats.pm_overwrites,
     "# of times a sample was overwritten before being logged");
 
+/* Every sample slot must fit the multipart header, payload and one PC. */
+#define	PMC_CALLCHAIN_DEPTH_MIN						\
+	(int)((PMC_MULTIPART_HEADER_LENGTH +				\
+	    sizeof(((struct pmc_multipart *)0)->pl_mpdata)) /		\
+	    sizeof(uintptr_t) + 1)
+
 static int pmc_callchaindepth = PMC_CALLCHAIN_DEPTH;
 SYSCTL_INT(_kern_hwpmc, OID_AUTO, callchaindepth, CTLFLAG_RDTUN,
     &pmc_callchaindepth, 0,
@@ -4748,6 +4754,8 @@ pmc_add_sample(ring_type_t ring, struct pmc *pm, struct trapframe *tf,
 
 	if (callchaindepth == 1) {
 		ps->ps_pc[ps->ps_nsamples_actual] = PMC_TRAPFRAME_TO_PC(tf);
+		/* Count the multipart words or they are lost at logging. */
+		callchaindepth += ps->ps_nsamples_actual;
 	} else {
 		/*
 		 * Kernel stack traversals can be done immediately, while we
@@ -5584,6 +5592,12 @@ pmc_initialize(void)
 		    "range - using %d.\n", pmc_callchaindepth,
 		    PMC_CALLCHAIN_DEPTH_MAX);
 		pmc_callchaindepth = PMC_CALLCHAIN_DEPTH_MAX;
+	}
+	if (pmc_callchaindepth < PMC_CALLCHAIN_DEPTH_MIN) {
+		printf("hwpmc: tunable \"callchaindepth\"=%d too small for "
+		    "multipart samples - using %d.\n", pmc_callchaindepth,
+		    PMC_CALLCHAIN_DEPTH_MIN);
+		pmc_callchaindepth = PMC_CALLCHAIN_DEPTH_MIN;
 	}
 
 	md = pmc_md_initialize();
