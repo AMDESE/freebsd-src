@@ -295,7 +295,8 @@ enum pmc_disp {
 	__PMC_CAP(TAGGING,	10, "tag upstream events")		\
 	__PMC_CAP(CASCADE,	11, "cascade counters")			\
 	__PMC_CAP(SYSWIDE,	12, "system wide counter")		\
-	__PMC_CAP(DOMWIDE,	13, "NUMA domain wide counter")
+	__PMC_CAP(DOMWIDE,	13, "NUMA domain wide counter")		\
+	__PMC_CAP(LBR,		14, "record last-branch stack")
 
 enum pmc_caps
 {
@@ -305,7 +306,7 @@ enum pmc_caps
 };
 
 #define	PMC_CAP_FIRST		PMC_CAP_INTERRUPT
-#define	PMC_CAP_LAST		PMC_CAP_DOMWIDE
+#define	PMC_CAP_LAST		PMC_CAP_LBR
 
 /*
  * PMC Event Numbers

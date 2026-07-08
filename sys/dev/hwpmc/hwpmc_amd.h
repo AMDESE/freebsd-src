@@ -36,6 +36,9 @@
 #define	EXTPERFMON_CORE_PMCS(x)	((x) & 0x0F)
 #define	EXTPERFMON_DF_PMCS(x)	(((x) >> 10) & 0x3F)
 #define	EXTPERFMON_PERFMONV2(x)	((x) & 0x1)	/* leaf 0x80000022 EAX bit 0 */
+#define	EXTPERFMON_LBR_V2(x)	(((x) >> 1) & 0x1)	/* EAX bit 1, LbrExtV2 */
+#define	EXTPERFMON_LBR_FREEZE(x) (((x) >> 2) & 0x1)	/* EAX bit 2, LbrAndPmcFreeze */
+#define	EXTPERFMON_LBR_DEPTH(x)	(((x) >> 4) & 0x3F)	/* EBX bits 9:4, stack depth */
 
 /* AMD K8 PMCs */
 #define	AMD_PMC_EVSEL_0		0xC0010000
@@ -70,7 +73,21 @@
 #define	AMD_PMC_GLOBAL_STATUS		0xC0000300	/* RO  */
 #define	AMD_PMC_GLOBAL_CTL		0xC0000301	/* RW  */
 #define	AMD_PMC_GLOBAL_STATUS_CLR	0xC0000302	/* WO  */
-/* GLOBAL_STATUS.LBRS_FROZEN (bit 58) goes here in the follow-up LBR v2 task. */
+#define	AMD_PMC_GLOBAL_STATUS_LBRS_FROZEN	(1ULL << 58)
+
+/*
+ * LBR v2 (LbrExtV2): a ring of From/To branch-record MSR pairs, frozen at
+ * core-PMC overflow and re-armed by clearing LBRS_FROZEN in GLOBAL_STATUS.
+ */
+#define	AMD_MSR_SAMP_BR_FROM	0xC0010300	/* From at +2i, To at +2i+1 */
+#define	AMD_MSR_LBR_SELECT	0xC000010E
+#define	AMD_MSR_DBG_EXTN_CFG	0xC000010F
+#define	AMD_DBG_EXTN_CFG_LBRV2EN	(1ULL << 6)
+#define	AMD_DEBUGCTL_FREEZE_LBRS_ON_PMI	(1ULL << 11)	/* MSR_DEBUGCTLMSR */
+/* LBR_SELECT suppress-mode filter: a set bit stops recording that type. */
+#define	AMD_LBR_SELECT_CPL0	(1ULL << 0)	/* branches ending in CPL 0 */
+#define	AMD_LBR_SELECT_CPLGT0	(1ULL << 1)	/* branches ending in CPL > 0 */
+#define	AMD_LBR_MAX_DEPTH	16
 
 #define	AMD_PMC_COUNTERMASK	0xFF000000
 #define AMD_PMC_PRECISERETIRE	(1ULL << 43) /* Only valid for PERF_CTL2 */

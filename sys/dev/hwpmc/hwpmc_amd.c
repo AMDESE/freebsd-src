@@ -64,6 +64,8 @@ static int amd_npmcs;
 static int amd_core_npmcs, amd_l3_npmcs, amd_df_npmcs;
 static bool amd_perfmon_v2;		/* PerfMonV2 global-control path selected */
 static uint64_t amd_global_cntr_mask;	/* (1 << amd_core_npmcs) - 1 */
+static int amd_lbr_depth;		/* LBR v2 stack depth; 0 = not present */
+static bool amd_lbr_freeze;		/* LbrAndPmcFreeze supported */
 static struct amd_descr amd_pmcdesc[AMD_NPMCS_MAX];
 struct amd_event_code_map {
 	enum pmc_event	pe_ev;	 /* enum value */
@@ -207,6 +209,10 @@ SYSCTL_U64(_kern_hwpmc, OID_AUTO, amd_df_extra_mask, CTLFLAG_RDTUN,
 SYSCTL_BOOL(_kern_hwpmc, OID_AUTO, amd_perfmon_v2, CTLFLAG_RD,
     &amd_perfmon_v2, 0,
     "AMD PerfMonV2 global-control path selected (read-only)");
+
+SYSCTL_INT(_kern_hwpmc, OID_AUTO, amd_lbr_depth, CTLFLAG_RD,
+    &amd_lbr_depth, 0,
+    "AMD LBR v2 branch-record stack depth (0 = not present)");
 
 static void
 amd_init_policy(void)
@@ -1155,6 +1161,16 @@ pmc_amd_initialize(void)
 		/* EAX bit 0 is the PerfMonV2 flag; the family check blocks it on older or virtual CPUs. */
 		if (EXTPERFMON_PERFMONV2(regs[0]) && family >= 0x19)
 			amd_perfmon_v2 = true;
+		/* LBR v2 rides on the PerfMonV2 machinery (freeze state in GLOBAL_STATUS). */
+		if (amd_perfmon_v2 && EXTPERFMON_LBR_V2(regs[0])) {
+			amd_lbr_depth = EXTPERFMON_LBR_DEPTH(regs[1]);
+			if (amd_lbr_depth > AMD_LBR_MAX_DEPTH) {
+				printf("hwpmc: LBR depth %d clamped to %d\n",
+				    amd_lbr_depth, AMD_LBR_MAX_DEPTH);
+				amd_lbr_depth = AMD_LBR_MAX_DEPTH;
+			}
+			amd_lbr_freeze = EXTPERFMON_LBR_FREEZE(regs[0]) != 0;
+		}
 	}
 
 	/* Enable the newer core counters */
@@ -1172,6 +1188,8 @@ pmc_amd_initialize(void)
 		 */
 		if ((family >= 0x1a) && (i == 2))
 			d->pm_descr.pd_caps |= PMC_CAP_PRECISE;
+		if (amd_lbr_depth > 0)
+			d->pm_descr.pd_caps |= PMC_CAP_LBR;
 		d->pm_descr.pd_width = 48;
 		if ((amd_feature2 & AMDID2_PCXC) != 0) {
 			d->pm_evsel = AMD_PMC_CORE_BASE + 2 * i;
@@ -1262,6 +1280,10 @@ pmc_amd_initialize(void)
 	pcd->pcd_ri		= pmc_mdep->pmd_npmc;
 	pcd->pcd_width		= 48;
 
+	/* Class-level caps gate allocation (hwpmc_mod.c pcd_caps check). */
+	if (amd_lbr_depth > 0)
+		pcd->pcd_caps |= PMC_CAP_LBR;
+
 	pcd->pcd_allocate_pmc	= amd_allocate_pmc;
 	pcd->pcd_config_pmc	= amd_config_pmc;
 	pcd->pcd_describe	= amd_describe;
@@ -1287,8 +1309,9 @@ pmc_amd_initialize(void)
 		pcd->pcd_stop_pmc  = amd_stop_pmc_v2;
 		pmc_mdep->pmd_intr = amd_intr_v2;
 		printf("hwpmc: AMD PerfMonV2 path enabled "
-		    "(%d core PMCs, mask 0x%jx)\n",
-		    amd_core_npmcs, (uintmax_t)amd_global_cntr_mask);
+		    "(%d core PMCs, mask 0x%jx, LBR depth %d%s)\n",
+		    amd_core_npmcs, (uintmax_t)amd_global_cntr_mask,
+		    amd_lbr_depth, amd_lbr_freeze ? "+freeze" : "");
 	} else {
 		printf("hwpmc: AMD classic PMU path\n");
 	}
