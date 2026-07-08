@@ -1,0 +1,83 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 Advanced Micro Devices, Inc.
+.\"
+.Dd July 8, 2026
+.Dt PMC.LBR 3
+.Os
+.Sh NAME
+.Nm pmc.lbr
+.Nd Last Branch Record capture for
+.Tn AMD
+CPUs
+.Sh LIBRARY
+.Lb libpmc
+.Sh SYNOPSIS
+.In pmc.h
+.Sh DESCRIPTION
+AMD Zen 4 and newer processors implement LBR v2
+.Pq LbrExtV2 ,
+a per-core ring of the last 16 taken branches recorded as
+From/To address pairs.
+The ring freezes when a core counter overflows, so the records
+describe the branches leading up to each sampling interrupt.
+.Pp
+LBR capture is not a PMC class of its own.
+It is requested with the
+.Li lbr
+event qualifier on a core counter allocated in sampling mode, for
+example:
+.Bd -literal -offset indent
+pmcstat -S ex_ret_brn_tkn,lbr -O sample.out command
+.Ed
+.Pp
+Allocation fails when the CPU does not implement LbrExtV2, when the
+PMC is not a core counter, or when it is not in sampling mode.
+The
+.Li usr
+and
+.Li os
+capabilities of the PMC also scope the branch records: user-only
+sampling suppresses branches ending in CPL 0 and system-only sampling
+suppresses branches ending in CPL greater than 0.
+.Pp
+Samples taken with LBR active set the PMC_CC_F_MULTIPART flag and
+embed a payload of type PMC_CC_MULTIPART_LBR in the callchain record,
+using the layout described in
+.Xr pmc.ibs 3 .
+The payload holds the valid branch records, most recent branch first,
+as two 64-bit words per record: the raw From then To register image.
+The instruction pointer is bits [57:0] of each word, sign-extended
+from bit 57; bit 63 of the From word flags a mispredicted branch;
+bit 62 of the To word flags a speculative record.
+Invalid records are dropped in the kernel and do not appear in the
+payload.
+.Sh CAVEATS
+The branch-type filter register is shared per CPU; when several LBR
+PMCs are scheduled on the same CPU the most recently started one
+determines the filter.
+.Pp
+For system-wide PMCs the ring is not cleared on context switches, so
+a sample taken shortly after a switch can include branches from the
+previous address space.
+Process-mode PMCs get a clean ring on every switch-in.
+.Pp
+On CPUs without the LbrAndPmcFreeze feature the ring keeps running
+until the interrupt handler reads it, so records may include kernel
+interrupt-entry branches.
+.Sh SEE ALSO
+.Xr pmc 3 ,
+.Xr pmc.amd 3 ,
+.Xr pmc.ibs 3 ,
+.Xr pmclog 3 ,
+.Xr hwpmc 4
+.Pp
+The record format is described in the
+.Rs
+.%B "Processor Programming Reference (PPR) for AMD Family 19h Model 11h"
+.%N "Publication No. 55901"
+.%Q "Advanced Micro Devices, Inc."
+.Re
+.Sh HISTORY
+LBR v2 capture support was first introduced in
+.Fx 16.0 .

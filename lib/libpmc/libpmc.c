@@ -1219,7 +1219,7 @@ pmc_allocate(const char *ctrspec, enum pmc_mode mode,
 {
 	size_t n;
 	int retval;
-	char *r, *spec_copy;
+	char *p, *r, *spec_copy;
 	const char *ctrname;
 	const struct pmc_event_descr *ev;
 	const struct pmc_event_alias *alias;
@@ -1250,6 +1250,10 @@ pmc_allocate(const char *ctrspec, enum pmc_mode mode,
 	r = spec_copy = strdup(ctrspec);
 	ctrname = strsep(&r, ",");
 	if (pmc_pmu_enabled()) {
+		/* MI spec keywords; other modifiers are ignored on this path. */
+		while ((p = strsep(&r, ",")) != NULL)
+			if (KWMATCH(p, "lbr"))
+				pmc_config.pm_caps |= PMC_CAP_LBR;
 		errno = pmc_pmu_pmcallocate(ctrname, &pmc_config);
 		if (errno == 0)
 			goto found;

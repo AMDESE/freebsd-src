@@ -454,6 +454,24 @@ pmcstat_print_ibs_op(struct pmclog_ev_callchain *cc, int offset, int len64)
 			PMCSTAT_PRINT_ENTRY("ibs-op", "streamstore");
 	}
 }
+
+static void
+pmcstat_print_lbr(struct pmclog_ev_callchain *cc, int offset, int len64)
+{
+	uint64_t *lbrbuf = (uint64_t *)&cc->pl_pc[offset];
+	uint64_t from, to;
+	int i;
+
+	/* Raw From/To pairs, top of stack first (see PMC_CC_MULTIPART_LBR). */
+	for (i = 0; i + 1 < len64; i += 2) {
+		from = lbrbuf[i];
+		to = lbrbuf[i + 1];
+		PMCSTAT_PRINT_ENTRY("lbr", "%#jx -> %#jx%s%s",
+		    (uintmax_t)AMD_LBR_IP(from), (uintmax_t)AMD_LBR_IP(to),
+		    (from & AMD_LBR_FROM_MISPREDICT) ? " mispredicted" : "",
+		    (to & AMD_LBR_TO_SPEC) ? " speculative" : "");
+	}
+}
 #endif
 
 static int
@@ -477,6 +495,9 @@ pmcstat_print_multipart(struct pmclog_ev_callchain *cc)
 			    len / (sizeof(uint64_t) / sizeof(uintptr_t)));
 		} else if (type == PMC_CC_MULTIPART_IBS_OP) {
 			pmcstat_print_ibs_op(cc, offset,
+			    len / (sizeof(uint64_t) / sizeof(uintptr_t)));
+		} else if (type == PMC_CC_MULTIPART_LBR) {
+			pmcstat_print_lbr(cc, offset,
 			    len / (sizeof(uint64_t) / sizeof(uintptr_t)));
 #endif
 		} else {
