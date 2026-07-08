@@ -180,6 +180,7 @@ const int amd_event_codes_size = nitems(amd_event_codes);
  */
 struct amd_cpu {
 	struct pmc_hw	pc_amdpmcs[AMD_NPMCS_MAX];
+	uint32_t	pc_lbr_mask;	/* core rows with LBR active */
 };
 static struct amd_cpu **amd_pcpu;
 
@@ -434,6 +435,23 @@ amd_allocate_pmc(int cpu __unused, int ri, struct pmc *pm,
 	    ((pd->pd_caps & PMC_CAP_PRECISE) == 0))
 		return (EINVAL);
 
+	/* LBR: core sampling PMCs on LBR v2 hardware only. */
+	if ((caps & PMC_CAP_LBR) != 0) {
+		if ((pd->pd_caps & PMC_CAP_LBR) == 0)
+			return (EINVAL);
+		if (!PMC_IS_SAMPLING_MODE(a->pm_mode))
+			return (EINVAL);
+		/* Suppress branches ending in the CPL the user did not ask for. */
+		if ((caps & (PMC_CAP_USER | PMC_CAP_SYSTEM)) == PMC_CAP_USER)
+			pm->pm_md.pm_amd.pm_amd_lbr_select = AMD_LBR_SELECT_CPL0;
+		else if ((caps & (PMC_CAP_USER | PMC_CAP_SYSTEM)) ==
+		    PMC_CAP_SYSTEM)
+			pm->pm_md.pm_amd.pm_amd_lbr_select =
+			    AMD_LBR_SELECT_CPLGT0;
+		else
+			pm->pm_md.pm_amd.pm_amd_lbr_select = 0;
+	}
+
 	PMCDBG2(MDP, ALL, 1,"amd-allocate ri=%d caps=0x%x", ri, caps);
 
 	/* Validate sub-class. */
@@ -562,10 +580,12 @@ amd_start_pmc(int cpu __diagused, int ri, struct pmc *pm)
 
 /* Start a PMC (PerfMonV2 path): arm EVSEL, then assert the global counter mask. */
 static int
-amd_start_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
+amd_start_pmc_v2(int cpu, int ri, struct pmc *pm)
 {
 	const struct amd_descr *pd;
+	struct amd_cpu *pac;
 	uint64_t config;
+	int i;
 
 	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
 	    ("[amd,%d] illegal CPU value %d", __LINE__, cpu));
@@ -573,8 +593,29 @@ amd_start_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
 	    ("[amd,%d] illegal row-index %d", __LINE__, ri));
 
 	pd = &amd_pmcdesc[ri];
+	pac = amd_pcpu[cpu];
 
 	PMCDBG2(MDP, STA, 1, "amd-start-v2 cpu=%d ri=%d", cpu, ri);
+
+	if ((pm->pm_caps & PMC_CAP_LBR) != 0) {
+		/* Wipe the ring: start runs on every switch-in for process PMCs. */
+		for (i = 0; i < 2 * amd_lbr_depth; i++)
+			wrmsr(AMD_MSR_SAMP_BR_FROM + i, 0);
+		wrmsr(AMD_MSR_LBR_SELECT, pm->pm_md.pm_amd.pm_amd_lbr_select);
+		/* First LBR user on this CPU turns the ring on. */
+		if (pac->pc_lbr_mask == 0) {
+			wrmsr(AMD_PMC_GLOBAL_STATUS_CLR,
+			    AMD_PMC_GLOBAL_STATUS_LBRS_FROZEN);
+			if (amd_lbr_freeze)
+				wrmsr(MSR_DEBUGCTLMSR,
+				    rdmsr(MSR_DEBUGCTLMSR) |
+				    AMD_DEBUGCTL_FREEZE_LBRS_ON_PMI);
+			wrmsr(AMD_MSR_DBG_EXTN_CFG,
+			    rdmsr(AMD_MSR_DBG_EXTN_CFG) |
+			    AMD_DBG_EXTN_CFG_LBRV2EN);
+		}
+		pac->pc_lbr_mask |= 1u << ri;
+	}
 
 	/* Arm the counter; GLOBAL_CTL gates when it actually counts. */
 	config = pm->pm_md.pm_amd.pm_amd_evsel | AMD_PMC_ENABLE;
@@ -632,9 +673,10 @@ amd_stop_pmc(int cpu __diagused, int ri, struct pmc *pm)
 
 /* Stop a PMC (PerfMonV2 path): clear EVSEL ENABLE only; GLOBAL_STATUS tells the handler about overflow. */
 static int
-amd_stop_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
+amd_stop_pmc_v2(int cpu, int ri, struct pmc *pm)
 {
 	const struct amd_descr *pd;
+	struct amd_cpu *pac;
 
 	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
 	    ("[amd,%d] illegal CPU value %d", __LINE__, cpu));
@@ -642,11 +684,26 @@ amd_stop_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
 	    ("[amd,%d] illegal row-index %d", __LINE__, ri));
 
 	pd = &amd_pmcdesc[ri];
+	pac = amd_pcpu[cpu];
 
 	PMCDBG1(MDP, STO, 1, "amd-stop-v2 ri=%d", ri);
 
 	/* Disarm this counter's event; leaves other counters' GLOBAL_CTL bits. */
 	wrmsr(pd->pm_evsel, pm->pm_md.pm_amd.pm_amd_evsel & ~AMD_PMC_ENABLE);
+
+	/* Last LBR user on this CPU turns the ring off. */
+	if ((pm->pm_caps & PMC_CAP_LBR) != 0) {
+		pac->pc_lbr_mask &= ~(1u << ri);
+		if (pac->pc_lbr_mask == 0) {
+			wrmsr(AMD_MSR_DBG_EXTN_CFG,
+			    rdmsr(AMD_MSR_DBG_EXTN_CFG) &
+			    ~AMD_DBG_EXTN_CFG_LBRV2EN);
+			if (amd_lbr_freeze)
+				wrmsr(MSR_DEBUGCTLMSR,
+				    rdmsr(MSR_DEBUGCTLMSR) &
+				    ~AMD_DEBUGCTL_FREEZE_LBRS_ON_PMI);
+		}
+	}
 
 	return (0);
 }
@@ -1010,6 +1067,11 @@ amd_pcpu_fini(struct pmc_mdep *md, int cpu)
 		    ("[amd,%d] CPU%d/PMC%d not stopped", __LINE__, cpu, i));
 	}
 #endif
+
+	/* Module-unload hygiene: force the LBR ring off. */
+	if (amd_lbr_depth > 0)
+		wrmsr(AMD_MSR_DBG_EXTN_CFG,
+		    rdmsr(AMD_MSR_DBG_EXTN_CFG) & ~AMD_DBG_EXTN_CFG_LBRV2EN);
 
 	pc = pmc_pcpu[cpu];
 	KASSERT(pc != NULL, ("[amd,%d] NULL per-cpu state", __LINE__));

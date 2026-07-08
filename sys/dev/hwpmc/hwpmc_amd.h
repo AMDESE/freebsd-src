@@ -223,6 +223,7 @@ struct pmc_md_amd_op_pmcallocate {
 /* MD extension for 'struct pmc' */
 struct pmc_md_amd_pmc {
 	uint64_t	pm_amd_evsel;
+	uint64_t	pm_amd_lbr_select;	/* LBR_SELECT filter image */
 };
 
 #endif /* _KERNEL */
