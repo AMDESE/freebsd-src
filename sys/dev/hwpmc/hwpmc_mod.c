@@ -5967,6 +5967,38 @@ pmc_cleanup(void)
 }
 
 /*
+ * MOD_UNLOAD: refuse while PMC owners exist; pmc_cleanup() cannot drain
+ * their queued samples once it has unhooked sampling (deadlocks on pmc_sx).
+ */
+static int
+pmc_unload(void)
+{
+	struct pmc_ownerhash *ph;
+	struct pmc_owner *po;
+	int nowners;
+
+	nowners = 0;
+	sx_xlock(&pmc_sx);
+	if (pmc_ownerhash != NULL) {
+		for (ph = pmc_ownerhash;
+		     ph <= &pmc_ownerhash[pmc_ownerhashmask]; ph++) {
+			LIST_FOREACH(po, ph, po_next)
+				nowners++;
+		}
+	}
+	sx_xunlock(&pmc_sx);
+
+	if (nowners != 0) {
+		printf("hwpmc: cannot unload, %d PMC owner(s) active\n",
+		    nowners);
+		return (EBUSY);
+	}
+
+	pmc_cleanup();
+	return (0);
+}
+
+/*
  * The function called at load/unload.
  */
 static int
@@ -5986,7 +6018,12 @@ load(struct module *module __unused, int cmd, void *arg __unused)
 		    pmc_cpu_max());
 		break;
 	case MOD_UNLOAD:
+		error = pmc_unload();
+		if (error == 0)
+			PMCDBG0(MOD,INI,1, "unloaded");
+		break;
 	case MOD_SHUTDOWN:
+		/* refusing is not an option here; queued samples don't matter */
 		pmc_cleanup();
 		PMCDBG0(MOD,INI,1, "unloaded");
 		break;
