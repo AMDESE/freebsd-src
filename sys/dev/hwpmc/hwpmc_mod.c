@@ -165,6 +165,13 @@ static u_long pmc_ownerhashmask;
 static LIST_HEAD(pmc_ownerhash, pmc_owner) *pmc_ownerhash;
 
 /*
+ * Count of live owner descriptors.  Maintained by the owner
+ * descriptor alloc/destroy pair below and read lockless by MOD_UNLOAD,
+ * so the unload path need not take pmc_sx under the kernel linker lock.
+ */
+static volatile int pmc_nowners;
+
+/*
  * List of PMC owners with system-wide sampling PMCs.
  */
 static CK_LIST_HEAD(, pmc_owner) pmc_ss_owners;
@@ -2319,6 +2326,9 @@ pmc_allocate_owner_descriptor(struct proc *p)
 	TAILQ_INIT(&po->po_logbuffers);
 	mtx_init(&po->po_mtx, "pmc-owner-mtx", "pmc-per-proc", MTX_SPIN);
 
+	/* Serialized by pmc_sx; read lockless in pmc_unload(). */
+	atomic_add_int(&pmc_nowners, 1);
+
 	PMCDBG4(OWN,ALL,1, "allocate-owner proc=%p (%d, %s) pmc-owner=%p",
 	    p, p->p_pid, p->p_comm, po);
 
@@ -2333,6 +2343,7 @@ pmc_destroy_owner_descriptor(struct pmc_owner *po)
 	    po, po->po_owner, po->po_owner->p_pid, po->po_owner->p_comm);
 
 	mtx_destroy(&po->po_mtx);
+	atomic_subtract_int(&pmc_nowners, 1);
 	free(po, M_PMC);
 }
 
@@ -5969,25 +5980,24 @@ pmc_cleanup(void)
 /*
  * MOD_UNLOAD: refuse while PMC owners exist; pmc_cleanup() cannot drain
  * their queued samples once it has unhooked sampling (deadlocks on pmc_sx).
+ *
+ * The owner count is read locklessly: this handler runs under the kernel
+ * linker lock (kld_sx), and taking pmc_sx here would invert the
+ * pmc_sx -> kld_sx order established by the sampling path
+ * (pmc_log_kernel_mappings() -> linker_hwpmc_list_objects()), which WITNESS
+ * flags as a lock-order reversal.  pmc_nowners is maintained under pmc_sx by
+ * the owner alloc/destroy pair, so a stale read can only be zero when an
+ * allocation is racing in - and such an allocation cannot make progress
+ * anyway, because pmc_hook is still set and every syscall path is about to be
+ * refused once pmc_cleanup() clears it.  A non-zero read is always safe: it
+ * means an owner existed, so we refuse.
  */
 static int
 pmc_unload(void)
 {
-	struct pmc_ownerhash *ph;
-	struct pmc_owner *po;
 	int nowners;
 
-	nowners = 0;
-	sx_xlock(&pmc_sx);
-	if (pmc_ownerhash != NULL) {
-		for (ph = pmc_ownerhash;
-		     ph <= &pmc_ownerhash[pmc_ownerhashmask]; ph++) {
-			LIST_FOREACH(po, ph, po_next)
-				nowners++;
-		}
-	}
-	sx_xunlock(&pmc_sx);
-
+	nowners = atomic_load_int(&pmc_nowners);
 	if (nowners != 0) {
 		printf("hwpmc: cannot unload, %d PMC owner(s) active\n",
 		    nowners);
