@@ -147,6 +147,7 @@ rapl_guard_handler(void *arg __unused)
 static void
 rapl_guard_schedule(void)
 {
+	mtx_assert(&rapl_alloc_mtx, MA_OWNED);
 	callout_reset_sbt(&rapl_guard_callout, rapl_guard_sbt,
 	    rapl_guard_sbt / 10, rapl_guard_tick, NULL, 0);
 }
@@ -248,10 +249,10 @@ rapl_describe(int cpu, int ri, struct pmc_info *pi, struct pmc **ppmc)
 	pi->pm_class = pd->pd_class;
 
 	if (phw->phw_state & PMC_PHW_FLAG_IS_ENABLED) {
-		pi->pm_enabled = TRUE;
+		pi->pm_enabled = true;
 		*ppmc          = phw->phw_pmc;
 	} else {
-		pi->pm_enabled = FALSE;
+		pi->pm_enabled = false;
 		*ppmc          = NULL;
 	}
 
@@ -445,6 +446,7 @@ rapl_add_event(enum pmc_event ev, uint32_t msr, uint32_t unit,
 
 	if (!rapl_msr_present(msr))
 		return;
+
 	rapl_events[rapl_npmcs].re_ev = ev;
 	rapl_events[rapl_npmcs].re_msr = msr;
 	rapl_events[rapl_npmcs].re_unit = unit;
@@ -468,6 +470,7 @@ rapl_compute_guard_sbt(uint32_t shift)
 		guard_ms = RAPL_GUARD_MIN_MS;
 	else if (guard_ms > RAPL_GUARD_MAX_MS)
 		guard_ms = RAPL_GUARD_MAX_MS;
+
 	return (guard_ms * SBT_1MS);
 }
 
@@ -478,6 +481,7 @@ rapl_intel_fixed_dram_unit(void)
 
 	if (CPUID_TO_FAMILY(cpu_id) != 0x6)
 		return (false);
+
 	switch (CPUID_TO_MODEL(cpu_id)) {
 	case 0x3f:	/* Haswell-EP */
 	case 0x4f:	/* Broadwell-EP */
@@ -549,8 +553,7 @@ pmc_rapl_initialize(struct pmc_mdep *md, int maxcpu, int classindex)
 	}
 
 	/* Decode the energy unit. */
-	if (rdmsr_safe(unit_msr, &unit_val) != 0)
-		return (ENXIO);
+	unit_val = rdmsr(unit_msr);
 	esu = (unit_val >> 8) & 0x1f;
 	dram_unit = rapl_intel_fixed_dram_unit() ? 16 : esu;
 
