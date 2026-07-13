@@ -834,6 +834,7 @@ amd_intr_v2(struct trapframe *tf)
 	uint64_t from, status, mask, to;
 	uint32_t active = 0, count = 0;
 	int i, error, n, retval, cpu;
+	bool usronly;
 
 	cpu = curcpu;
 	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
@@ -859,6 +860,8 @@ amd_intr_v2(struct trapframe *tf)
 	/* Snapshot the branch ring only when an LBR row overflowed. */
 	mpd.pl_length = 0;
 	if ((status & pac->pc_lbr_mask) != 0) {
+		usronly = (rdmsr(AMD_MSR_LBR_SELECT) &
+		    AMD_LBR_SELECT_CPL0) != 0;
 		/* No freeze feature: the ring is live, stop it while reading. */
 		if (!amd_lbr_freeze)
 			wrmsr(AMD_MSR_DBG_EXTN_CFG,
@@ -870,6 +873,9 @@ amd_intr_v2(struct trapframe *tf)
 			/* Skip invalid records and erratum-1452 hits. */
 			if ((to & (AMD_LBR_TO_VALID | AMD_LBR_TO_SPEC)) == 0 ||
 			    (to & AMD_LBR_TO_RESERVED) != 0)
+				continue;
+			/* usr-only: the filter operates on branch-ending CPL, so drop kernel-From leaks (SYSRET/IRET). */
+			if (usronly && (int64_t)AMD_LBR_IP(from) < 0)
 				continue;
 			mpd.pl_mpdata[n++] = from;
 			mpd.pl_mpdata[n++] = to;
