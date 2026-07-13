@@ -2,7 +2,7 @@
 .\"
 .\" Copyright (c) 2026 Advanced Micro Devices, Inc.
 .\"
-.Dd July 8, 2026
+.Dd July 13, 2026
 .Dt PMC.LBR 3
 .Os
 .Sh NAME
@@ -47,6 +47,11 @@ and
 capabilities of the PMC also scope the branch records: user-only
 sampling suppresses branches ending in CPL 0 and system-only sampling
 suppresses branches ending in CPL greater than 0.
+Because the hardware filter operates on the mode a branch ends in, a
+branch from kernel to user mode, such as a system call or interrupt
+return, is still recorded with a kernel From address; user-only
+sampling drops such records in the kernel so that kernel addresses
+are not exposed.
 .Pp
 Samples taken with LBR active set the PMC_CC_F_MULTIPART flag and
 embed a payload of type PMC_CC_MULTIPART_LBR in the callchain record,
@@ -74,6 +79,11 @@ Process-mode PMCs get a clean ring on every switch-in.
 On CPUs without the LbrAndPmcFreeze feature the ring keeps running
 until the interrupt handler reads it, so records may include kernel
 interrupt-entry branches.
+.Pp
+Instruction fusion can make the hardware report a From address that
+points to an instruction preceding the actual branch by several
+bytes, for example the comparison of a fused compare-and-branch pair.
+Records are exported as captured, without adjusting the address.
 .Sh SEE ALSO
 .Xr pmc 3 ,
 .Xr pmc.amd 3 ,
