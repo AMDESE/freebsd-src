@@ -841,7 +841,7 @@ static int
 rapl_allocate_pmc(enum pmc_event pe, char *ctrspec,
     struct pmc_op_pmcallocate *pmc_config)
 {
-	if ((int)pe < PMC_EV_RAPL_FIRST || (int)pe > PMC_EV_RAPL_LAST)
+	if (pe < PMC_EV_RAPL_FIRST || pe > PMC_EV_RAPL_LAST)
 		return (-1);
 
 	/* RAPL events must be unqualified. */
