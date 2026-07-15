@@ -624,11 +624,12 @@ amd_stop_pmc(int cpu __diagused, int ri, struct pmc *pm)
 	return (0);
 }
 
-/* Stop a PMC (PerfMonV2 path): clear EVSEL ENABLE only; GLOBAL_STATUS tells the handler about overflow. */
+/* Stop a PMC (PerfMonV2 path): clear EVSEL ENABLE; wait out a pending overflow NMI via GLOBAL_STATUS. */
 static int
 amd_stop_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
 {
 	const struct amd_descr *pd;
+	int i;
 
 	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
 	    ("[amd,%d] illegal CPU value %d", __LINE__, cpu));
@@ -641,6 +642,17 @@ amd_stop_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
 
 	/* Disarm this counter's event; leaves other counters' GLOBAL_CTL bits. */
 	wrmsr(pd->pm_evsel, pm->pm_md.pm_amd.pm_amd_evsel & ~AMD_PMC_ENABLE);
+
+	/* NMI latency: wait for an in-flight overflow NMI; the handler's ack clears the status bit. */
+	if (pd->pm_subclass == PMC_AMD_SUB_CLASS_CORE &&
+	    PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm))) {
+		for (i = 0; i < OVERFLOW_WAIT_COUNT; i++) {
+			if ((rdmsr(AMD_PMC_GLOBAL_STATUS) & (1ULL << ri)) == 0)
+				break;
+
+			DELAY(1);
+		}
+	}
 
 	return (0);
 }
