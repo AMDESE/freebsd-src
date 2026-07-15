@@ -787,15 +787,13 @@ amd_intr_v2(struct trapframe *tf)
 	retval = 0;
 	pac = amd_pcpu[cpu];
 
-	/* IBS shares the handler entry; service it first. */
 	retval = pmc_ibs_intr(tf);
 	if (retval)
 		goto done;
 
-	/* Freeze core counters while we read status and reload. */
 	amd_v2_disable_all();
 
-	/* Single read of the overflow bitmap; drop reserved bits. */
+	/* Single read of the overflow bitmap. */
 	status = rdmsr(AMD_PMC_GLOBAL_STATUS);
 	status &= amd_global_cntr_mask;
 
@@ -808,14 +806,13 @@ amd_intr_v2(struct trapframe *tf)
 			continue;
 		}
 
-		/* Consider pmc with valid handle as active. */
 		active++;
 
 		mask = (1ULL << i);
 		if ((status & mask) == 0)
 			continue;
 
-		retval = 1;	/* Found an interrupting PMC. */
+		retval = 1;
 
 		if (pm->pm_state != PMC_STATE_RUNNING)
 			continue;
@@ -825,14 +822,14 @@ amd_intr_v2(struct trapframe *tf)
 		wrmsr(amd_pmcdesc[i].pm_perfctr,
 		    AMD_RELOAD_COUNT_TO_PERFCTR_VALUE(v));
 
-		/* On log failure, leave the counter disarmed for back-pressure; MI restarts via pcd_start_pmc. */
+		/* On log failure, leave the counter disarmed. MI restarts via pcd_start_pmc. */
 		error = pmc_process_interrupt(PMC_HR, pm, tf);
 		if (error != 0)
 			wrmsr(amd_pmcdesc[i].pm_evsel,
 			    pm->pm_md.pm_amd.pm_amd_evsel & ~AMD_PMC_ENABLE);
 	}
 
-	/* Ack overflow bits; status was already masked to core counters only. */
+	/* Ack overflow bits. */
 	wrmsr(AMD_PMC_GLOBAL_STATUS_CLR, status);
 
 	/* Resume core counters. */
@@ -1164,7 +1161,7 @@ pmc_amd_initialize(void)
 			amd_core_npmcs = EXTPERFMON_CORE_PMCS(regs[1]);
 			amd_df_npmcs = EXTPERFMON_DF_PMCS(regs[1]);
 		}
-		/* EAX bit 0 is the PerfMonV2 flag; the family check blocks it on older or virtual CPUs. */
+		/* EAX bit 0 is the PerfMonV2 flag. */
 		if (EXTPERFMON_PERFMONV2(regs[0]) && family >= 0x19)
 			amd_perfmon_v2 = true;
 	}
@@ -1293,7 +1290,7 @@ pmc_amd_initialize(void)
 	pmc_mdep->pmd_switch_in	= amd_switch_in;
 	pmc_mdep->pmd_switch_out = amd_switch_out;
 
-	/* PerfMonV2: override start/stop/intr with global-control variants; L3 and DF keep the classic path. */
+	/* PerfMonV2: override start/stop/intr. L3 and DF keep the classic path. */
 	if (amd_perfmon_v2) {
 		pcd->pcd_start_pmc = amd_start_pmc_v2;
 		pcd->pcd_stop_pmc  = amd_stop_pmc_v2;
