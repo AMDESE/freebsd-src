@@ -1298,11 +1298,6 @@ pmc_amd_initialize(void)
 		pcd->pcd_start_pmc = amd_start_pmc_v2;
 		pcd->pcd_stop_pmc  = amd_stop_pmc_v2;
 		pmc_mdep->pmd_intr = amd_intr_v2;
-		printf("hwpmc: AMD PerfMonV2 path enabled "
-		    "(%d core PMCs, mask 0x%jx)\n",
-		    amd_core_npmcs, (uintmax_t)amd_global_cntr_mask);
-	} else {
-		printf("hwpmc: AMD classic PMU path\n");
 	}
 
 	pmc_mdep->pmd_npmc	+= amd_npmcs;
