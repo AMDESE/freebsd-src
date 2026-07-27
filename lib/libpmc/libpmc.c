@@ -845,7 +845,7 @@ rapl_allocate_pmc(enum pmc_event pe, char *ctrspec,
 		return (-1);
 
 	/* RAPL events must be unqualified. */
-	if (ctrspec && *ctrspec != '\0')
+	if (ctrspec != NULL && *ctrspec != '\0')
 		return (-1);
 
 	pmc_config->pm_caps |= PMC_CAP_READ;

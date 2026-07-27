@@ -1,8 +1,10 @@
-/*-
- * SPDX-License-Identifier: BSD-2-Clause
- *
+/*
  * Copyright (c) 2026 Advanced Micro Devices, Inc.
  *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+/*
  * AMD/Intel RAPL energy counters exposed as an hwpmc(4) PMC class.
  *
  * Read-only, system-scope (PMC_MODE_SC), 64-bit counters reporting
