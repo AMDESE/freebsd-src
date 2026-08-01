@@ -791,6 +791,7 @@ pmcview::process(struct pmclog_ev_callchain &p)
 	uintfptr_t *cc = &p.pl_pc[1];
 	ibsfetchinfo ibsf;
 	ibsopinfo ibso;
+	bool trig, inval;
 
 	/*
 	 * Callchain events are always attributed to one of the kernel
@@ -832,16 +833,18 @@ pmcview::process(struct pmclog_ev_callchain &p)
 				ibso.physaddr = cc[PMC_MPIDX_OP_DC_PHYSADDR];
 				ibso.tgtrip = cc[PMC_MPIDX_OP_TGT_RIP];
 				ibso.data4 = cc[PMC_MPIDX_OP_DATA4];
-				/* AMD Zen3 IBS erratum #1293 overlay */
-				{
-				bool trig = (ibso.data3 &
+				/*
+				 * AMD Zen3 IBS erratum #1293 overlay.  No view
+				 * consumes these flags yet; the first op-side
+				 * view must honour them.
+				 */
+				trig = (ibso.data3 &
 				    (IBS_OP_DATA3_PREFETCH |
-				     IBS_OP_DATA3_DCMISSNOMABALLOC)) != 0;
-				bool inval = ibs_zen3_b0_errata && trig;
+				    IBS_OP_DATA3_DCMISSNOMABALLOC)) != 0;
+				inval = ibs_zen3_b0_errata && trig;
 				ibso.data2_valid = !inval;
 				ibso.l2miss_valid = !inval;
 				ibso.openmemreqs_valid = !inval;
-				}
 				break;
 			}
 
