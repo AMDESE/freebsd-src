@@ -881,6 +881,9 @@ pmcview::process(struct pmclog_ev_callchain &p)
 
 	// Advanced filters for AMD IBS
 	if (ibsf.len) {
+		/* Erratum #1197: ignore fetch samples with zero linear addr. */
+		if (ibs_zen3_b0_errata && ibsf.linaddr == 0)
+			return;
 		if (filter.ibs_ldlat > IBS_FETCH_CTL_TO_LAT(ibsf.ctl))
 			return;
 		callchain(p, ibsf, cc, len);
