@@ -818,6 +818,16 @@ pmcview::process(struct pmclog_ev_callchain &p)
 				ibso.physaddr = cc[PMC_MPIDX_OP_DC_PHYSADDR];
 				ibso.tgtrip = cc[PMC_MPIDX_OP_TGT_RIP];
 				ibso.data4 = cc[PMC_MPIDX_OP_DATA4];
+				/* AMD Zen3 IBS erratum #1293 overlay */
+				{
+				bool trig = (ibso.data3 &
+				    (IBS_OP_DATA3_PREFETCH |
+				     IBS_OP_DATA3_DCMISSNOMABALLOC)) != 0;
+				bool inval = ibs_zen3_b0_errata && trig;
+				ibso.data2_valid = !inval;
+				ibso.l2miss_valid = !inval;
+				ibso.openmemreqs_valid = !inval;
+				}
 				break;
 			}
 
