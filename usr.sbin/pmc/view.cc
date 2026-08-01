@@ -39,6 +39,7 @@
 #include <inttypes.h>
 #include <libelf.h>
 #include <pmclog.h>
+#include <string.h>
 #include <sysexits.h>
 #include <unistd.h>
 
@@ -52,6 +53,7 @@
 #include <unordered_set>
 
 #include <dev/hwpmc/hwpmc_ibs.h>
+#include <machine/specialreg.h>
 #include "util.hh"
 #include "view.hh"
 
@@ -209,6 +211,26 @@ pmcview::process_cpuidinfo(int logfd, const pmchdr_infohdr &infohdr)
 	}
 
 	delete[] cpuidinfo;
+
+	/*
+	 * Detect AMD Family 19h (Zen3) Model 00h-0Fh, affected by IBS errata
+	 * #1197/#1238/#1293/#1347. Decode from CPUID leaf 0 (vendor) and leaf
+	 * 1 (family/model signature) rather than the legacy pl_cpuid string.
+	 */
+	auto vend = cpuid.find(0x0);
+	auto leaf1 = cpuid.find(0x1);
+	if (vend != cpuid.end() && leaf1 != cpuid.end()) {
+		alignas(4) char vstr[13];
+		((uint32_t *)vstr)[0] = vend->second.ebx;
+		((uint32_t *)vstr)[1] = vend->second.edx;
+		((uint32_t *)vstr)[2] = vend->second.ecx;
+		vstr[12] = '\0';
+		uint32_t sig = leaf1->second.eax;
+		if (strncmp(vstr, AMD_VENDOR_ID, 12) == 0 &&
+		    CPUID_TO_FAMILY(sig) == 0x19 &&
+		    CPUID_TO_MODEL(sig) <= 0x0F)
+			ibs_zen3_b0_errata = true;
+	}
 
 	return 0;
 }
