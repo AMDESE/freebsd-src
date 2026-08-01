@@ -799,6 +799,13 @@ pmcview::process(struct pmclog_ev_callchain &p)
 				ibsf.extctl = cc[PMC_MPIDX_FETCH_EXTCTL];
 				ibsf.linaddr = cc[PMC_MPIDX_FETCH_LINADDR];
 				ibsf.physaddr = cc[PMC_MPIDX_FETCH_PHYSADDR];
+				/* AMD Zen3 IBS errata overlay */
+				ibsf.icmiss_valid =
+				    !ibs_zen3_b0_errata;              /* #1238 */
+				ibsf.l1tlb_pgsz =
+				    IBS_FETCH_CTL_TO_PGSZ(ibsf.ctl);   /* #1347 */
+				ibsf.l1tlb_pgsz_valid =
+				    (ibsf.ctl & IBS_FETCH_CTL_PHYSADDRVALID) != 0;
 				break;
 			case PMC_CC_MULTIPART_IBS_OP:
 				ibso.len = len;
