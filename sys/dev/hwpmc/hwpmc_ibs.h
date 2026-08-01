@@ -204,6 +204,7 @@
 #define IBS_OP_DATA3_L2MISS		(1ULL << 20)
 #define IBS_OP_DATA3_DCPHYADDRVALID	(1ULL << 18) /* DC Physical Address */
 #define IBS_OP_DATA3_DCLINADDRVALID	(1ULL << 17) /* DC Linear Address */
+#define IBS_OP_DATA3_DCMISSNOMABALLOC	(1ULL << 16) /* DC Miss No MAB Alloc */
 #define IBS_OP_DATA3_LOCKEDOP		(1ULL << 15) /* DC Locked Op */
 #define IBS_OP_DATA3_UCMEMACCESS	(1ULL << 14) /* DC UC Memory Access */
 #define IBS_OP_DATA3_WCMEMACCESS	(1ULL << 13) /* DC WC Memory Access */
