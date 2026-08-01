@@ -61,13 +61,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <err.h>
 
 #include "headers.hh"
 
+static const char *outpath;
+static int outdone;
+
+/*
+ * Every error path below exits mid-stream, leaving an output file that still
+ * carries a valid magic. Remove it so a truncated log is never mistaken for a
+ * spoofed one.
+ */
+static void
+cleanup(void)
+{
+	if (outpath != NULL && !outdone)
+		unlink(outpath);
+}
+
 /*
  * Build the CPUID leaf-1 eax family/model/stepping signature. For
- * fam=0x19, model=0x0F, step=0 this yields 0x00a00f00, which the consumer's
+ * fam=0x19, model=0x0F, step=0 this yields 0x00a00ff0, which the consumer's
  * CPUID_TO_FAMILY/CPUID_TO_MODEL macros decode back to family 0x19, model
  * 0x0F.
  */
@@ -158,11 +174,17 @@ main(int argc, char *argv[])
 	out = fopen(argv[2], "wb");
 	if (out == NULL)
 		err(1, "open %s", argv[2]);
+	outpath = argv[2];
+	if (atexit(cleanup) != 0)
+		err(1, "atexit");
 
 	/* Header. */
 	xfread(&hdr, sizeof(hdr), in, "header");
 	if (hdr.magic != PMC_HEADER_MAGIC)
 		errx(1, "%s: not a pmc log (magic 0x%08x)", argv[1], hdr.magic);
+	if (hdr.version != PMC_HEADER_VERSION)
+		errx(1, "%s: unsupported pmc log version %u (expected %u)",
+		    argv[1], hdr.version, PMC_HEADER_VERSION);
 	xfwrite(&hdr, sizeof(hdr), out, "header");
 
 	/* Info blocks, up to and including INFOHDR_TYPE_DONE. */
@@ -199,6 +221,7 @@ main(int argc, char *argv[])
 
 	if (fclose(out) != 0)
 		err(1, "close %s", argv[2]);
+	outdone = 1;
 	fclose(in);
 
 	return (0);
