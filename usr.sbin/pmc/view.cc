@@ -53,9 +53,23 @@
 #include <unordered_set>
 
 #include <dev/hwpmc/hwpmc_ibs.h>
-#include <machine/specialreg.h>
 #include "util.hh"
 #include "view.hh"
+
+/*
+ * CPUID leaf 1 eax decode, copied from machine/specialreg.h.  The values are
+ * decoded from the log rather than the host CPU, so detection has to work on
+ * any architecture pmc(1) is built for, not just x86.
+ */
+#define	IBS_CPUID_VENDOR_AMD	"AuthenticAMD"
+#define	IBS_CPUID_MODEL		0x000000f0
+#define	IBS_CPUID_FAMILY	0x00000f00
+#define	IBS_CPUID_EXT_MODEL	0x000f0000
+#define	IBS_CPUID_EXT_FAMILY	0x0ff00000
+#define	IBS_CPUID_TO_MODEL(id) \
+    ((((id) & IBS_CPUID_MODEL) >> 4) | (((id) & IBS_CPUID_EXT_MODEL) >> 12))
+#define	IBS_CPUID_TO_FAMILY(id) \
+    ((((id) & IBS_CPUID_FAMILY) >> 8) + (((id) & IBS_CPUID_EXT_FAMILY) >> 20))
 
 std::string
 syminfo::to_string(bool show_line)
@@ -220,15 +234,15 @@ pmcview::process_cpuidinfo(int logfd, const pmchdr_infohdr &infohdr)
 	auto vend = cpuid.find(0x0);
 	auto leaf1 = cpuid.find(0x1);
 	if (vend != cpuid.end() && leaf1 != cpuid.end()) {
-		alignas(4) char vstr[13];
-		((uint32_t *)vstr)[0] = vend->second.ebx;
-		((uint32_t *)vstr)[1] = vend->second.edx;
-		((uint32_t *)vstr)[2] = vend->second.ecx;
+		char vstr[13];
+		memcpy(vstr + 0, &vend->second.ebx, 4);
+		memcpy(vstr + 4, &vend->second.edx, 4);
+		memcpy(vstr + 8, &vend->second.ecx, 4);
 		vstr[12] = '\0';
 		uint32_t sig = leaf1->second.eax;
-		if (strncmp(vstr, AMD_VENDOR_ID, 12) == 0 &&
-		    CPUID_TO_FAMILY(sig) == 0x19 &&
-		    CPUID_TO_MODEL(sig) <= 0x0F)
+		if (strncmp(vstr, IBS_CPUID_VENDOR_AMD, 12) == 0 &&
+		    IBS_CPUID_TO_FAMILY(sig) == 0x19 &&
+		    IBS_CPUID_TO_MODEL(sig) <= 0x0F)
 			ibs_zen3_b0_errata = true;
 	}
 
