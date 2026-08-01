@@ -192,7 +192,12 @@ public:
 			r.emplace_back(kv.second.l3miss, kv.second.samples, true);
 			r.emplace_back(kv.second.l1tlbmiss, kv.second.samples, true);
 			r.emplace_back(kv.second.l2tlbmiss, kv.second.samples, true);
-			r.emplace_back(kv.second.icmiss, kv.second.samples, true);
+			/* #1238: IcMiss is unknown, not zero, on Zen3-B0. */
+			if (ibs_zen3_b0_errata)
+				r.emplace_back(std::string("-"));
+			else
+				r.emplace_back(kv.second.icmiss,
+				    kv.second.samples, true);
 			{
 				int top = 0;
 				for (int i = 1; i < 4; i++)
