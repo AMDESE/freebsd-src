@@ -80,6 +80,18 @@
 #include "display.hh"
 #include "view.hh"
 
+/*
+ * L1TLB page-size labels. Erratum #1347 (Zen3-B0) shifts the encoding:
+ * architectural {4K,2M,1G,rsvd} becomes {4K,16K,2M,1G}.
+ */
+static const char *
+frontend_pgsz_label(uint8_t code, bool zen3_b0)
+{
+	static const char *arch[4] = { "4K", "2M", "1G", "rsvd" };
+	static const char *err1347[4] = { "4K", "16K", "2M", "1G" };
+	return (zen3_b0 ? err1347 : arch)[code & 0x3];
+}
+
 struct frontend {
 	syminfo		func;
 	int64_t		ocmiss;
@@ -89,6 +101,9 @@ struct frontend {
 	int64_t		l2tlbmiss;
 	int64_t		latency;
 	int64_t		samples;
+	int64_t		icmiss;
+	int64_t		pgsz_counts[4];   /* indexed by 2-bit code */
+	int64_t		pgsz_samples;     /* samples with valid pgsz */
 };
 
 static int sortcol = 2;
@@ -137,6 +152,13 @@ public:
 
 		inst->second.latency += IBS_FETCH_CTL_TO_LAT(f.ctl);
 		inst->second.samples += 1;
+
+		if (f.icmiss_valid && (f.ctl & IBS_FETCH_CTL_ICMISS))
+			inst->second.icmiss += 1;      /* #1238 */
+		if (f.l1tlb_pgsz_valid) {
+			inst->second.pgsz_counts[f.l1tlb_pgsz & 0x3] += 1;
+			inst->second.pgsz_samples += 1;  /* #1347 */
+		}
 	}
 
 	virtual void
@@ -155,6 +177,8 @@ public:
 		t.addcolumn("L3 Miss");
 		t.addcolumn("L1 TLB Miss");
 		t.addcolumn("L2 TLB Miss");
+		t.addcolumn("IC Miss");
+		t.addcolumn("Top PgSz");
 
 		for (auto &kv : samples) {
 			std::vector<field> r;
@@ -168,6 +192,18 @@ public:
 			r.emplace_back(kv.second.l3miss, kv.second.samples, true);
 			r.emplace_back(kv.second.l1tlbmiss, kv.second.samples, true);
 			r.emplace_back(kv.second.l2tlbmiss, kv.second.samples, true);
+			r.emplace_back(kv.second.icmiss, kv.second.samples, true);
+			{
+				int top = 0;
+				for (int i = 1; i < 4; i++)
+					if (kv.second.pgsz_counts[i] >
+					    kv.second.pgsz_counts[top])
+						top = i;
+				const char *lbl = kv.second.pgsz_samples ?
+				    frontend_pgsz_label(top, ibs_zen3_b0_errata) :
+				    "-";
+				r.emplace_back(std::string(lbl));
+			}
 
 			t.addrow(r);
 		}
