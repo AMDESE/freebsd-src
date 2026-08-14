@@ -3553,6 +3553,12 @@ hwpmc_mark_row_thread(int ri)
 }
 
 void
+hwpmc_unmark_row_thread(int ri)
+{
+	PMC_UNMARK_ROW_THREAD(ri);
+}
+
+void
 hwpmc_mark_row_free(int ri)
 {
 	PMC_MARK_ROW_FREE(ri);

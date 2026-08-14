@@ -328,7 +328,7 @@ pmu_unassign_group(pmu_group_t *pg, int cpu)
 		if (sys)
 			hwpmc_unmark_row_standalone(n);
 		else
-			hwpmc_mark_row_free(n);
+			hwpmc_unmark_row_thread(n);
 		pe->pe_state = PMU_EVENT_STATE_INACTIVE;
 		pe->pe_assigned_row = -1;
 	}

@@ -130,6 +130,7 @@ struct pmc_classdep *hwpmc_ri_to_classdep(int ri, int *adjri);
 bool hwpmc_can_allocate_row(int ri, enum pmc_mode mode);
 bool hwpmc_can_allocate_rowindex(struct proc *p, unsigned int ri, int cpu);
 void hwpmc_mark_row_thread(int ri);
+void hwpmc_unmark_row_thread(int ri);
 void hwpmc_mark_row_free(int ri);
 void hwpmc_mark_row_standalone(int ri);
 void hwpmc_unmark_row_standalone(int ri);
