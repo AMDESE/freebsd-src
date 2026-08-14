@@ -686,7 +686,7 @@ main(int argc, char **argv)
 				/* not really a group; fall through */
 			}
 			caps = 0;
-			if ((ev = malloc(sizeof(*ev))) == NULL)
+			if ((ev = calloc(1, sizeof(*ev))) == NULL)
 				errx(EX_SOFTWARE, "ERROR: Out of memory.");
 
 			switch (option) {
