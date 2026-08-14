@@ -5229,6 +5229,11 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		if ((error = pmc_find_pmc(gm.pm_pmcid, &pm)) != 0)
 			break;
 
+		if (pm->pm_pmu != NULL) {
+			error = EOPNOTSUPP;
+			break;
+		}
+
 		/*
 		 * The allocated PMC has to be a process virtual PMC,
 		 * i.e., of type MODE_T[CS].  Global PMCs can only be
@@ -5576,8 +5581,13 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		struct pmc_op_caps c;
 		struct pmc *pm;
 		struct pmc_classdep *pcd;
+		pmc_sched_constraint_t cons;
+		pmu_event_t *pe;
 		pmc_id_t pmcid;
+		uint32_t rowcaps;
+		u_int n;
 		int adjri, ri;
+		bool found;
 
 		PMC_DOWNGRADE_SX();
 
@@ -5594,19 +5604,54 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		    ("[pmc,%d] pmcid %x != handle %x", __LINE__,
 			pm->pm_handle, pmcid));
 
-		ri = PMC_TO_ROWINDEX(pm);
-		pcd = pmc_ri_to_classdep(md, ri, &adjri);
-
-		/*
-		 * If PMC class has no GETCAPS return the class capabilities
-		 * otherwise get the per counter capabilities.
-		 */
-		if (pcd->pcd_get_caps == NULL) {
-			c.pm_caps = pcd->pcd_caps;
-		} else {
-			error = (*pcd->pcd_get_caps)(adjri, &c.pm_caps);
-			if (error < 0)
+		if (pm->pm_pmu != NULL) {
+			pe = pmu_event_from_pmc(pm);
+			pcd = pmc_class_to_classdep(pm->pm_class);
+			if (pe == NULL || pcd == NULL) {
+				error = EINVAL;
 				break;
+			}
+			if (pcd->pcd_get_caps == NULL) {
+				c.pm_caps = pcd->pcd_caps;
+			} else {
+				error = pmu_event_get_constraint(pe, &cons);
+				if (error != 0)
+					break;
+				/* Report capabilities common to every assignable row. */
+				found = false;
+				for (n = 0; n < pcd->pcd_num && n < 32; n++) {
+					if ((cons.pc_allowed_rows & (1u << n)) == 0)
+						continue;
+					if (pcd->pcd_can_assign_pmc != NULL &&
+					    pcd->pcd_can_assign_pmc(n, pm,
+					    &pe->pe_alloc) != 0)
+						continue;
+					error = pcd->pcd_get_caps(n, &rowcaps);
+					if (error != 0)
+						break;
+					if (found)
+						c.pm_caps &= rowcaps;
+					else
+						c.pm_caps = rowcaps;
+					found = true;
+				}
+				if (error != 0)
+					break;
+				if (!found) {
+					error = EINVAL;
+					break;
+				}
+			}
+		} else {
+			ri = PMC_TO_ROWINDEX(pm);
+			pcd = pmc_ri_to_classdep(md, ri, &adjri);
+			if (pcd->pcd_get_caps == NULL)
+				c.pm_caps = pcd->pcd_caps;
+			else {
+				error = pcd->pcd_get_caps(adjri, &c.pm_caps);
+				if (error != 0)
+					break;
+			}
 		}
 
 		if ((error = copyout(&c, arg, sizeof(c))) < 0)
