@@ -537,8 +537,13 @@ pmu_group_csw_out(struct thread *td __unused, int cpu __unused)
 }
 
 int
-pmu_group_read_value(struct pmc *pm __unused, pmc_value_t *value __unused)
+pmu_group_read_value(struct pmc *pm, pmc_value_t *value __unused)
 {
+	pmu_event_t *pe;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || pe->pe_group == NULL)
+		return (ENOENT);
 	return (0);
 }
 

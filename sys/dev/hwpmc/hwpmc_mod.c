@@ -4610,8 +4610,12 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 			if ((prw->pm_flags & PMC_F_NEWVALUE) != 0)
 				pm->pm_gv.pm_savedvalue = prw->pm_value;
 			mtx_pool_unlock_spin(pmc_mtxpool, pm);
-			if ((prw->pm_flags & PMC_F_OLDVALUE) != 0)
-				(void)pmu_group_read_value(pm, valp);
+			if ((prw->pm_flags & PMC_F_OLDVALUE) != 0 &&
+			    pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL) {
+				error = pmu_group_read_value(pm, valp);
+				if (error != 0)
+					return (error);
+			}
 			return (0);
 		}
 
@@ -4686,8 +4690,9 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 			return (error);
 	}
 
-	if (error == 0 && (prw->pm_flags & PMC_F_OLDVALUE) != 0)
-		(void)pmu_group_read_value(pm, valp);
+	if (error == 0 && (prw->pm_flags & PMC_F_OLDVALUE) != 0 &&
+	    pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL)
+		error = pmu_group_read_value(pm, valp);
 
 #ifdef HWPMC_DEBUG
 	if ((prw->pm_flags & PMC_F_NEWVALUE) != 0)
