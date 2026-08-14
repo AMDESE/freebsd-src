@@ -1709,8 +1709,8 @@ pmc_init(void)
 	if (PMC_CALL(PMC_OP_GETMODULEVERSION, &abi_version) < 0)
 		return (pmc_syscall = -1);
 
-	/* ignore patch & minor numbers for the comparison */
-	if ((abi_version & 0xFF000000) != (PMC_VERSION & 0xFF000000)) {
+	/* ignore the patch number for the comparison */
+	if ((abi_version & 0xFFFF0000) != (PMC_VERSION & 0xFFFF0000)) {
 		errno  = EPROGMISMATCH;
 		return (pmc_syscall = -1);
 	}
