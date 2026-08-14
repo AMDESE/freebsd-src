@@ -122,6 +122,7 @@ static uint64_t	 ixl_if_get_counter(if_ctx_t ctx, ift_counter cnt);
 static int	 ixl_if_i2c_req(if_ctx_t ctx, struct ifi2creq *req);
 static int	 ixl_if_priv_ioctl(if_ctx_t ctx, u_long command, caddr_t data);
 static bool	 ixl_if_needs_restart(if_ctx_t ctx, enum iflib_restart_event event);
+static int	 ixl_if_vf_status(if_ctx_t ctx, nvlist_t *status);
 #ifdef PCI_IOV
 static void	 ixl_if_vflr_handle(if_ctx_t ctx);
 #endif
@@ -193,6 +194,7 @@ static device_method_t ixl_if_methods[] = {
 	DEVMETHOD(ifdi_i2c_req, ixl_if_i2c_req),
 	DEVMETHOD(ifdi_priv_ioctl, ixl_if_priv_ioctl),
 	DEVMETHOD(ifdi_needs_restart, ixl_if_needs_restart),
+	DEVMETHOD(ifdi_vf_status, ixl_if_vf_status),
 #ifdef PCI_IOV
 	DEVMETHOD(ifdi_iov_init, ixl_if_iov_init),
 	DEVMETHOD(ifdi_iov_uninit, ixl_if_iov_uninit),
@@ -250,6 +252,12 @@ TUNABLE_INT("hw.ixl.enable_vf_loopback",
 SYSCTL_INT(_hw_ixl, OID_AUTO, enable_vf_loopback, CTLFLAG_RDTUN,
     &ixl_enable_vf_loopback, 0,
     IXL_SYSCTL_HELP_VF_LOOPBACK);
+
+static int ixl_mdd_auto_reset_vf;
+TUNABLE_INT("hw.ixl.mdd_auto_reset_vf", &ixl_mdd_auto_reset_vf);
+SYSCTL_INT(_hw_ixl, OID_AUTO, mdd_auto_reset_vf, CTLFLAG_RDTUN,
+    &ixl_mdd_auto_reset_vf, 0,
+    "Automatically reset VFs blocked by malicious-driver detection");
 
 /*
  * Different method for processing TX descriptor
@@ -959,7 +967,7 @@ ixl_if_init(if_ctx_t ctx)
 	int		ret;
 
 	if (IXL_PF_IN_RECOVERY_MODE(pf))
-		return;
+		goto fail;
 	/*
 	 * If the aq is dead here, it probably means something outside of the driver
 	 * did something to the adapter, like a PF reset.
@@ -967,23 +975,25 @@ ixl_if_init(if_ctx_t ctx)
 	 */
 	if (!i40e_check_asq_alive(&pf->hw)) {
 		device_printf(dev, "Admin Queue is down; resetting...\n");
-		ixl_teardown_hw_structs(pf);
-		ixl_rebuild_hw_structs_after_reset(pf, false);
+		(void)ixl_teardown_hw_structs(pf);
+		ret = ixl_rebuild_hw_structs_after_reset(pf, false);
+		if (ret != 0)
+			goto fail;
 	}
 
 	/* Get the latest mac address... User might use a LAA */
 	bcopy(if_getlladdr(vsi->ifp), tmpaddr, ETH_ALEN);
 	if (!ixl_ether_is_equal(hw->mac.addr, tmpaddr) &&
 	    (i40e_validate_mac_addr(tmpaddr) == I40E_SUCCESS)) {
-		ixl_del_all_vlan_filters(vsi, hw->mac.addr);
-		bcopy(tmpaddr, hw->mac.addr, ETH_ALEN);
 		ret = i40e_aq_mac_address_write(hw,
 		    I40E_AQC_WRITE_TYPE_LAA_ONLY,
-		    hw->mac.addr, NULL);
+		    tmpaddr, NULL);
 		if (ret) {
 			device_printf(dev, "LLA address change failed!!\n");
-			return;
+			goto fail;
 		}
+		ixl_del_all_vlan_filters(vsi, hw->mac.addr);
+		bcopy(tmpaddr, hw->mac.addr, ETH_ALEN);
 		/*
 		 * New filters are configured by ixl_reconfigure_filters
 		 * at the end of ixl_init_locked.
@@ -995,7 +1005,7 @@ ixl_if_init(if_ctx_t ctx)
 	/* Prepare the VSI: rings, hmc contexts, etc... */
 	if (ixl_initialize_vsi(vsi)) {
 		device_printf(dev, "initialize vsi failed!!\n");
-		return;
+		goto fail;
 	}
 
 	ixl_set_link(pf, true);
@@ -1018,7 +1028,12 @@ ixl_if_init(if_ctx_t ctx)
 	else
 		ixl_init_tx_rsqs(vsi);
 
-	ixl_enable_rings(vsi);
+	ret = ixl_enable_rings(vsi);
+	if (ret != 0) {
+		device_printf(dev, "enable rings failed: %d\n", ret);
+		ixl_disable_rings(pf, vsi, &pf->qtag);
+		goto fail;
+	}
 
 	i40e_aq_set_default_vsi(hw, vsi->seid, NULL);
 
@@ -1036,6 +1051,10 @@ ixl_if_init(if_ctx_t ctx)
 			    "initialize iwarp failed, code %d\n", ret);
 	}
 #endif
+	return;
+
+fail:
+	iflib_init_failed(ctx);
 }
 
 void
@@ -1908,6 +1927,68 @@ ixl_if_needs_restart(if_ctx_t ctx __unused, enum iflib_restart_event event)
 	}
 }
 
+static int
+ixl_if_vf_status(if_ctx_t ctx, nvlist_t *status)
+{
+	struct ixl_pf *pf;
+	nvlist_t **vfs;
+	struct ixl_vf *vf;
+	int error;
+
+	pf = iflib_get_softc(ctx);
+	if (pf->num_vfs < 1)
+		return (ENXIO);
+
+	vfs = mallocarray(pf->num_vfs, sizeof(*vfs), M_IXL,
+	    M_WAITOK | M_ZERO);
+	for (int i = 0; i < pf->num_vfs; i++) {
+		vf = &pf->vfs[i];
+		vfs[i] = nvlist_create(0);
+		nvlist_add_number(vfs[i], IFVF_STATUS_INDEX, vf->vf_num);
+		nvlist_add_bool(vfs[i], IFVF_STATUS_CONFIGURED,
+		    (vf->vf_flags & VF_FLAG_ENABLED) != 0);
+		nvlist_add_bool(vfs[i], IFVF_STATUS_INITIALIZED,
+		    (vf->vf_flags & VF_FLAG_INITIALIZED) != 0);
+		nvlist_add_binary(vfs[i], IFVF_STATUS_MAC, vf->mac,
+		    ETHER_ADDR_LEN);
+		if (vf->default_vlan == 0) {
+			nvlist_add_string(vfs[i], IFVF_STATUS_VLAN_MODE,
+			    IFVF_VLAN_MODE_TRUNK);
+			nvlist_add_number(vfs[i], IFVF_STATUS_VLAN_COUNT,
+			    vf->vsi.num_vlans);
+			nvlist_add_number(vfs[i], IFVF_STATUS_VLAN_LIMIT,
+			    IXL_VF_MAX_VLAN_FILTERS);
+		} else {
+			nvlist_add_string(vfs[i], IFVF_STATUS_VLAN_MODE,
+			    IFVF_VLAN_MODE_ACCESS);
+			nvlist_add_number(vfs[i], IFVF_STATUS_VLAN,
+			    vf->default_vlan);
+			nvlist_add_number(vfs[i], IFVF_STATUS_VLAN_COUNT, 1);
+		}
+		nvlist_add_number(vfs[i], IFVF_STATUS_NUM_QUEUES,
+		    vf->qtag.num_active);
+		nvlist_add_bool(vfs[i], IFVF_STATUS_ALLOW_SET_MAC,
+		    (vf->vf_flags & VF_FLAG_SET_MAC_CAP) != 0);
+		nvlist_add_bool(vfs[i], IFVF_STATUS_ALLOW_SET_VLAN,
+		    (vf->vf_flags & VF_FLAG_VLAN_CAP) != 0);
+		nvlist_add_bool(vfs[i], IFVF_STATUS_MAC_ANTI_SPOOF,
+		    (vf->vf_flags & VF_FLAG_MAC_ANTI_SPOOF) != 0);
+		nvlist_add_bool(vfs[i], IFVF_STATUS_ALLOW_PROMISC,
+		    (vf->vf_flags & VF_FLAG_PROMISC_CAP) != 0);
+		nvlist_add_bool(vfs[i], IFVF_STATUS_TRAFFIC_ENABLED,
+		    !vf->mdd_blocked);
+		nvlist_add_bool(vfs[i], IFVF_STATUS_MDD_BLOCKED,
+		    vf->mdd_blocked);
+	}
+	nvlist_add_nvlist_array(status, IFVF_STATUS_VFS,
+	    (const nvlist_t * const *)vfs, pf->num_vfs);
+	error = nvlist_error(status);
+	for (int i = 0; i < pf->num_vfs; i++)
+		nvlist_destroy(vfs[i]);
+	free(vfs, M_IXL);
+	return (error);
+}
+
 /*
  * Sanity check and save off tunable values.
  */
@@ -1927,6 +2008,7 @@ ixl_save_pf_tunables(struct ixl_pf *pf)
 	pf->hw.debug_mask = ixl_shared_debug_mask;
 	pf->vsi.enable_head_writeback = !!(ixl_enable_head_writeback);
 	pf->enable_vf_loopback = !!(ixl_enable_vf_loopback);
+	pf->mdd_auto_reset_vf = !!(ixl_mdd_auto_reset_vf);
 #if 0
 	pf->dynamic_rx_itr = ixl_dynamic_rx_itr;
 	pf->dynamic_tx_itr = ixl_dynamic_tx_itr;
@@ -1976,4 +2058,3 @@ ixl_save_pf_tunables(struct ixl_pf *pf)
 			pf->fc = ixl_flow_control;
 	}
 }
-

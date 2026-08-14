@@ -79,6 +79,7 @@ bool has_vector;
 bool __read_frequently has_sstc;
 bool __read_frequently has_sscofpmf;
 bool has_svpbmt;
+bool has_svinval;
 
 /* Z-extensions support. */
 bool has_zicbom;
@@ -131,6 +132,11 @@ static const struct marchid_entry sifive_marchids[] = {
 	MARCHID_END
 };
 
+static const struct marchid_entry spacemit_marchids[] = {
+	{ MARCHID_SPACEMIT_K1,	"SpacemiT(R) X60" },
+	MARCHID_END
+};
+
 /*
  * Known CPU vendor/manufacturer table.
  */
@@ -142,6 +148,7 @@ static const struct {
 	{ MVENDORID_UNIMPL,	"Unspecified",		NULL		},
 	{ MVENDORID_SIFIVE,	"SiFive",		sifive_marchids	},
 	{ MVENDORID_THEAD,	"T-Head",		NULL		},
+	{ MVENDORID_SPACEMIT,	"SpacemiT",		spacemit_marchids	},
 };
 
 /*
@@ -472,6 +479,7 @@ update_global_capabilities(u_int cpu, struct cpu_desc *desc)
 	UPDATE_CAP(has_sstc, (desc->smode_extensions & SV_SSTC) != 0);
 	UPDATE_CAP(has_sscofpmf, (desc->smode_extensions & SV_SSCOFPMF) != 0);
 	UPDATE_CAP(has_svpbmt, (desc->smode_extensions & SV_SVPBMT) != 0);
+	UPDATE_CAP(has_svinval, (desc->smode_extensions & SV_SVINVAL) != 0);
 
 	/* Z extension support. */
 	UPDATE_CAP(has_zicbom, (desc->z_extensions & Z_ZICBOM) != 0);

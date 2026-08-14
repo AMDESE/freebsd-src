@@ -167,6 +167,7 @@ int	kern_extattr_set_fp(struct thread *td, struct file *fp,
 int	kern_extattr_set_path(struct thread *td, const char *path,
 	    int attrnamespace, const char *attrname, void *data,
 	    size_t nbytes, int follow, enum uio_seg pathseg);
+int	kern_exterrctl(struct thread *td, u_int op, u_int flags, void *ptr);
 int	kern_fchmodat(struct thread *td, int fd, const char *path,
 	    enum uio_seg pathseg, mode_t mode, int flag);
 int	kern_fchownat(struct thread *td, int fd, const char *path,
@@ -176,6 +177,8 @@ int	kern_fcntl_freebsd(struct thread *td, int fd, int cmd, intptr_t arg);
 int	kern_fhopen(struct thread *td, const struct fhandle *u_fhp, int flags);
 int	kern_fhstat(struct thread *td, fhandle_t fh, struct stat *buf);
 int	kern_fhstatfs(struct thread *td, fhandle_t fh, struct statfs *buf);
+int	kern_filewrite(struct thread *td, int fd, struct file *fp,
+	    struct uio *auio, int flags, ssize_t *cntp);
 int	kern_fpathconf(struct thread *td, int fd, int name, long *valuep);
 int	kern_freebsd11_getfsstat(struct thread *td,
 	    struct freebsd11_statfs *ubuf, long bufsize, int mode);

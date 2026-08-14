@@ -292,14 +292,6 @@
     ..
     games
     ..
-    gnu
-        lib
-        ..
-        usr.bin
-            diff
-            ..
-        ..
-    ..
     include
     ..
     lib
@@ -914,6 +906,8 @@
             ..
             routing
             ..
+            wg
+            ..
         ..
         netgraph
         ..
@@ -978,6 +972,8 @@
             ..
             utimensat
             ..
+        ..
+        pmc
         ..
         posixshm
         ..

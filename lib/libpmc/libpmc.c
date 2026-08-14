@@ -58,6 +58,8 @@ static int ibs_allocate_pmc(enum pmc_event _pe, char *_ctrspec,
     struct pmc_op_pmcallocate *_pmc_config);
 static int tsc_allocate_pmc(enum pmc_event _pe, char *_ctrspec,
     struct pmc_op_pmcallocate *_pmc_config);
+static int rapl_allocate_pmc(enum pmc_event _pe, char *_ctrspec,
+    struct pmc_op_pmcallocate *_pmc_config);
 #endif
 #if defined(__arm__)
 static int armv7_allocate_pmc(enum pmc_event _pe, char *_ctrspec,
@@ -191,6 +193,11 @@ static const struct pmc_event_descr tsc_event_table[] =
 	__PMC_EV_ALIAS_TSC()
 };
 
+static const struct pmc_event_descr rapl_event_table[] =
+{
+	__PMC_EV_RAPL()
+};
+
 #undef	PMC_CLASS_TABLE_DESC
 #define	PMC_CLASS_TABLE_DESC(NAME, CLASS, EVENTS, ALLOCATOR)	\
 static const struct pmc_class_descr NAME##_class_table_descr =	\
@@ -208,6 +215,7 @@ static const struct pmc_class_descr NAME##_class_table_descr =	\
 PMC_CLASS_TABLE_DESC(k8, K8, k8, k8);
 PMC_CLASS_TABLE_DESC(ibs, IBS, ibs, ibs);
 PMC_CLASS_TABLE_DESC(tsc, TSC, tsc, tsc);
+PMC_CLASS_TABLE_DESC(rapl, RAPL, rapl, rapl);
 #endif
 #if	defined(__arm__)
 PMC_CLASS_TABLE_DESC(cortex_a8, ARMV7, cortex_a8, armv7);
@@ -879,6 +887,22 @@ tsc_allocate_pmc(enum pmc_event pe, char *ctrspec,
 
 	return (0);
 }
+
+static int
+rapl_allocate_pmc(enum pmc_event pe, char *ctrspec,
+    struct pmc_op_pmcallocate *pmc_config)
+{
+	if (pe < PMC_EV_RAPL_FIRST || pe > PMC_EV_RAPL_LAST)
+		return (-1);
+
+	/* RAPL events must be unqualified. */
+	if (ctrspec != NULL && *ctrspec != '\0')
+		return (-1);
+
+	pmc_config->pm_caps |= PMC_CAP_READ;
+
+	return (0);
+}
 #endif
 
 static struct pmc_event_alias generic_aliases[] = {
@@ -1327,6 +1351,98 @@ out:
 }
 
 int
+pmc_allocate_group(const char *ctrspec, enum pmc_mode mode, uint32_t flags,
+    int cpu, pmc_id_t *pmcid, uint64_t count)
+{
+	return (pmc_allocate(ctrspec, mode, flags | PMC_F_GROUP_DEFER, cpu,
+	    pmcid, count));
+}
+
+int
+pmc_group_create(uint32_t *groupid)
+{
+	struct pmc_op_pmcgroupcreate args;
+	int rv;
+
+	if (groupid == NULL) {
+		errno = EINVAL;
+		return (-1);
+	}
+	bzero(&args, sizeof(args));
+	rv = PMC_CALL(PMC_OP_PMCGROUPCREATE, &args);
+	if (rv == 0)
+		*groupid = args.pm_groupid;
+	return (rv);
+}
+
+int
+pmc_group_add(uint32_t groupid, pmc_id_t pmcid, int leader)
+{
+	struct pmc_op_pmcgroupadd args;
+
+	bzero(&args, sizeof(args));
+	args.pm_groupid = groupid;
+	args.pm_pmcid = pmcid;
+	if (leader)
+		args.pm_flags = PMC_GROUP_F_LEADER;
+	return (PMC_CALL(PMC_OP_PMCGROUPADD, &args));
+}
+
+int
+pmc_group_commit(uint32_t groupid)
+{
+	struct pmc_op_pmcgroupcommit args;
+
+	bzero(&args, sizeof(args));
+	args.pm_groupid = groupid;
+	return (PMC_CALL(PMC_OP_PMCGROUPCOMMIT, &args));
+}
+
+/*
+ * Convenience: release a sequence of grouped pmc ids.  Kept lib-side
+ * so callers do not have to track sibling ids individually; the
+ * kernel side has already wired pmu_group_on_release into
+ * pmc_release_pmc_descriptor.
+ */
+int
+pmc_group_release(pmc_id_t *pmcids, size_t n)
+{
+	size_t i;
+	int last_err = 0;
+
+	for (i = 0; i < n; i++)
+		if (pmc_release(pmcids[i]) != 0)
+			last_err = -1;
+	return (last_err);
+}
+
+/*
+ * Advanced reader: returns the (scaled) value plus the time_enabled
+ * and time_running ratios used by the kernel to scale a multiplexed
+ * event.  Until the kernel exports the ratios in pmc_op_pmcrw,
+ * *enabled and *running are populated with zero and pmc_read() returns
+ * the already-scaled value; callers that want explicit scaling factors
+ * should treat unsupported (0,0) as "scaling not available".
+ */
+int
+pmc_read_pair(pmc_id_t pmc, pmc_value_t *value, uint64_t *enabled,
+    uint64_t *running)
+{
+	int rv;
+
+	if (value == NULL) {
+		errno = EINVAL;
+		return (-1);
+	}
+	rv = pmc_read(pmc, value);
+	if (enabled != NULL)
+		*enabled = 0;
+	if (running != NULL)
+		*running = 0;
+	return (rv);
+}
+
+int
 pmc_attach(pmc_id_t pmc, pid_t pid)
 {
 	struct pmc_op_pmcattach pmc_attach_args;
@@ -1434,6 +1550,10 @@ pmc_event_names_of_class(enum pmc_class cl, const char ***eventnames,
 	case PMC_CLASS_TSC:
 		ev = tsc_event_table;
 		count = PMC_EVENT_TABLE_SIZE(tsc);
+		break;
+	case PMC_CLASS_RAPL:
+		ev = rapl_event_table;
+		count = PMC_EVENT_TABLE_SIZE(rapl);
 		break;
 	case PMC_CLASS_K8:
 		ev = k8_event_table;
@@ -1641,6 +1761,10 @@ pmc_init(void)
 #if defined(__amd64__) || defined(__i386__)
 		case PMC_CLASS_TSC:
 			pmc_class_table[n++] = &tsc_class_table_descr;
+			break;
+
+		case PMC_CLASS_RAPL:
+			pmc_class_table[n++] = &rapl_class_table_descr;
 			break;
 
 		case PMC_CLASS_K8:
@@ -1915,6 +2039,9 @@ _pmc_name_of_event(enum pmc_event pe, enum pmc_cputype cpu)
 	} else if (pe == PMC_EV_TSC_TSC) {
 		ev = tsc_event_table;
 		evfence = tsc_event_table + PMC_EVENT_TABLE_SIZE(tsc);
+	} else if (pe >= PMC_EV_RAPL_FIRST && pe <= PMC_EV_RAPL_LAST) {
+		ev = rapl_event_table;
+		evfence = rapl_event_table + PMC_EVENT_TABLE_SIZE(rapl);
 	} else if ((int)pe >= PMC_EV_SOFT_FIRST && (int)pe <= PMC_EV_SOFT_LAST) {
 		ev = soft_event_table;
 		evfence = soft_event_table + soft_event_info.pm_nevent;

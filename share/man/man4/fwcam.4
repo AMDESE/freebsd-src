@@ -3,7 +3,7 @@
 .\"
 .\" SPDX-License-Identifier: BSD-2-Clause
 .\"
-.Dd June 19, 2026
+.Dd July 27, 2026
 .Dt FWCAM 4
 .Os
 .Sh NAME
@@ -11,19 +11,34 @@
 .Nd IIDC FireWire digital camera driver
 .Sh SYNOPSIS
 .Cd "device firewire"
+.Cd "device video"
 .Cd "device fwcam"
 .Sh DESCRIPTION
 The
 .Nm
 driver provides support for IIDC (Instrumentation and Industrial Digital
-Camera) v1.30 cameras attached via IEEE 1394 (FireWire).
+Camera) v1.04/v1.20/v1.30 cameras attached via IEEE 1394 (FireWire).
 .Pp
-Video frames are received over an isochronous DMA channel and exposed
-through a character device.
-Applications read raw frames from
-.Pa /dev/fwcamX
-and configure the camera via
-.Xr ioctl 2 .
+The driver attaches to unit directories in the device CSR configuration ROM
+with
+.Va unit_spec_id
+0x00a02d (1394 Trade Association) and
+.Va unit_sw_version
+matching IIDC v1.04, v1.20, or v1.30.
+The IIDC command base address is located within the unit directory
+or a nested logical unit directory.
+.Pp
+Camera hardware probing is deferred until the device is first opened.
+This avoids bus resets on controllers where early register access
+destabilizes the link.
+.Pp
+Video frames are received over an isochronous DMA channel and delivered
+through the
+.Xr video 4
+framework.
+Applications access the camera via
+.Pa /dev/videoN
+using the V4L2 interface.
 .Pp
 The driver supports Format_0 (VGA non-compressed) video with the
 following modes:
@@ -96,14 +111,16 @@ Can be set as a tunable in
 .Xr loader.conf 5 .
 .El
 .Sh FILES
-.Bl -tag -width "/dev/fwcamX" -compact
-.It Pa /dev/fwcamX
-Camera character device.
-Read to obtain raw video frames.
+.Bl -tag -width "/dev/videoN" -compact
+.It Pa /dev/videoN
+Video capture device provided by the
+.Xr video 4
+framework.
 .El
 .Sh SEE ALSO
 .Xr firewire 4 ,
-.Xr fwohci 4
+.Xr fwohci 4 ,
+.Xr video 4
 .Pp
 IIDC 1394-based Digital Camera Specification v1.30,
 1394 Trade Association Document 1999023.

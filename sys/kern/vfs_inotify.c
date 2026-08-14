@@ -563,7 +563,7 @@ inotify_overflow_event(struct inotify_event *evp)
 }
 
 /*
- * Put an event record on the queue for an inotify desscriptor.  Return false if
+ * Put an event record on the queue for an inotify descriptor.  Return false if
  * the record was not enqueued for some reason, true otherwise.
  */
 static bool
@@ -627,14 +627,13 @@ inotify_log_one(struct inotify_watch *watch, const char *name, size_t namelen,
 	if (!notify && !delete && !unmount)
 		return;
 
+	allocfail = false;
 	if (notify || unmount) {
 		rec = inotify_alloc_record(watch->wd, name, namelen, event,
 		    cookie, M_NOWAIT);
 		if (rec == NULL) {
 			rec = &sc->overflow;
 			allocfail = true;
-		} else {
-			allocfail = false;
 		}
 	} else {
 		rec = NULL;

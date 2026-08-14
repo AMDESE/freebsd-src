@@ -6,7 +6,7 @@
 .\" Konstantin Belousov <kib@FreeBSD.org> under sponsorship
 .\" from the FreeBSD Foundation.
 .\"
-.Dd November 5, 2025
+.Dd August 3, 2026
 .Dt EXTERROR 9
 .Os
 .Sh NAME
@@ -14,6 +14,7 @@
 .Nd provide extended error information to userspace
 .Sh SYNOPSIS
 .Bd -literal -offset left -compact
+#define EXTERR_CATEGORY_DYNAMIC "path/to/this/file.c"
 #define	EXTERR_CATEGORY EXTERR_CAT_MYCATEGORY
 .Ed
 .In sys/exterrvar.h
@@ -56,7 +57,13 @@ is to make it easier for a user to identify the cause of the error.
 Before
 .Nm
 can be used in the given source .c file, the category of extended errors
-should be allocated in the
+must be defined.
+This can be done by setting the
+.Va EXTERR_CATEGORY_DYNAMIC
+macro to a string containing the name of the file relative to
+.Pa src/sys
+directory.
+Alternatively, an entry may be allocated in the
 .In sys/exterr_cat.h
 file.
 The category is the unique integer, that, together with the source
@@ -171,6 +178,17 @@ were modified to print the extended information if it is available
 in addition to the usual
 .Va errno
 decoding.
+.Pp
+Kernels built with the
+.Cd option EXTERR_STRINGS
+advertise the
+.Va kern.features.exterr_strings
+.Xr sysctl 8
+variable, see
+.Xr feature_present 3 ,
+indicating that the reported errors include the descriptive message strings.
+Without it, only the numeric information (error code, category,
+source line number and parameters) is available.
 .Sh ASYNCHRONOUS INPUT/OUTPUT
 Due to the nature of the
 .Fx

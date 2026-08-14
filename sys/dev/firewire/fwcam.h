@@ -53,6 +53,13 @@
 #define IIDC_ONE_SHOT		0x61C
 #define IIDC_MEM_SAVE_CH	0x620
 #define IIDC_CUR_MEM_CH		0x624
+#define IIDC_VMODE_ERR_STATUS	0x628
+
+/* Cur_V_Format / Cur_V_Mode / Cur_V_Frm_Rate register fields */
+#define IIDC_CUR_V_SHIFT	29		/* bits [0..2] */
+
+/* Vmode_Error_Status register */
+#define IIDC_VMODE_ERROR	(1 << 31)	/* bit [0]: mode error */
 
 /* Section 1.7 - Status and control register for features */
 #define IIDC_BRIGHTNESS		0x800
@@ -128,17 +135,6 @@
  * Mode_2: 640x480 YUV411 = 460,800 bytes
  * Mode_3: 640x480 YUV422 = 614,400 bytes
  */
-/*
- * ioctl interface
- */
-struct fwcam_mode {
-	uint8_t		format;		/* IIDC video format (0-7) */
-	uint8_t		mode;		/* IIDC video mode (0-7) */
-	uint8_t		framerate;	/* IIDC frame rate (0-7) */
-	uint8_t		_pad;
-	uint32_t	frame_size;	/* computed frame size in bytes (read-only) */
-};
-
 struct fwcam_feature {
 	uint32_t	id;		/* FWCAM_FEAT_* */
 	uint32_t	flags;		/* FWCAM_FEATF_* (from INQ, read-only) */
@@ -173,32 +169,31 @@ struct fwcam_feature {
 #define FWCAM_FEATF_AUTO	(1 << 2)  /* supports auto mode */
 #define FWCAM_FEATF_MANUAL	(1 << 3)  /* supports manual mode */
 
-struct fwcam_info {
-	uint32_t	formats;	/* V_FORMAT_INQ bitmask */
-	uint32_t	basic_func;	/* BASIC_FUNC_INQ */
-	uint32_t	features_hi;	/* FEATURE_HI_INQ */
-	uint32_t	features_lo;	/* FEATURE_LO_INQ */
-	uint8_t		cur_format;
-	uint8_t		cur_mode;
-	uint8_t		cur_framerate;
-	uint8_t		state;		/* FWCAM_STATE_* */
-	uint32_t	frame_size;
-	uint32_t	frame_dropped;
-	uint8_t		iso_channel;	/* active ISO receive channel */
-	uint8_t		_pad[3];
-};
-
-#define FWCAM_GMODE	_IOR('C', 1, struct fwcam_mode)
-#define FWCAM_SMODE	_IOWR('C', 2, struct fwcam_mode)
-#define FWCAM_GFEAT	_IOWR('C', 3, struct fwcam_feature)
-#define FWCAM_SFEAT	_IOW('C', 4, struct fwcam_feature)
-#define FWCAM_GINFO	_IOR('C', 5, struct fwcam_info)
-
-/* fwcam state values (visible to userland via fwcam_info.state) */
+/* fwcam state values */
 #define FWCAM_STATE_IDLE	0
-#define FWCAM_STATE_PROBED	1
-#define FWCAM_STATE_STREAMING	2
-#define FWCAM_STATE_DETACHING	3
+#define FWCAM_STATE_PROBING	1
+#define FWCAM_STATE_PROBED	2
+#define FWCAM_STATE_STREAMING	3
+#define FWCAM_STATE_DETACHING	4
+
+static const char * const fwcam_feat_names[FWCAM_FEAT_MAX] = {
+	[FWCAM_FEAT_BRIGHTNESS]    = "brightness",
+	[FWCAM_FEAT_AUTO_EXPOSURE] = "auto_exposure",
+	[FWCAM_FEAT_SHARPNESS]     = "sharpness",
+	[FWCAM_FEAT_WHITE_BALANCE] = "white_balance",
+	[FWCAM_FEAT_HUE]           = "hue",
+	[FWCAM_FEAT_SATURATION]    = "saturation",
+	[FWCAM_FEAT_GAMMA]         = "gamma",
+	[FWCAM_FEAT_SHUTTER]       = "shutter",
+	[FWCAM_FEAT_GAIN]          = "gain",
+	[FWCAM_FEAT_IRIS]          = "iris",
+	[FWCAM_FEAT_FOCUS]         = "focus",
+	[FWCAM_FEAT_TEMPERATURE]   = "temperature",
+	[FWCAM_FEAT_TRIGGER]       = "trigger",
+	[FWCAM_FEAT_ZOOM]          = "zoom",
+	[FWCAM_FEAT_PAN]           = "pan",
+	[FWCAM_FEAT_TILT]          = "tilt",
+};
 
 /*
  * Internal constants
@@ -208,10 +203,16 @@ struct fwcam_info {
 #define FWCAM_ISO_PKTSIZE	2048	/* max iso packet size (MCLBYTES) */
 
 #ifdef _KERNEL
+
+struct video_device;
+
 struct fwcam_softc {
 	struct firewire_dev_comm fd;	/* must be first */
 	struct mtx		mtx;
-	struct cdev		*cdev;
+
+	/* video(4) framework handle */
+	struct video_device	*sc_vd;
+	uint32_t		sc_sequence;
 
 	/* Remote camera node */
 	struct fw_device	*fwdev;
@@ -225,6 +226,8 @@ struct fwcam_softc {
 	uint32_t		basic_func;	/* BASIC_FUNC_INQ */
 	uint32_t		features_hi;	/* FEATURE_HI_INQ */
 	uint32_t		features_lo;	/* FEATURE_LO_INQ */
+	uint32_t		modes[8];	/* V_MODE_INQ per format */
+	uint32_t		rates[8][8];	/* V_RATE_INQ per format/mode */
 
 	/* Current settings */
 	uint8_t			cur_format;
@@ -240,16 +243,11 @@ struct fwcam_softc {
 	int			dma_ch;		/* IR DMA channel, -1 if none */
 	int			iso_active;	/* iso_input running */
 
-	/* Frame assembly (double buffer) */
+	/* Frame assembly */
 	uint8_t			*frame_buf;	/* frame being assembled */
-	uint8_t			*read_buf;	/* completed frame for read() */
 	uint32_t		frame_size;	/* expected frame size (bytes) */
 	uint32_t		frame_offset;	/* write position in frame_buf */
-	int			frame_ready;	/* read_buf has valid frame */
-	int			read_in_progress; /* uiomove active on read_buf */
 	int			frame_dropped;	/* dropped frame count */
-	int			open_count;	/* cdev open count */
-	struct selinfo		rsel;		/* poll/select/kqueue */
 
 	/* State: one of FWCAM_STATE_* */
 	int			state;

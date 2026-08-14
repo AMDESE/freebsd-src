@@ -128,6 +128,7 @@ enum ixgbe_pfvf_api_rev {
 	/* API 1.4 is being used in the upstream for IPsec */
 	ixgbe_mbox_api_14,	/* API version 1.4, linux/freebsd VF driver */
 	ixgbe_mbox_api_15,	/* API version 1.5, linux/freebsd VF driver */
+	ixgbe_mbox_api_16,	/* API version 1.6, linux/freebsd VF driver */
 	/* This value should always be last */
 	ixgbe_mbox_api_unknown,	/* indicates that API version is not known */
 };
@@ -196,6 +197,7 @@ s32 ixgbe_check_for_msg(struct ixgbe_hw *hw, u16 mbx_id);
 s32 ixgbe_check_for_ack(struct ixgbe_hw *hw, u16 mbx_id);
 s32 ixgbe_check_for_rst(struct ixgbe_hw *hw, u16 mbx_id);
 s32 ixgbe_clear_mbx(struct ixgbe_hw *hw, u16 vf_number);
+s32 ixgbe_force_clear_mbx_pf(struct ixgbe_hw *hw, u16 vf_number);
 void ixgbe_init_mbx_params_vf(struct ixgbe_hw *hw);
 void ixgbe_upgrade_mbx_params_vf(struct ixgbe_hw *hw);
 void ixgbe_init_mbx_params_pf(struct ixgbe_hw *hw);
