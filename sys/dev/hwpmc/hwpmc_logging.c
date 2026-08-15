@@ -920,7 +920,7 @@ pmclog_process_callchain(struct pmc *pm, struct pmc_sample *ps)
 	PMCLOG_RESERVE_SAFE(po, PMCLOG_TYPE_CALLCHAIN, recordlen, ps->ps_tsc);
 	PMCLOG_EMIT32(ps->ps_pid);
 	PMCLOG_EMIT32(ps->ps_tid);
-	PMCLOG_EMIT32(pm->pm_id);
+	PMCLOG_EMIT32(pm->pm_handle);
 	PMCLOG_EMIT32(flags);
 	for (n = 0; n < ps->ps_nsamples; n++)
 		PMCLOG_EMITADDR(ps->ps_pc[n]);
@@ -990,7 +990,7 @@ pmclog_process_pmcallocate(struct pmc *pm)
 	if (PMC_TO_CLASS(pm) == PMC_CLASS_SOFT) {
 		PMCLOG_RESERVE(po, PMCLOG_TYPE_PMCALLOCATEDYN,
 		    sizeof(struct pmclog_pmcallocatedyn));
-		PMCLOG_EMIT32(pm->pm_id);
+		PMCLOG_EMIT32(pm->pm_handle);
 		PMCLOG_EMIT32(pm->pm_event);
 		PMCLOG_EMIT32(pm->pm_flags);
 		PMCLOG_EMIT32(0);
@@ -1005,7 +1005,7 @@ pmclog_process_pmcallocate(struct pmc *pm)
 	} else {
 		PMCLOG_RESERVE(po, PMCLOG_TYPE_PMCALLOCATE,
 		    sizeof(struct pmclog_pmcallocate));
-		PMCLOG_EMIT32(pm->pm_id);
+		PMCLOG_EMIT32(pm->pm_handle);
 		PMCLOG_EMIT32(pm->pm_event);
 		PMCLOG_EMIT32(pm->pm_flags);
 		PMCLOG_EMIT32(0);
@@ -1028,7 +1028,7 @@ pmclog_process_pmcattach(struct pmc *pm, pid_t pid, char *path)
 	recordlen = offsetof(struct pmclog_pmcattach, pl_pathname) + pathlen;
 
 	PMCLOG_RESERVE(po, PMCLOG_TYPE_PMCATTACH, recordlen);
-	PMCLOG_EMIT32(pm->pm_id);
+	PMCLOG_EMIT32(pm->pm_handle);
 	PMCLOG_EMIT32(pid);
 	PMCLOG_EMITSTRING(path, pathlen);
 	PMCLOG_DESPATCH_SYNC(po);
@@ -1045,7 +1045,7 @@ pmclog_process_pmcdetach(struct pmc *pm, pid_t pid)
 
 	PMCLOG_RESERVE(po, PMCLOG_TYPE_PMCDETACH,
 	    sizeof(struct pmclog_pmcdetach));
-	PMCLOG_EMIT32(pm->pm_id);
+	PMCLOG_EMIT32(pm->pm_handle);
 	PMCLOG_EMIT32(pid);
 	PMCLOG_DESPATCH_SYNC(po);
 }
@@ -1090,7 +1090,7 @@ pmclog_process_proccsw(struct pmc *pm, struct pmc_process *pp, pmc_value_t v, st
 	PMCLOG_RESERVE_SAFE(po, PMCLOG_TYPE_PROCCSW,
 	    sizeof(struct pmclog_proccsw), pmc_rdtsc());
 	PMCLOG_EMIT64(v);
-	PMCLOG_EMIT32(pm->pm_id);
+	PMCLOG_EMIT32(pm->pm_handle);
 	PMCLOG_EMIT32(pp->pp_proc->p_pid);
 	PMCLOG_EMIT32(td->td_tid);
 	PMCLOG_EMIT32(0);
@@ -1134,7 +1134,7 @@ pmclog_process_procexit(struct pmc *pm, struct pmc_process *pp)
 
 	PMCLOG_RESERVE(po, PMCLOG_TYPE_PROCEXIT,
 	    sizeof(struct pmclog_procexit));
-	PMCLOG_EMIT32(pm->pm_id);
+	PMCLOG_EMIT32(pm->pm_handle);
 	PMCLOG_EMIT32(pp->pp_proc->p_pid);
 	PMCLOG_EMIT64(pp->pp_pmcs[ri].pp_pmcval);
 	PMCLOG_DESPATCH(po);

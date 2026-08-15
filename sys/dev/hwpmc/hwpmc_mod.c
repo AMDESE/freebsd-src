@@ -1706,7 +1706,7 @@ pmc_process_exec(struct thread *td, struct pmckern_procexec *pk)
 		po = pm->pm_owner;
 		if (po->po_sscount == 0 &&
 		    (po->po_flags & PMC_PO_OWNS_LOGFILE) != 0) {
-			pmclog_process_procexec(po, pm->pm_id, p->p_pid,
+			pmclog_process_procexec(po, pm->pm_handle, p->p_pid,
 			    pk->pm_baseaddr, pk->pm_dynaddr, fullpath);
 		}
 	}
@@ -4645,6 +4645,7 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 
 	/* Fill in the correct value in the ID field. */
 	pmc->pm_id = PMC_ID_MAKE_ID(cpu, mode, class, n);
+	pmc->pm_handle = pmc->pm_id;
 
 	PMCDBG5(PMC,ALL,2, "ev=%d class=%d mode=%d n=%d -> pmcid=%x",
 	    pmc->pm_event, class, mode, n, pmc->pm_id);
@@ -4708,11 +4709,7 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 		return (EXTERROR(error, "Failed to register PMC owner"));
 	}
 
-	/*
-	 * Return the allocated index.  Non-deferred PMCs use pm_id as
-	 * their stable handle.
-	 */
-	pmc->pm_handle = pmc->pm_id;
+	/* Return the allocated index. */
 	pa->pm_pmcid = pmc->pm_handle;
 	return (0);
 }
