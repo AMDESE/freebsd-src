@@ -29,7 +29,7 @@ CFLAGS+=	-O -g -Wall
 
 # Kernel ABI tests (need hwpmc(4) loaded and root to run).
 KTESTS=		pmc_group_test pmc_mux_test pmc_mux_works_test \
-		pmc_mux_drain_test
+		pmc_mux_drain_test pmc_mux_rotation_test
 
 # Userland-only test (parser unit test, no PMU access).
 UTESTS=		test_libpmcstat_group
@@ -47,6 +47,9 @@ pmc_mux_test: ${.CURDIR}/pmc_mux_test.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
 
 pmc_mux_works_test: ${.CURDIR}/pmc_mux_works_test.c
+	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
+
+pmc_mux_rotation_test: ${.CURDIR}/pmc_mux_rotation_test.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
 
 # Reproduces the multiplex switch-off drain wedge; needs -lpthread for
@@ -72,6 +75,8 @@ check-root: ${KTESTS}
 	./pmc_mux_test
 	@echo "==> pmc_mux_works_test"
 	./pmc_mux_works_test
+	@echo "==> pmc_mux_rotation_test"
+	./pmc_mux_rotation_test
 	@echo "==> pmc_mux_drain_test"
 	./pmc_mux_drain_test
 	@if [ -r ${.CURDIR}/pmcstat_test.sh ]; then \
