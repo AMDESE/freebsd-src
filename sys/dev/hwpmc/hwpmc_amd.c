@@ -805,8 +805,18 @@ amd_start_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
 	 */
 	if (pd->pm_subclass == PMC_AMD_SUB_CLASS_CORE &&
 	    PMC_IS_SAMPLING_MODE(mode) &&
-	    (rdmsr(AMD_PMC_GLOBAL_STATUS) & (1ULL << ri)) != 0)
+	    (rdmsr(AMD_PMC_GLOBAL_STATUS) & (1ULL << ri)) != 0) {
 		wrmsr(AMD_PMC_GLOBAL_STATUS_CLR, 1ULL << ri);
+
+		/*
+		 * That NMI may still be in flight.  With no status bit
+		 * left to claim it, amd_intr_v2() would return 0 and the
+		 * NMI would go unhandled (machdep.panic_on_nmi), so leave
+		 * the stray absorber one credit on this CPU.
+		 */
+		if (DPCPU_GET(nmi_counter) == 0)
+			DPCPU_SET(nmi_counter, 1);
+	}
 
 	/* enable EVSEL while virtual slot global bit off */
 	config = pm->pm_md.pm_amd.pm_amd_evsel | AMD_PMC_ENABLE;
