@@ -922,10 +922,11 @@ pmu_group_on_start(struct pmc *pm)
  *      behaviour and lets a subsequent pmc_start re-run the group
  *      with the same row assignments.
  *
- * The rotation kthread skips stopped groups (it gates on
- * pg_running == true), so a stopped group does not get evicted as
- * a victim.  Final HW row release happens in pmu_group_on_release
- * which always runs under sx_xlock.
+ * A stopped-but-placed MUX group remains a valid rotation victim,
+ * so its idle rows can be reclaimed when a deferred running group
+ * needs them; restart then re-places it via pmu_pp_schedule_in.
+ * Final HW row release happens in pmu_group_on_release which always
+ * runs under sx_xlock.
  */
 void
 pmu_group_on_stop(struct pmc *pm)
@@ -1441,9 +1442,9 @@ pmu_pp_kick_after_exec(struct pmc_process *pp)
 }
 
 /*
- * Rows currently held by the list's placed running MUX groups --
- * everything rotation could evict -- as the global-ri mask the
- * satisfiability probe consumes.
+ * Rows currently held by the list's placed MUX groups, running or
+ * stopped -- everything rotation could evict -- as the global-ri mask
+ * the satisfiability probe consumes.
  */
 static uint64_t
 pmu_list_evictable_rows(struct pmu_group_list *gl)
@@ -1455,7 +1456,7 @@ pmu_list_evictable_rows(struct pmu_group_list *gl)
 
 	evictable = 0;
 	LIST_FOREACH(pg, gl, pg_proc_next) {
-		if (!pg->pg_running || !pg->pg_assigned || !pg->pg_defer_ok)
+		if (!pg->pg_assigned || !pg->pg_defer_ok)
 			continue;
 		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 			n = PMC_TO_ROWINDEX(pe->pe_pmc);
@@ -1467,9 +1468,10 @@ pmu_list_evictable_rows(struct pmu_group_list *gl)
 }
 
 /*
- * Next placed running MUX group at or after *vpg, wrapping over the
- * list until *vseen reaches ngroups.  Pinned (non-MUX), unplaced and
- * stopped groups are passed over without being counted as victims.
+ * Next placed MUX group at or after *vpg, wrapping over the list
+ * until *vseen reaches ngroups.  Pinned (non-MUX) and unplaced groups
+ * are passed over without being counted as victims; stopped-but-placed
+ * MUX groups are eligible so their idle rows can be reclaimed.
  * Advances the scan state so successive calls continue the same wrap
  * (the escalation path in the rotation ticks relies on this).
  */
@@ -1485,7 +1487,7 @@ pmu_list_next_victim(struct pmu_group_list *gl, pmu_group_t **vpg,
 			pg = LIST_FIRST(gl);
 		(*vseen)++;
 		*vpg = LIST_NEXT(pg, pg_proc_next);
-		if (pg->pg_assigned && pg->pg_running && pg->pg_defer_ok)
+		if (pg->pg_assigned && pg->pg_defer_ok)
 			return (pg);
 	}
 	return (NULL);
