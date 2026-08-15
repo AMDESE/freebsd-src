@@ -339,6 +339,29 @@ The first two groups consume 5 of 6 counters, leaving 1.
 The third group is then committed in multiplex mode so its 3 events
 rotate through the remaining slot rather than failing with
 .Er ENOSPC .
+.Pp
+While a group is being multiplexed its counting-mode columns show
+.Em scaled estimates
+(interval count scaled by the group's enabled/running time ratio),
+and the group's hardware residency for the interval is appended in a
+trailing
+.Ql res%
+column that stays blank while the group is fully resident:
+.Bd -literal -offset indent
+# p/instructions p/unhalted-cycles p/branches    res%
+        24000210          51003001      92010   50.2%
+   <not counted>     <not counted> <not counted>   0.0%
+        23890110          50700323      91500
+.Ed
+.Pp
+An interval in which the group never reached hardware prints
+.Ql <not counted>
+for every member; when residency falls below 1/10
+.Pq Dv PMC_SCALE_MAX
+the raw interval count is shown instead of an extrapolated estimate.
+With
+.Fl C ,
+cumulative values are running sums of the per-interval estimates.
 .It Fl c Ar cpu-spec
 Set the cpus for subsequent system mode PMCs specified on the
 command line to

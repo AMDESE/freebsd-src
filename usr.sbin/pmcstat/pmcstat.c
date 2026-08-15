@@ -276,17 +276,29 @@ pmcstat_start_pmcs(void)
 	}
 }
 
+/*
+ * Width of the per-group trailing residency column (spec section 5.3);
+ * blank while the group is fully resident so scrapers see stable rows.
+ */
+#define	PRINT_RESIDENCY_WIDTH	8
+
 void
 pmcstat_print_headers(void)
 {
 	struct pmcstat_ev *ev;
-	int c, w;
+	int c, gid, w;
 
 	(void) fprintf(args.pa_printfile, PRINT_HEADER_PREFIX);
 
+	gid = 0;
 	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
 		if (PMC_IS_SAMPLING_MODE(ev->ev_mode))
 			continue;
+
+		if (gid != 0 && ev->ev_groupid != gid)
+			(void) fprintf(args.pa_printfile, "%*s",
+			    PRINT_RESIDENCY_WIDTH, "res%");
+		gid = ev->ev_groupid;
 
 		c = PMC_IS_SYSTEM_MODE(ev->ev_mode) ? 's' : 'p';
 
@@ -302,18 +314,42 @@ pmcstat_print_headers(void)
 			(void) fprintf(args.pa_printfile, "p/%*s ", w,
 			    ev->ev_name);
 	}
+	if (gid != 0)
+		(void) fprintf(args.pa_printfile, "%*s",
+		    PRINT_RESIDENCY_WIDTH, "res%");
 
 	(void) fflush(args.pa_printfile);
+}
+
+static void
+pmcstat_print_residency(int have_times, double residency)
+{
+
+	if (have_times && residency < 100.0)
+		(void) fprintf(args.pa_printfile, " %6.1f%%", residency);
+	else
+		(void) fprintf(args.pa_printfile, "%*s",
+		    PRINT_RESIDENCY_WIDTH, "");
 }
 
 void
 pmcstat_print_counters(void)
 {
-	int extra_width;
+	struct pmc_group_member members[PMC_GROUP_MAX_MEMBERS];
+	struct pmc_group_times times;
 	struct pmcstat_ev *ev;
 	pmc_value_t value;
+	uint64_t d_enabled, d_running, d_value, estimate;
+	double residency;
+	uint32_t i, nmembers;
+	int extra_width, found, gid, have_times, width;
 
 	extra_width = sizeof(PRINT_HEADER_PREFIX) - 1;
+	gid = 0;
+	have_times = 0;
+	nmembers = 0;
+	d_enabled = d_running = 0;
+	residency = 100.0;
 
 	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
 
@@ -321,19 +357,92 @@ pmcstat_print_counters(void)
 		if (PMC_IS_SAMPLING_MODE(ev->ev_mode))
 			continue;
 
-		if (pmc_read(ev->ev_pmcid, &value) < 0)
+		/* close the previous group's trailing residency column */
+		if (gid != 0 && ev->ev_groupid != gid) {
+			pmcstat_print_residency(have_times, residency);
+			gid = 0;
+		}
+
+		width = ev->ev_fieldwidth + extra_width;
+		extra_width = 0;
+
+		if (ev->ev_groupid == 0) {
+			if (pmc_read(ev->ev_pmcid, &value) < 0)
+				err(EX_OSERR,
+				    "ERROR: Cannot read pmc \"%s\"",
+				    ev->ev_name);
+
+			(void) fprintf(args.pa_printfile, "%*ju ", width,
+			    (uintmax_t) ev->ev_cumulative ? value :
+			    (value - ev->ev_saved));
+
+			if (ev->ev_cumulative == 0)
+				ev->ev_saved = value;
+			continue;
+		}
+
+		/* one snapshot per leader per interval (spec section 5.3) */
+		if (ev->ev_is_leader) {
+			gid = ev->ev_groupid;
+			nmembers = PMC_GROUP_MAX_MEMBERS;
+			if (pmc_group_read(ev->ev_pmcid, &nmembers,
+			    members, &times) == 0) {
+				have_times = 1;
+				d_enabled = times.pgt_enabled -
+				    ev->ev_prev_enabled;
+				d_running = times.pgt_running -
+				    ev->ev_prev_running;
+				ev->ev_prev_enabled = times.pgt_enabled;
+				ev->ev_prev_running = times.pgt_running;
+			} else {
+				have_times = 0;
+				nmembers = 0;
+			}
+			residency = (have_times && d_enabled != 0) ?
+			    100.0 * (double)d_running / (double)d_enabled :
+			    100.0;
+		}
+
+		found = 0;
+		value = 0;
+		for (i = 0; i < nmembers; i++) {
+			if (members[i].pm_pmcid == ev->ev_pmcid) {
+				value = members[i].pm_value;
+				found = 1;
+				break;
+			}
+		}
+		if (!found && pmc_read(ev->ev_pmcid, &value) < 0)
 			err(EX_OSERR, "ERROR: Cannot read pmc \"%s\"",
 			    ev->ev_name);
 
-		(void) fprintf(args.pa_printfile, "%*ju ",
-		    ev->ev_fieldwidth + extra_width,
-		    (uintmax_t) ev->ev_cumulative ? value :
-		    (value - ev->ev_saved));
+		d_value = value - ev->ev_saved;
+		ev->ev_saved = value;
 
-		if (ev->ev_cumulative == 0)
-			ev->ev_saved = value;
-		extra_width = 0;
+		/* scale per spec section 4.4 */
+		if (!have_times) {
+			(void) fprintf(args.pa_printfile, "%*ju ", width,
+			    (uintmax_t) ev->ev_cumulative ? value : d_value);
+		} else if (d_enabled == 0) {
+			(void) fprintf(args.pa_printfile, "%*s ", width,
+			    "<not enabled>");
+		} else if (d_running == 0) {
+			(void) fprintf(args.pa_printfile, "%*s ", width,
+			    "<not counted>");
+		} else {
+			if (d_enabled > (uint64_t)PMC_SCALE_MAX * d_running)
+				estimate = d_value; /* refuse to extrapolate */
+			else
+				estimate = (uint64_t)((long double)d_value *
+				    d_enabled / d_running);
+			ev->ev_scaled_sum += estimate;
+			(void) fprintf(args.pa_printfile, "%*ju ", width,
+			    (uintmax_t) (ev->ev_cumulative ?
+			    ev->ev_scaled_sum : estimate));
+		}
 	}
+	if (gid != 0)
+		pmcstat_print_residency(have_times, residency);
 
 	(void) fflush(args.pa_printfile);
 }

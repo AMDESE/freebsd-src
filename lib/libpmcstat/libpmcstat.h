@@ -77,6 +77,9 @@ struct pmcstat_ev {
 	char	       *ev_spec;  /* event specification */
 	int		ev_groupid; /* 0 = no group, >0 = syntactic group id */
 	int		ev_is_leader; /* 1 if leader of its group */
+	uint64_t	ev_prev_enabled; /* leader: prior snapshot times */
+	uint64_t	ev_prev_running;
+	uint64_t	ev_scaled_sum; /* -C: sum of interval estimates */
 };
 
 struct pmcstat_target {

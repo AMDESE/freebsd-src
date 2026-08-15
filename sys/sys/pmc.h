@@ -465,6 +465,9 @@ struct pmc_op_pmcgroupadd {
 #define	PMC_GROUP_F_LEADER	0x00000001
 #define	PMC_GROUP_MAX_MEMBERS	32
 
+/* Presentation clamp: tools refuse to extrapolate beyond this ratio. */
+#define	PMC_SCALE_MAX		10
+
 struct pmc_op_pmcgroupcommit {
 	uint32_t	pm_groupid;
 };
