@@ -19,6 +19,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#define	TEST_DEFERRED_HANDLE_SLOTS	31
+
 static int
 is_amd(void)
 {
@@ -31,14 +33,6 @@ is_amd(void)
 	    strstr(buf, "HygonGenuine") != NULL);
 }
 
-/*
- * Probe how many process-mode core PMCs we can simultaneously allocate
- * with the canonical "instructions" event.  Returns the count without
- * leaving any allocations behind.  Used to size the rest of the test
- * dynamically per-CPU instead of relying on pmc_npmc(0), which sums
- * SOFT/TSC/K8/IBS classes and is therefore meaningless for sizing a
- * single core-class group.
- */
 static int
 expect_errno(const char *operation, int error, int expected)
 {
@@ -71,6 +65,97 @@ test_allocation_gates(void)
 	return (pmc_release(pmcid) < 0);
 }
 
+static int
+test_deferred_handle_namespace(void)
+{
+	pmc_id_t fresh, ids[TEST_DEFERRED_HANDLE_SLOTS], stale, system;
+	pmc_value_t value;
+	int i, j, n, rc;
+
+	for (i = 0; i < 160; i++) {
+		if (pmc_allocate_group("instructions", PMC_MODE_TC, 0,
+		    PMC_CPU_ANY, &fresh, 0) < 0 || pmc_release(fresh) < 0) {
+			warn("deferred handle recycle %d", i);
+			return (1);
+		}
+	}
+
+	if (pmc_allocate_group("instructions", PMC_MODE_TC, 0,
+	    PMC_CPU_ANY, &stale, 0) < 0 || pmc_release(stale) < 0)
+		return (1);
+	if (pmc_allocate_group("instructions", PMC_MODE_TC, 0,
+	    PMC_CPU_ANY, &fresh, 0) < 0)
+		return (1);
+	if (fresh == stale || expect_errno("stale deferred handle",
+	    pmc_read(stale, &value), EINVAL) != 0) {
+		(void)pmc_release(fresh);
+		return (1);
+	}
+	if (pmc_release(fresh) < 0)
+		return (1);
+
+	n = 0;
+	while (n < TEST_DEFERRED_HANDLE_SLOTS) {
+		if (pmc_allocate_group("instructions", PMC_MODE_TC, 0,
+		    PMC_CPU_ANY, &ids[n], 0) < 0)
+			break;
+		for (j = 0; j < n; j++) {
+			if (ids[j] == ids[n]) {
+				fprintf(stderr,
+				    "FAIL: duplicate deferred handle %#x\n", ids[n]);
+				n++;
+				goto fail;
+			}
+		}
+		n++;
+	}
+	if (n != TEST_DEFERRED_HANDLE_SLOTS) {
+		fprintf(stderr, "FAIL: allocated %d of %d deferred handles\n",
+		    n, TEST_DEFERRED_HANDLE_SLOTS);
+		goto fail;
+	}
+	errno = 0;
+	if (pmc_allocate_group("instructions", PMC_MODE_TC, 0,
+	    PMC_CPU_ANY, &fresh, 0) == 0) {
+		fprintf(stderr, "FAIL: deferred handle exhaustion succeeded\n");
+		(void)pmc_release(fresh);
+		goto fail;
+	}
+	if (errno != EMFILE) {
+		fprintf(stderr, "FAIL: deferred handle exhaustion errno=%d\n",
+		    errno);
+		goto fail;
+	}
+	if (pmc_allocate_group("instructions", PMC_MODE_SC, 0, 0,
+	    &system, 0) < 0) {
+		warn("per-CPU deferred handle namespace");
+		goto fail;
+	}
+	if (pmc_release(system) < 0)
+		goto fail;
+	rc = 0;
+	for (i = 0; i < n; i++) {
+		if (pmc_release(ids[i]) < 0) {
+			warn("release deferred handle %d", i);
+			rc = 1;
+		}
+	}
+	return (rc);
+
+fail:
+	for (i = 0; i < n; i++)
+		(void)pmc_release(ids[i]);
+	return (1);
+}
+
+/*
+ * Probe how many process-mode core PMCs we can simultaneously allocate
+ * with the canonical "instructions" event.  Returns the count without
+ * leaving any allocations behind.  Used to size the rest of the test
+ * dynamically per-CPU instead of relying on pmc_npmc(0), which sums
+ * SOFT/TSC/K8/IBS classes and is therefore meaningless for sizing a
+ * single core-class group.
+ */
 static int
 probe_core_pmcs(void)
 {
@@ -262,6 +347,8 @@ main(void)
 		return (77);
 	}
 	if (test_allocation_gates() != 0)
+		return (1);
+	if (test_deferred_handle_namespace() != 0)
 		return (1);
 	if (test_basic_group() != 0)
 		return (1);
