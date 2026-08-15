@@ -960,19 +960,6 @@ pmu_group_on_stop(struct pmc *pm)
 	pmu_group_accounting_drain(pg, false);
 }
 
-static void
-pmu_group_transition_lock(pmu_group_t *pg)
-{
-
-	for (;;) {
-		mtx_lock_spin(&pg->pg_snapshot_lock);
-		if (!pg->pg_snapshot_pending && !pg->pg_snapshot_active)
-			return;
-		mtx_unlock_spin(&pg->pg_snapshot_lock);
-		cpu_spinwait();
-	}
-}
-
 void
 pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
 {
@@ -991,7 +978,8 @@ pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
 		if (pg->pg_system || cpu < 0 || (u_int)cpu >= pg->pg_ncpu)
 			continue;
 		pgcs = &pg->pg_cpu_state[cpu];
-		pmu_group_transition_lock(pg);
+		/* Never wait out a snapshot here: its IPIs may target this CPU. */
+		mtx_lock_spin(&pg->pg_snapshot_lock);
 		mtx_pool_lock_spin(pmc_mtxpool, pg);
 		if (!pg->pg_committed || !pg->pg_running ||
 		    pg->pg_account_blocked) {
@@ -1081,7 +1069,8 @@ pmu_group_csw_out(struct thread *td, int cpu)
 		if (pgcs->pgcs_td != td)
 			continue;
 		pg = pgcs->pgcs_group;
-		pmu_group_transition_lock(pg);
+		/* Never wait out a snapshot here: its IPIs may target this CPU. */
+		mtx_lock_spin(&pg->pg_snapshot_lock);
 		mtx_pool_lock_spin(pmc_mtxpool, pg);
 		if (pgcs->pgcs_counted && pgcs->pgcs_td == td &&
 		    !pgcs->pgcs_transitioning)
