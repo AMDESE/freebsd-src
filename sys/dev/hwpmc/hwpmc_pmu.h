@@ -158,8 +158,6 @@ void hwpmc_unmark_row_standalone(int ri);
  */
 void hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm);
 void hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm);
-void pmu_group_sys_row_started(struct pmc *pm);
-void pmu_group_sys_row_stopped(struct pmc *pm);
 
 /*
  * The PMU grouping/multiplex scheduler is architecture-independent:
@@ -197,7 +195,7 @@ bool pmu_class_supports_grouping(enum pmc_class class);
 /*
  * Group lifecycle (hwpmc_pmu.c).
  */
-int pmu_group_create(struct pmc_owner *po, uint32_t *pg_id);
+void pmu_group_create(struct pmc_owner *po, uint32_t *pg_id);
 int pmu_group_add(pmu_group_t *pg, struct pmc *pm, bool leader);
 int pmu_group_commit(pmu_group_t *pg);
 pmu_group_t *pmu_group_lookup(struct pmc_owner *po, uint32_t pg_id);
@@ -240,14 +238,14 @@ void pmu_sys_group_on_stop(struct pmc *pm);
 void pmu_sys_group_pre_release(struct pmc *pm);
 
 /*
- * Cleanup hook for callers that are about to free a pmc_process out from
- * under the PMU layer (target-process exit, descriptor destroy).  Tears
- * down the per-pp rotation kthread (which holds pp as its arg) and
- * unhooks every pmu_group still hanging off pp->pp_pmu_groups so the
- * eventual pmu_group_on_release won't dereference freed memory.  Caller
- * must hold pmc_sx exclusive.
+ * PMU-layer half of the pmc_process lifecycle.  pmu_pp_init sets up the
+ * spin lock and group list of a fresh pp; pmu_pp_destroy tears down the
+ * per-pp rotation kthread and unhooks every pmu_group still hanging off
+ * pp->pp_pmu_groups before the caller frees pp.  pmu_pp_destroy needs
+ * pmc_sx held exclusive.
  */
-void pmu_pp_release_all(struct pmc_process *pp);
+void pmu_pp_init(struct pmc_process *pp);
+void pmu_pp_destroy(struct pmc_process *pp);
 void pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp);
 void pmu_pp_kick_after_exec(struct pmc_process *pp);
 

@@ -51,12 +51,24 @@ SYSCTL_INT(_kern_hwpmc, OID_AUTO, mux_period_ms, CTLFLAG_RWTUN,
     &pmu_mux_period_ms, 0,
     "PMU multiplex rotation period floor in milliseconds");
 
+/* One rotation window in ticks; §7.4 upward jitter breaks phase-lock. */
+static int
+pmu_rot_period_ticks(void)
+{
+	int period_ticks;
+
+	period_ticks = (pmu_mux_period_ms * hz) / 1000;
+	if (period_ticks < 1)
+		period_ticks = 1;
+	return (period_ticks + prng32_bounded(period_ticks / 4 + 1));
+}
+
 static void pmu_pp_rotate_thread(void *arg);
 static int pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg);
 static void pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
     bool drain_samples);
 static void pmu_pp_kick_rotate(struct pmc_process *pp);
-static int pmu_group_attach_siblings(pmu_group_t *pg,
+static void pmu_group_attach_siblings(pmu_group_t *pg,
     struct pmc_process *pp);
 
 /*
@@ -68,7 +80,7 @@ static int pmu_group_attach_siblings(pmu_group_t *pg,
  * mutually exclusive for any given group (pg_system selects which).
  */
 struct pmu_syscpu {
-	LIST_HEAD(, pmu_group)	sc_groups;	/* groups bound to this CPU */
+	struct pmu_group_list	sc_groups;	/* groups bound to this CPU */
 	pmu_group_t		*sc_cursor;	/* round-robin start point */
 	struct thread		*sc_td;		/* rotation kthread */
 	u_int			sc_quiesce;
@@ -201,15 +213,20 @@ pmu_group_time_snapshot_locked(pmu_group_t *pg,
 }
 
 static void
-pmu_group_accounting_block(pmu_group_t *pg)
+pmu_group_accounting_block_locked(pmu_group_t *pg, uint64_t now)
 {
-	uint64_t now;
 
-	now = cpu_ticks();
-	mtx_pool_lock_spin(pmc_mtxpool, pg);
 	pmu_group_time_update_locked(pg, now);
 	pg->pg_account_blocked = true;
 	pg->pg_account_placement_admit = false;
+}
+
+static void
+pmu_group_accounting_block(pmu_group_t *pg)
+{
+
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_accounting_block_locked(pg, cpu_ticks());
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 }
 
@@ -251,8 +268,6 @@ pmu_group_accounting_drain(pmu_group_t *pg, bool release)
 		KASSERT(pmc_cpu_is_active(cpu),
 		    ("[pmu] group %u marker on inactive CPU %u", pg->pg_id,
 		    cpu));
-		if (!pmc_cpu_is_active(cpu))
-			continue;
 		pmc_select_cpu(cpu);
 		hwpmc_pmu_force_context_switch();
 	}
@@ -283,8 +298,8 @@ pmu_group_kick_placement(pmu_group_t *pg)
 	bool kick;
 	u_int cpu;
 
-	if (pg->pg_system || pg->pg_ncpu == 0)
-		return;
+	KASSERT(!pg->pg_system && pg->pg_ncpu != 0,
+	    ("[pmu] kick_placement: bad group %u", pg->pg_id));
 	pmc_save_cpu_binding(&pb);
 	for (cpu = 0; cpu < pg->pg_ncpu; cpu++) {
 		mtx_pool_lock_spin(pmc_mtxpool, pg);
@@ -331,6 +346,48 @@ pmu_pp_stop_rotate(struct pmc_process *pp, const char *wmesg)
 	mtx_unlock_spin(&pp->pp_pmu_lock);
 }
 
+/* Hang pg off pp's group list unless it is already linked. */
+static void
+pmu_pp_link_group(pmu_group_t *pg, struct pmc_process *pp)
+{
+
+	if (pg->pg_pp != NULL)
+		return;
+	mtx_lock_spin(&pp->pp_pmu_lock);
+	LIST_INSERT_HEAD(&pp->pp_pmu_groups, pg, pg_proc_next);
+	pg->pg_pp = pp;
+	mtx_unlock_spin(&pp->pp_pmu_lock);
+}
+
+/* Unhook pg from pp, stepping the rotation cursor past it. */
+static void
+pmu_pp_unlink_group(pmu_group_t *pg, struct pmc_process *pp)
+{
+
+	mtx_lock_spin(&pp->pp_pmu_lock);
+	if (pp->pp_pmu_rot_cursor == pg)
+		pp->pp_pmu_rot_cursor = LIST_NEXT(pg, pg_proc_next);
+	LIST_REMOVE(pg, pg_proc_next);
+	pg->pg_pp = NULL;
+	pg->pg_attach_proc = NULL;
+	mtx_unlock_spin(&pp->pp_pmu_lock);
+}
+
+/* Place any deferred group that now fits and re-arm rotation. */
+static void
+pmu_pp_backfill(struct pmc_process *pp)
+{
+	pmu_group_t *pg;
+
+	if (pp->pp_pmu_unhashed)
+		return;
+	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
+		if (pg->pg_running && !pg->pg_assigned)
+			(void)pmu_pp_schedule_in(pp, pg);
+	}
+	pmu_pp_kick_rotate(pp);
+}
+
 pmu_event_t *
 pmu_event_from_pmc(struct pmc *pm)
 {
@@ -346,7 +403,7 @@ pmu_event_destroy(pmu_event_t *pe)
 	free(pe, M_PMU);
 }
 
-int
+void
 pmu_group_create(struct pmc_owner *po, uint32_t *pg_id)
 {
 	pmu_group_t *pg;
@@ -361,7 +418,6 @@ pmu_group_create(struct pmc_owner *po, uint32_t *pg_id)
 	TAILQ_INIT(&pg->pg_events);
 	LIST_INSERT_HEAD(&po->po_groups, pg, pg_owner_next);
 	*pg_id = pg->pg_id;
-	return (0);
 }
 
 pmu_group_t *
@@ -571,7 +627,6 @@ pmu_group_prepare_release(pmu_group_t *pg, struct pmc **members,
     u_int capacity, struct pmc_process **released_pp)
 {
 	pmu_event_t *pe, *tmp;
-	pmu_group_t *other;
 	struct pmc_process *held_pp, *pp;
 	bool pp_unhashed;
 	u_int n;
@@ -614,21 +669,8 @@ pmu_group_prepare_release(pmu_group_t *pg, struct pmc **members,
 		}
 		if (pg->pg_pp != NULL) {
 			pp = pg->pg_pp;
-			mtx_lock_spin(&pp->pp_pmu_lock);
-			if (pp->pp_pmu_rot_cursor == pg)
-				pp->pp_pmu_rot_cursor = LIST_NEXT(pg,
-				    pg_proc_next);
-			LIST_REMOVE(pg, pg_proc_next);
-			pg->pg_pp = NULL;
-			pg->pg_attach_proc = NULL;
-			mtx_unlock_spin(&pp->pp_pmu_lock);
-			if (!pp->pp_pmu_unhashed) {
-				LIST_FOREACH(other, &pp->pp_pmu_groups, pg_proc_next) {
-					if (other->pg_running && !other->pg_assigned)
-						(void)pmu_pp_schedule_in(pp, other);
-				}
-				pmu_pp_kick_rotate(pp);
-			}
+			pmu_pp_unlink_group(pg, pp);
+			pmu_pp_backfill(pp);
 		}
 		if (held_pp != NULL) {
 			mtx_lock_spin(&held_pp->pp_pmu_lock);
@@ -734,12 +776,7 @@ pmu_group_on_attach(struct pmc *pm, struct proc *p)
 	if (pg->pg_pp != NULL && pg->pg_pp != pp)
 		return (EBUSY);
 	pg->pg_attach_proc = p;
-	if (pg->pg_pp == NULL) {
-		mtx_lock_spin(&pp->pp_pmu_lock);
-		LIST_INSERT_HEAD(&pp->pp_pmu_groups, pg, pg_proc_next);
-		pg->pg_pp = pp;
-		mtx_unlock_spin(&pp->pp_pmu_lock);
-	}
+	pmu_pp_link_group(pg, pp);
 	return (0);
 }
 
@@ -823,12 +860,7 @@ pmu_group_on_start(struct pmc *pm)
 	if (pg->pg_attach_proc == NULL)
 		pg->pg_attach_proc = p;
 
-	if (pg->pg_pp == NULL) {
-		mtx_lock_spin(&pp->pp_pmu_lock);
-		LIST_INSERT_HEAD(&pp->pp_pmu_groups, pg, pg_proc_next);
-		pg->pg_pp = pp;
-		mtx_unlock_spin(&pp->pp_pmu_lock);
-	}
+	pmu_pp_link_group(pg, pp);
 
 	mtx_pool_lock_spin(pmc_mtxpool, pg);
 	if (pg->pg_account_blocked) {
@@ -841,13 +873,7 @@ pmu_group_on_start(struct pmc *pm)
 		PMCDBG3(PMC, OPS, 2,
 		    "on_start: gid=%u pm=%p ASSIGNED, attaching siblings "
 		    "on pp=%p", pg->pg_id, pm, pp);
-		error = pmu_group_attach_siblings(pg, pp);
-		if (error != 0) {
-			PMCDBG2(PMC, OPS, 1,
-			    "on_start: gid=%u attach_siblings err=%d",
-			    pg->pg_id, error);
-			return (error);
-		}
+		pmu_group_attach_siblings(pg, pp);
 	} else {
 		error = pmu_pp_schedule_in(pp, pg);
 		PMCDBG4(PMC, OPS, 2,
@@ -913,8 +939,8 @@ pmu_group_on_stop(struct pmc *pm)
 			mtx_unlock_spin(&pp->pp_pmu_lock);
 		return;
 	}
+	pmu_group_accounting_block_locked(pg, cpu_ticks());
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
-	pmu_group_accounting_block(pg);
 	if (pp != NULL)
 		mtx_unlock_spin(&pp->pp_pmu_lock);
 
@@ -944,6 +970,9 @@ pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
 	uint64_t now;
 	int cpu;
 
+	/* Unlocked peek: a racing insert is caught on the next switch. */
+	if (LIST_EMPTY(&pp->pp_pmu_groups))
+		return;
 	cpu = PCPU_GET(cpuid);
 	now = cpu_ticks();
 	mtx_lock_spin(&pp->pp_pmu_lock);
@@ -962,11 +991,6 @@ pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
 		KASSERT(!pgcs->pgcs_counted,
 		    ("[pmu] duplicate CPU %d marker for group %u", cpu,
 		    pg->pg_id));
-		if (pgcs->pgcs_counted) {
-			mtx_pool_unlock_spin(pmc_mtxpool, pg);
-			mtx_unlock_spin(&pg->pg_snapshot_lock);
-			continue;
-		}
 		pmu_group_time_update_locked(pg, now);
 		pgcs->pgcs_td = td;
 		pgcs->pgcs_counted = true;
@@ -988,9 +1012,6 @@ pmu_group_csw_in_complete(struct thread *td, int cpu)
 
 	KASSERT(cpu >= 0 && cpu < MAXCPU,
 	    ("[pmu] invalid csw-in completion CPU %d", cpu));
-	if (cpu < 0 || cpu >= MAXCPU)
-		return;
-
 	LIST_FOREACH(pgcs, &pmu_group_cpu_active[cpu], pgcs_next) {
 		if (pgcs->pgcs_td != td)
 			continue;
@@ -1045,9 +1066,6 @@ pmu_group_csw_out(struct thread *td, int cpu)
 
 	KASSERT(cpu >= 0 && cpu < MAXCPU,
 	    ("[pmu] invalid csw-out CPU %d", cpu));
-	if (cpu < 0 || cpu >= MAXCPU)
-		return;
-
 	LIST_FOREACH(pgcs, &pmu_group_cpu_active[cpu], pgcs_next) {
 		if (pgcs->pgcs_td != td)
 			continue;
@@ -1071,9 +1089,6 @@ pmu_group_csw_out_complete(struct thread *td, int cpu)
 
 	KASSERT(cpu >= 0 && cpu < MAXCPU,
 	    ("[pmu] invalid csw-out completion CPU %d", cpu));
-	if (cpu < 0 || cpu >= MAXCPU)
-		return;
-
 	now = cpu_ticks();
 	LIST_FOREACH_SAFE(pgcs, &pmu_group_cpu_active[cpu], pgcs_next,
 	    next) {
@@ -1164,7 +1179,7 @@ pmu_group_on_release(struct pmc *pm)
  * the group in mid-flight).  All-or-none scheduling means every
  * sibling holds a row once pmu_assign_group succeeds.
  */
-static int
+static void
 pmu_group_attach_siblings(pmu_group_t *pg, struct pmc_process *pp)
 {
 	pmu_event_t *pe;
@@ -1179,7 +1194,6 @@ pmu_group_attach_siblings(pmu_group_t *pg, struct pmc_process *pp)
 			continue;	/* idempotent: already attached */
 		pmc_rotation_attach(pm, pp);
 	}
-	return (0);
 }
 
 /*
@@ -1199,13 +1213,7 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 
 	if (pg == NULL || pg->pg_assigned)
 		return (0);
-	/*
-	 * Use the recorded TARGET proc only.  Falling back to the
-	 * owner here is what created the cross-pp inconsistency that
-	 * panicked csw_in with "pmc 255 != ri N": owner-pp is NOT the
-	 * pp the scheduler walks, so attach/detach there silently
-	 * corrupts state.
-	 */
+	/* Only the recorded TARGET proc; see pmu_group_target_proc(). */
 	p = pmu_group_target_proc(pg);
 	if (p == NULL)
 		return (EINVAL);
@@ -1228,29 +1236,14 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 	}
 
 	/*
-	 * Restore the per-pmc RUNNING state BEFORE we publish the row
-	 * via attach_siblings.  pmu_pp_schedule_out stamped pm_state =
-	 * STOPPED on every sibling so that pmc_process_csw_in (which
-	 * checks pm_state == RUNNING before loading the HW counter,
-	 * see hwpmc_mod.c csw_in path) would not race the drain phase
-	 * of eviction and let new csw_in traffic increment pm_runcount
-	 * while we were detaching.
-	 *
-	 * Doing the restore here -- after assign (rows are valid)
-	 * but before attach (pp_pmcs[ri] is still NULL) --
-	 * means by the time pmc_rotation_attach publishes the row via
-	 * atomic_store_rel, pm_state is already RUNNING and any csw_in
-	 * that observes the new row will load the counter immediately.
-	 *
-	 * Without this, a rotation-evicted-then-rebound group stayed at
-	 * STOPPED forever and csw_in silently skipped the rebinding,
-	 * which is the bug behind "Group 0 delta=0 between snapshots
-	 * after a single eviction window" in pmc_mux_works_test.
+	 * Restore RUNNING before attach_siblings publishes the rows:
+	 * csw_in only loads counters for RUNNING PMCs, so the reverse
+	 * order leaves a rebound group stopped forever.
 	 */
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
 		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
 
-	(void)pmu_group_attach_siblings(pg, pp);
+	pmu_group_attach_siblings(pg, pp);
 	mtx_pool_lock_spin(pmc_mtxpool, pg);
 	pg->pg_account_placement_admit = true;
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
@@ -1309,21 +1302,12 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
 
 /*
  * Purge every pmu_group hanging off pp->pp_pmu_groups and tear down the
- * per-pp rotation kthread.  Called from paths that are about to free pp
- * out from under the PMU layer (pmc_process_exit when the target proc
- * goes away, pmc_destroy_process_descriptor as a defensive belt-and-
- * suspenders), so that the eventual pmu_group_on_release for each
- * sibling sees pg_pp == NULL and skips its LIST_REMOVE/schedule_out
- * branch instead of dereferencing freed memory.
- *
- * The pmu_group structs themselves are NOT freed here -- they are owned
- * by the pmc_owner / pmu_event lifetime and will be reclaimed by
- * pmu_group_on_release / pmu_group_release in the normal way.  We only
- * sever the pp linkage.
- *
- * Caller must hold pmc_sx exclusive.
+ * per-pp rotation kthread, so the eventual pmu_group_on_release for
+ * each sibling sees pg_pp == NULL instead of a freed pp.  The groups
+ * themselves stay owned by the pmc_owner / pmu_event lifetime.  Caller
+ * must hold pmc_sx exclusive.
  */
-void
+static void
 pmu_pp_release_all(struct pmc_process *pp)
 {
 	pmu_group_t *pg;
@@ -1356,7 +1340,6 @@ pmu_pp_release_all(struct pmc_process *pp)
 	 * pg_pp gets cleared so a later pmu_group_on_release for any
 	 * surviving sibling skips the now-stale LIST_REMOVE.
 	 */
-	pp->pp_pmu_rot_cursor = NULL;
 	for (;;) {
 		mtx_lock_spin(&pp->pp_pmu_lock);
 		pg = LIST_FIRST(&pp->pp_pmu_groups);
@@ -1366,19 +1349,35 @@ pmu_pp_release_all(struct pmc_process *pp)
 		pmu_group_accounting_drain(pg, true);
 		if (pg->pg_assigned)
 			pmu_pp_schedule_out(pp, pg, false);
-		mtx_lock_spin(&pp->pp_pmu_lock);
-		LIST_REMOVE(pg, pg_proc_next);
-		pg->pg_pp = NULL;
-		pg->pg_attach_proc = NULL;
-		mtx_unlock_spin(&pp->pp_pmu_lock);
+		pmu_pp_unlink_group(pg, pp);
 	}
+}
+
+/* Set up the PMU-layer fields of a fresh pp. */
+void
+pmu_pp_init(struct pmc_process *pp)
+{
+
+	mtx_init(&pp->pp_pmu_lock, "pmc-pmu-groups", "pmc-pmu", MTX_SPIN);
+	LIST_INIT(&pp->pp_pmu_groups);
+}
+
+/* Tear down the PMU-layer state of pp just before it is freed. */
+void
+pmu_pp_destroy(struct pmc_process *pp)
+{
+
+	pmu_pp_release_all(pp);
+	KASSERT(pp->pp_pmu_refs == 0 && pp->pp_pmu_rot_quiesce == 0 &&
+	    pp->pp_pmu_rot_td == NULL,
+	    ("[pmu] pp %p destroyed while referenced", pp));
+	mtx_destroy(&pp->pp_pmu_lock);
 }
 
 void
 pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp)
 {
 	pmu_event_t *pe;
-	pmu_group_t *other;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
 	KASSERT(pg != NULL && pp != NULL && pg->pg_pp == pp,
@@ -1397,13 +1396,7 @@ pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp)
 	if (pg->pg_assigned)
 		pmu_pp_schedule_out(pp, pg, false);
 
-	mtx_lock_spin(&pp->pp_pmu_lock);
-	if (pp->pp_pmu_rot_cursor == pg)
-		pp->pp_pmu_rot_cursor = LIST_NEXT(pg, pg_proc_next);
-	LIST_REMOVE(pg, pg_proc_next);
-	pg->pg_pp = NULL;
-	pg->pg_attach_proc = NULL;
-	mtx_unlock_spin(&pp->pp_pmu_lock);
+	pmu_pp_unlink_group(pg, pp);
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 		pe->pe_pmc->pm_flags &= ~(PMC_F_ATTACH_DONE |
 		    PMC_F_ATTACHED_TO_OWNER | PMC_F_NEEDS_LOGFILE);
@@ -1411,20 +1404,16 @@ pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp)
 	pg->pg_releasing = false;
 	wakeup(&pg->pg_releasing);
 
-	LIST_FOREACH(other, &pp->pp_pmu_groups, pg_proc_next) {
-		if (other->pg_running && !other->pg_assigned)
-			(void)pmu_pp_schedule_in(pp, other);
-	}
-	pmu_pp_kick_rotate(pp);
+	pmu_pp_backfill(pp);
 }
 
-/* True if any running MUX group on pp is waiting for hardware. */
+/* True if any running MUX group on the list is waiting for hardware. */
 static bool
-pmu_pp_has_deferred(struct pmc_process *pp)
+pmu_list_has_deferred(struct pmu_group_list *gl)
 {
 	pmu_group_t *pg;
 
-	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
+	LIST_FOREACH(pg, gl, pg_proc_next) {
 		if (pg->pg_running && !pg->pg_assigned && pg->pg_defer_ok)
 			return (true);
 	}
@@ -1444,7 +1433,7 @@ pmu_pp_kick_rotate(struct pmc_process *pp)
 
 	if (pp == NULL || pp->pp_pmu_rot_quiesce != 0 || pp->pp_pmu_unhashed)
 		return;
-	if (!pmu_pp_has_deferred(pp))
+	if (!pmu_list_has_deferred(&pp->pp_pmu_groups))
 		return;
 
 	pp->pp_pmu_rot_needed = true;
@@ -1474,12 +1463,12 @@ pmu_pp_kick_after_exec(struct pmc_process *pp)
 }
 
 /*
- * Rows currently held by pp's placed running MUX groups -- everything
- * rotation could evict -- as the global-ri mask the satisfiability
- * probe consumes.
+ * Rows currently held by the list's placed running MUX groups --
+ * everything rotation could evict -- as the global-ri mask the
+ * satisfiability probe consumes.
  */
 static uint64_t
-pmu_pp_evictable_rows(struct pmc_process *pp)
+pmu_list_evictable_rows(struct pmu_group_list *gl)
 {
 	pmu_event_t *pe;
 	pmu_group_t *pg;
@@ -1487,7 +1476,7 @@ pmu_pp_evictable_rows(struct pmc_process *pp)
 	u_int n;
 
 	evictable = 0;
-	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
+	LIST_FOREACH(pg, gl, pg_proc_next) {
 		if (!pg->pg_running || !pg->pg_assigned || !pg->pg_defer_ok)
 			continue;
 		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
@@ -1500,22 +1489,22 @@ pmu_pp_evictable_rows(struct pmc_process *pp)
 }
 
 /*
- * Next placed running MUX group at or after *vpg, wrapping over
- * pp_pmu_groups until *vseen reaches ngroups.  Pinned (non-MUX),
- * unplaced and stopped groups are passed over without being counted
- * as victims.  Advances the scan state so successive calls continue
- * the same wrap (the escalation path below relies on this).
+ * Next placed running MUX group at or after *vpg, wrapping over the
+ * list until *vseen reaches ngroups.  Pinned (non-MUX), unplaced and
+ * stopped groups are passed over without being counted as victims.
+ * Advances the scan state so successive calls continue the same wrap
+ * (the escalation path in the rotation ticks relies on this).
  */
 static pmu_group_t *
-pmu_pp_next_victim(struct pmc_process *pp, pmu_group_t **vpg, u_int *vseen,
-    u_int ngroups)
+pmu_list_next_victim(struct pmu_group_list *gl, pmu_group_t **vpg,
+    u_int *vseen, u_int ngroups)
 {
 	pmu_group_t *pg;
 
 	while (*vseen < ngroups) {
 		pg = *vpg;
 		if (pg == NULL)
-			pg = LIST_FIRST(&pp->pp_pmu_groups);
+			pg = LIST_FIRST(gl);
 		(*vseen)++;
 		*vpg = LIST_NEXT(pg, pg_proc_next);
 		if (pg->pg_assigned && pg->pg_running && pg->pg_defer_ok)
@@ -1584,7 +1573,7 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 	 * are all unsatisfiable, does nothing -- evicting a victim
 	 * would only put it straight back.
 	 */
-	evictable = pmu_pp_evictable_rows(pp);
+	evictable = pmu_list_evictable_rows(&pp->pp_pmu_groups);
 	satisfiable = false;
 	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
 		if (!pg->pg_running || pg->pg_assigned || !pg->pg_defer_ok)
@@ -1602,7 +1591,8 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 	/* Evict the single victim at the cursor, advance past it. */
 	vpg = cursor;
 	vseen = 0;
-	victim = pmu_pp_next_victim(pp, &vpg, &vseen, ngroups);
+	victim = pmu_list_next_victim(&pp->pp_pmu_groups, &vpg, &vseen,
+	    ngroups);
 	if (victim != NULL) {
 		PMCDBG3(PMC, OPS, 4, "rotate: pp=%p evict gid=%u nevents=%u",
 		    pp, victim->pg_id, victim->pg_nevents);
@@ -1628,8 +1618,8 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 			goto next;
 		sin_err = pmu_pp_schedule_in(pp, pg);
 		while (sin_err == ENOSPC && !placed_any) {
-			victim = pmu_pp_next_victim(pp, &vpg, &vseen,
-			    ngroups);
+			victim = pmu_list_next_victim(&pp->pp_pmu_groups,
+			    &vpg, &vseen, ngroups);
 			if (victim == NULL)
 				break;
 			PMCDBG2(PMC, OPS, 4,
@@ -1654,7 +1644,7 @@ next:
 	pp->pp_pmu_rot_cursor = cursor;
 out:
 	/* §7.3: the kthread self-stops once nothing is left deferred. */
-	pp->pp_pmu_rot_needed = pmu_pp_has_deferred(pp);
+	pp->pp_pmu_rot_needed = pmu_list_has_deferred(&pp->pp_pmu_groups);
 }
 
 /*
@@ -1668,17 +1658,11 @@ static void
 pmu_pp_rotate_thread(void *arg)
 {
 	struct pmc_process *pp = arg;
-	int period_ticks;
 
 	sx_xlock(&pmc_sx);
 	while (pp->pp_pmu_rot_running) {
-		period_ticks = (pmu_mux_period_ms * hz) / 1000;
-		if (period_ticks < 1)
-			period_ticks = 1;
-		/* §7.4: jitter breaks phase-lock with periodic loads. */
-		period_ticks += prng32_bounded(period_ticks / 4 + 1);
 		(void)sx_sleep(&pp->pp_pmu_rot_needed, &pmc_sx, 0, "muxrot",
-		    period_ticks);
+		    pmu_rot_period_ticks());
 		if (!pp->pp_pmu_rot_running)
 			break;
 		pmu_pp_rotate_one(pp);
@@ -1714,38 +1698,14 @@ pmu_pp_rotate_thread(void *arg)
  *     pm->pm_gv.pm_savedvalue so values are continuous across windows.
  */
 
-/* Enter and leave SC residency at the final sibling's hardware edge. */
-void
-pmu_group_sys_row_started(struct pmc *pm)
+/* Enter and leave SC residency at the group's hardware edges. */
+static void
+pmu_sys_residency_mark(pmu_group_t *pg, bool admit)
 {
-	pmu_event_t *pe;
-	pmu_group_t *pg;
 
-	pe = pmu_event_from_pmc(pm);
-	if (pe == NULL || pe->pe_group == NULL ||
-	    TAILQ_NEXT(pe, pe_sibling) != NULL)
-		return;
-	pg = pe->pe_group;
 	mtx_pool_lock_spin(pmc_mtxpool, pg);
 	pmu_group_time_update_locked(pg, cpu_ticks());
-	pg->pg_account_placement_admit = true;
-	mtx_pool_unlock_spin(pmc_mtxpool, pg);
-}
-
-void
-pmu_group_sys_row_stopped(struct pmc *pm)
-{
-	pmu_event_t *pe;
-	pmu_group_t *pg;
-
-	pe = pmu_event_from_pmc(pm);
-	if (pe == NULL || pe->pe_group == NULL ||
-	    TAILQ_NEXT(pe, pe_sibling) != NULL)
-		return;
-	pg = pe->pe_group;
-	mtx_pool_lock_spin(pmc_mtxpool, pg);
-	pmu_group_time_update_locked(pg, cpu_ticks());
-	pg->pg_account_placement_admit = false;
+	pg->pg_account_placement_admit = admit;
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 }
 
@@ -1793,6 +1753,7 @@ pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
 		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
 		hwpmc_pmu_sys_start_row(cpu, pe->pe_pmc);
 	}
+	pmu_sys_residency_mark(pg, true);
 	PMCDBG3(PMC, OPS, 4, "sys_schedule_in: gid=%u cpu=%d nevents=%u IN",
 	    pg->pg_id, cpu, pg->pg_nevents);
 	return (0);
@@ -1815,6 +1776,7 @@ pmu_sys_schedule_out(int cpu, pmu_group_t *pg)
 		hwpmc_pmu_sys_stop_row(cpu, pe->pe_pmc);
 		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
 	}
+	pmu_sys_residency_mark(pg, false);
 	pmu_unassign_group(pg, cpu);
 	PMCDBG2(PMC, OPS, 4, "sys_schedule_out: gid=%u cpu=%d OUT",
 	    pg->pg_id, cpu);
@@ -1977,19 +1939,6 @@ pmu_sys_group_pre_release(struct pmc *pm)
 	pmu_syscpu_kick_rotate(cpu);
 }
 
-/* System-mode mirror of pmu_pp_has_deferred(), keyed on sc_groups. */
-static bool
-pmu_syscpu_has_deferred(struct pmu_syscpu *sc)
-{
-	pmu_group_t *pg;
-
-	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
-		if (pg->pg_running && !pg->pg_assigned && pg->pg_defer_ok)
-			return (true);
-	}
-	return (false);
-}
-
 /*
  * System-mode mirror of pmu_pp_kick_rotate(): mark rotation needed
  * and wake the per-CPU kthread, spawning it if absent.  Idempotent.
@@ -2003,7 +1952,7 @@ pmu_syscpu_kick_rotate(int cpu)
 	sc = &pmu_syscpu[cpu];
 	if (sc->sc_quiesce != 0)
 		return;
-	if (!pmu_syscpu_has_deferred(sc))
+	if (!pmu_list_has_deferred(&sc->sc_groups))
 		return;
 
 	sc->sc_needed = true;
@@ -2023,47 +1972,6 @@ pmu_syscpu_kick_rotate(int cpu)
 		    "syscpu_kick_rotate: cpu=%d kthread_add err=%d",
 		    cpu, error);
 	}
-}
-
-/* System-mode mirror of pmu_pp_evictable_rows(), keyed on sc_groups. */
-static uint64_t
-pmu_syscpu_evictable_rows(struct pmu_syscpu *sc)
-{
-	pmu_event_t *pe;
-	pmu_group_t *pg;
-	uint64_t evictable;
-	u_int n;
-
-	evictable = 0;
-	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
-		if (!pg->pg_running || !pg->pg_assigned || !pg->pg_defer_ok)
-			continue;
-		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-			n = PMC_TO_ROWINDEX(pe->pe_pmc);
-			if (n < 64)
-				evictable |= 1ULL << n;
-		}
-	}
-	return (evictable);
-}
-
-/* System-mode mirror of pmu_pp_next_victim(), keyed on sc_groups. */
-static pmu_group_t *
-pmu_syscpu_next_victim(struct pmu_syscpu *sc, pmu_group_t **vpg,
-    u_int *vseen, u_int ngroups)
-{
-	pmu_group_t *pg;
-
-	while (*vseen < ngroups) {
-		pg = *vpg;
-		if (pg == NULL)
-			pg = LIST_FIRST(&sc->sc_groups);
-		(*vseen)++;
-		*vpg = LIST_NEXT(pg, pg_proc_next);
-		if (pg->pg_assigned && pg->pg_running && pg->pg_defer_ok)
-			return (pg);
-	}
-	return (NULL);
 }
 
 /*
@@ -2101,7 +2009,7 @@ pmu_syscpu_rotate_one(int cpu)
 	if (!found_cursor)
 		cursor = LIST_FIRST(&sc->sc_groups);
 
-	evictable = pmu_syscpu_evictable_rows(sc);
+	evictable = pmu_list_evictable_rows(&sc->sc_groups);
 	satisfiable = false;
 	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
 		if (!pg->pg_running || pg->pg_assigned || !pg->pg_defer_ok)
@@ -2119,7 +2027,7 @@ pmu_syscpu_rotate_one(int cpu)
 	/* Evict the single victim at the cursor, advance past it. */
 	vpg = cursor;
 	vseen = 0;
-	victim = pmu_syscpu_next_victim(sc, &vpg, &vseen, ngroups);
+	victim = pmu_list_next_victim(&sc->sc_groups, &vpg, &vseen, ngroups);
 	if (victim != NULL) {
 		PMCDBG3(PMC, OPS, 4, "sysrotate: cpu=%d evict gid=%u "
 		    "nevents=%u", cpu, victim->pg_id, victim->pg_nevents);
@@ -2145,8 +2053,8 @@ pmu_syscpu_rotate_one(int cpu)
 			goto next;
 		sin_err = pmu_sys_schedule_in(cpu, pg);
 		while (sin_err == ENOSPC && !placed_any) {
-			victim = pmu_syscpu_next_victim(sc, &vpg, &vseen,
-			    ngroups);
+			victim = pmu_list_next_victim(&sc->sc_groups, &vpg,
+			    &vseen, ngroups);
 			if (victim == NULL)
 				break;
 			PMCDBG2(PMC, OPS, 4,
@@ -2168,7 +2076,7 @@ next:
 	sc->sc_cursor = cursor;
 out:
 	/* §7.3: the kthread self-stops once nothing is left deferred. */
-	sc->sc_needed = pmu_syscpu_has_deferred(sc);
+	sc->sc_needed = pmu_list_has_deferred(&sc->sc_groups);
 }
 
 /*
@@ -2183,17 +2091,11 @@ pmu_syscpu_rotate_thread(void *arg)
 {
 	int cpu = (int)(intptr_t)arg;
 	struct pmu_syscpu *sc = &pmu_syscpu[cpu];
-	int period_ticks;
 
 	sx_xlock(&pmc_sx);
 	while (sc->sc_running) {
-		period_ticks = (pmu_mux_period_ms * hz) / 1000;
-		if (period_ticks < 1)
-			period_ticks = 1;
-		/* §7.4: jitter breaks phase-lock with periodic loads. */
-		period_ticks += prng32_bounded(period_ticks / 4 + 1);
 		(void)sx_sleep(&sc->sc_needed, &pmc_sx, 0, "muxsys",
-		    period_ticks);
+		    pmu_rot_period_ticks());
 		if (!sc->sc_running)
 			break;
 		pmu_syscpu_rotate_one(cpu);

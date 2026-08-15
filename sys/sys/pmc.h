@@ -817,6 +817,7 @@ struct pmc_pcpu_state {
  */
 typedef struct pmu_event pmu_event_t;
 typedef struct pmu_group pmu_group_t;
+LIST_HEAD(pmu_group_list, pmu_group);
 #endif
 
 struct pmc {
@@ -965,7 +966,7 @@ struct pmc_process {
 	uint32_t	pp_flags;		/* flags PMC_PP_* */
 	struct proc	*pp_proc;		/* target process */
 #ifdef _KERNEL
-	LIST_HEAD(, pmu_group) pp_pmu_groups;	/* attached PMU groups (FIFO) */
+	struct pmu_group_list pp_pmu_groups;	/* attached PMU groups (FIFO) */
 	struct mtx	pp_pmu_lock;		/* protects pp_pmu_groups */
 	/*
 	 * Inter-group multiplex rotation.  When the union of events

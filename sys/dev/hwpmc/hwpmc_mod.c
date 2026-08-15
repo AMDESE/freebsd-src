@@ -3433,8 +3433,7 @@ pmc_find_process_descriptor(struct proc *p, uint32_t mode)
 	if ((mode & PMC_FLAG_ALLOCATE) != 0) {
 		ppnew = malloc(sizeof(struct pmc_process) + md->pmd_npmc *
 		    sizeof(struct pmc_targetstate), M_PMC, M_WAITOK | M_ZERO);
-		mtx_init(&ppnew->pp_pmu_lock, "pmc-pmu-groups", "pmc-pmu",
-		    MTX_SPIN);
+		pmu_pp_init(ppnew);
 	}
 
 	mtx_lock_spin(&pmc_processhash_mtx);
@@ -3451,7 +3450,6 @@ pmc_find_process_descriptor(struct proc *p, uint32_t mode)
 	if ((mode & PMC_FLAG_ALLOCATE) != 0 && pp == NULL && ppnew != NULL) {
 		ppnew->pp_proc = p;
 		LIST_INIT(&ppnew->pp_tds);
-		LIST_INIT(&ppnew->pp_pmu_groups);
 		ppnew->pp_tdslock = mtx_pool_find(pmc_mtxpool, ppnew);
 		LIST_INSERT_HEAD(pph, ppnew, pp_next);
 		mtx_unlock_spin(&pmc_processhash_mtx);
@@ -3494,26 +3492,14 @@ pmc_destroy_process_descriptor(struct pmc_process *pp)
 {
 	struct pmc_thread *pmc_td;
 
-	/*
-	 * Defense in depth: with the reordering in
-	 * pmc_release_pmc_descriptor, every pmu_group should already
-	 * have been unhooked from pp by its own pmu_group_on_release.
-	 * But if any caller ever drives pp_refcnt to zero without going
-	 * through that path, sever any leftover pp_pmu_groups linkage
-	 * here so the pgs never see a freed pp.
-	 */
-	pmu_pp_release_all(pp);
 	KASSERT(pp->pp_pmu_unhashed,
 	    ("[pmc,%d] destroying hashed process descriptor", __LINE__));
-	KASSERT(pp->pp_pmu_refs == 0 && pp->pp_pmu_rot_quiesce == 0 &&
-	    pp->pp_pmu_rot_td == NULL,
-	    ("[pmc,%d] destroying referenced process descriptor", __LINE__));
+	pmu_pp_destroy(pp);
 
 	while ((pmc_td = LIST_FIRST(&pp->pp_tds)) != NULL) {
 		LIST_REMOVE(pmc_td, pt_next);
 		pmc_thread_descriptor_pool_free(pmc_td);
 	}
-	mtx_destroy(&pp->pp_pmu_lock);
 	free(pp, M_PMC);
 }
 
@@ -4042,7 +4028,6 @@ hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
 	mtx_pool_unlock_spin(pmc_mtxpool, pm);
 	pm->pm_pcpu_state[cpu].pps_cpustate = 1;
 	(void)pcd->pcd_start_pmc(cpu, adjri, pm);
-	pmu_group_sys_row_started(pm);
 	critical_exit();
 	pmc_restore_cpu_binding(&pb);
 }
@@ -4078,7 +4063,6 @@ hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm)
 		PMC_PCPU_SAVED(cpu, ri) = v;
 		mtx_pool_unlock_spin(pmc_mtxpool, pm);
 	}
-	pmu_group_sys_row_stopped(pm);
 	critical_exit();
 	pmc_restore_cpu_binding(&pb);
 }
@@ -6067,18 +6051,16 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 				error = ENOMEM;
 				break;
 			}
-		error = pmu_group_create(po, &gc.pm_groupid);
-		PMCDBG3(PMC, ALL, 1, "groupcreate: pid=%d gid=%u err=%d",
-		    td->td_proc->p_pid, gc.pm_groupid, error);
-		if (error == 0) {
-			error = copyout(&gc, arg, sizeof(gc));
-			if (error != 0) {
-				pg = pmu_group_lookup(po, gc.pm_groupid);
-				KASSERT(pg != NULL,
-				    ("[pmc,%d] created group missing", __LINE__));
-				pmu_group_release(pg);
-				pmc_maybe_remove_owner(po);
-			}
+		pmu_group_create(po, &gc.pm_groupid);
+		PMCDBG2(PMC, ALL, 1, "groupcreate: pid=%d gid=%u",
+		    td->td_proc->p_pid, gc.pm_groupid);
+		error = copyout(&gc, arg, sizeof(gc));
+		if (error != 0) {
+			pg = pmu_group_lookup(po, gc.pm_groupid);
+			KASSERT(pg != NULL,
+			    ("[pmc,%d] created group missing", __LINE__));
+			pmu_group_release(pg);
+			pmc_maybe_remove_owner(po);
 		}
 	}
 	break;
@@ -6953,11 +6935,7 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 	PMCDBG2(PMC, OPS, 2,
 	    "process_exit: pid=%d pp=%p draining pmu groups",
 	    p->p_pid, pp);
-	pmu_pp_release_all(pp);
-	KASSERT(pp->pp_pmu_refs == 0 && pp->pp_pmu_rot_quiesce == 0 &&
-	    pp->pp_pmu_rot_td == NULL,
-	    ("[pmc,%d] exiting process descriptor still referenced", __LINE__));
-	mtx_destroy(&pp->pp_pmu_lock);
+	pmu_pp_destroy(pp);
 	free(pp, M_PMC);
 
 out:
