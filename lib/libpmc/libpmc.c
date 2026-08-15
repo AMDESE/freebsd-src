@@ -1398,48 +1398,99 @@ pmc_group_commit(uint32_t groupid)
 	return (PMC_CALL(PMC_OP_PMCGROUPCOMMIT, &args));
 }
 
-/*
- * Convenience: release a sequence of grouped pmc ids.  Kept lib-side
- * so callers do not have to track sibling ids individually; the
- * kernel side has already wired pmu_group_on_release into
- * pmc_release_pmc_descriptor.
- */
 int
-pmc_group_release(pmc_id_t *pmcids, size_t n)
+pmc_group_read(pmc_id_t leader, uint32_t *nmembers,
+    struct pmc_group_member *members, struct pmc_group_times *times)
 {
-	size_t i;
-	int last_err = 0;
+	struct pmc_op_pmcgroupread *snapshot;
+	size_t snapshot_size;
+	uint32_t capacity;
+	int error, rv;
 
-	for (i = 0; i < n; i++)
-		if (pmc_release(pmcids[i]) != 0)
-			last_err = -1;
-	return (last_err);
+	if (nmembers == NULL) {
+		errno = EINVAL;
+		return (-1);
+	}
+	capacity = *nmembers;
+	if (capacity > PMC_GROUP_MAX_MEMBERS ||
+	    (capacity != 0 && members == NULL)) {
+		errno = EINVAL;
+		return (-1);
+	}
+
+	snapshot_size = sizeof(*snapshot) +
+	    capacity * sizeof(snapshot->pm_members[0]);
+	snapshot = calloc(1, snapshot_size);
+	if (snapshot == NULL)
+		return (-1);
+	snapshot->pm_leader = leader;
+	snapshot->pm_nmembers = capacity;
+	rv = PMC_CALL(PMC_OP_PMCGROUPREAD, snapshot);
+	if (rv == 0) {
+		*nmembers = snapshot->pm_nmembers;
+		if (capacity != 0) {
+			memcpy(members, snapshot->pm_members,
+			    snapshot->pm_nmembers * sizeof(members[0]));
+			if (times != NULL) {
+				times->pgt_enabled = snapshot->pm_enabled;
+				times->pgt_running = snapshot->pm_running;
+				times->pgt_enabled_wall =
+				    snapshot->pm_enabled_wall;
+				times->pgt_wall = snapshot->pm_wall;
+				times->pgt_flags = snapshot->pm_gflags;
+			}
+		}
+	} else if (errno == E2BIG) {
+		*nmembers = snapshot->pm_nmembers;
+	}
+	error = errno;
+	free(snapshot);
+	if (rv != 0)
+		errno = error;
+	return (rv);
 }
 
 /*
- * Advanced reader: returns the (scaled) value plus the time_enabled
- * and time_running ratios used by the kernel to scale a multiplexed
- * event.  Until the kernel exports the ratios in pmc_op_pmcrw,
- * *enabled and *running are populated with zero and pmc_read() returns
- * the already-scaled value; callers that want explicit scaling factors
- * should treat unsupported (0,0) as "scaling not available".
+ * Read one group leader value together with its enabled and running times.
  */
 int
 pmc_read_pair(pmc_id_t pmc, pmc_value_t *value, uint64_t *enabled,
     uint64_t *running)
 {
-	int rv;
+	struct pmc_group_member *members;
+	struct pmc_group_times times;
+	pmc_value_t result;
+	uint32_t n;
+	int error;
 
 	if (value == NULL) {
 		errno = EINVAL;
 		return (-1);
 	}
-	rv = pmc_read(pmc, value);
+	n = 0;
+	if (pmc_group_read(pmc, &n, NULL, NULL) != 0) {
+		if (errno == ENOTTY)
+			errno = EOPNOTSUPP;
+		return (-1);
+	}
+	members = calloc(n, sizeof(*members));
+	if (members == NULL)
+		return (-1);
+	if (pmc_group_read(pmc, &n, members, &times) != 0) {
+		error = errno;
+		free(members);
+		errno = error == ENOTTY ? EOPNOTSUPP : error;
+		return (-1);
+	}
+	result = members[0].pm_value;
+	free(members);
+
+	*value = result;
 	if (enabled != NULL)
-		*enabled = 0;
+		*enabled = times.pgt_enabled;
 	if (running != NULL)
-		*running = 0;
-	return (rv);
+		*running = times.pgt_running;
+	return (0);
 }
 
 int
