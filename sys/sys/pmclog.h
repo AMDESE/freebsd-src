@@ -321,7 +321,11 @@ void	pmclog_process_closelog(struct pmc_owner *po);
 void	pmclog_process_dropnotify(struct pmc_owner *po);
 void	pmclog_process_map_in(struct pmc_owner *po, pid_t pid,
     uintfptr_t start, const char *path);
+void	pmclog_process_map_in_nowakeup(struct pmc_owner *po, pid_t pid,
+    uintfptr_t start, const char *path);
 void	pmclog_process_map_out(struct pmc_owner *po, pid_t pid,
+    uintfptr_t start, uintfptr_t end);
+void	pmclog_process_map_out_nowakeup(struct pmc_owner *po, pid_t pid,
     uintfptr_t start, uintfptr_t end);
 void	pmclog_process_pmcallocate(struct pmc *_pm);
 void	pmclog_process_pmcattach(struct pmc *_pm, pid_t _pid, char *_path);

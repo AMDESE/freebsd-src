@@ -963,6 +963,48 @@ pmclog_process_map_in(struct pmc_owner *po, pid_t pid, uintfptr_t start,
 	PMCLOG_DESPATCH_SYNC(po);
 }
 
+/*
+ * Mapping records for callers that already hold a spin mutex.  Waking
+ * the log kthread from such a context would invert established spin
+ * lock orders, so these queue the buffer without a wakeup, exactly as
+ * pmclog_process_proccsw() does under a scheduler lock; the record is
+ * flushed by the next emitter that can wake the kthread.
+ */
+void
+pmclog_process_map_in_nowakeup(struct pmc_owner *po, pid_t pid,
+    uintfptr_t start, const char *path)
+{
+	int pathlen, recordlen;
+
+	KASSERT(path != NULL, ("[pmclog,%d] map-in, null path", __LINE__));
+
+	pathlen = strlen(path) + 1;	/* #bytes for path name */
+	recordlen = offsetof(struct pmclog_map_in, pl_pathname) +
+	    pathlen;
+
+	PMCLOG_RESERVE_SAFE(po, PMCLOG_TYPE_MAP_IN, recordlen, pmc_rdtsc());
+	PMCLOG_EMIT32(pid);
+	PMCLOG_EMIT32(0);
+	PMCLOG_EMITADDR(start);
+	PMCLOG_EMITSTRING(path,pathlen);
+	PMCLOG_DESPATCH_SCHED_LOCK(po);
+}
+
+void
+pmclog_process_map_out_nowakeup(struct pmc_owner *po, pid_t pid,
+    uintfptr_t start, uintfptr_t end)
+{
+	KASSERT(start <= end, ("[pmclog,%d] start > end", __LINE__));
+
+	PMCLOG_RESERVE_SAFE(po, PMCLOG_TYPE_MAP_OUT,
+	    sizeof(struct pmclog_map_out), pmc_rdtsc());
+	PMCLOG_EMIT32(pid);
+	PMCLOG_EMIT32(0);
+	PMCLOG_EMITADDR(start);
+	PMCLOG_EMITADDR(end);
+	PMCLOG_DESPATCH_SCHED_LOCK(po);
+}
+
 void
 pmclog_process_map_out(struct pmc_owner *po, pid_t pid, uintfptr_t start,
     uintfptr_t end)

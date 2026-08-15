@@ -2609,10 +2609,18 @@ pmc_group_needs_mapping(pmu_group_t *pg)
  * emits a MAP_OUT for [start, end).
  *
  * The callers run from a VM callback, so this may neither sleep nor
- * acquire pmc_sx.  The walk therefore runs entirely under pp_pmu_lock,
- * which keeps every visited group -- and hence its owner descriptor --
- * linked and alive, and pmclog emission is spin-lock safe.  Mapping
- * records are owner-scoped, so at most one is emitted per owner.
+ * acquire pmc_sx.  The walk therefore runs entirely under pp_pmu_lock:
+ * a group is unlinked from pp_pmu_groups under that lock before its
+ * members are destroyed, and an owner descriptor outlives its groups,
+ * so everything reached here stays valid.  Emission uses the nowakeup
+ * record variants -- waking the log kthread under a spin mutex would
+ * invert the scheduler lock order in which pmu_group_csw_in() takes
+ * pp_pmu_lock; the buffered records are flushed by the next emitter.
+ *
+ * Mapping records are owner-scoped, so this walk emits at most one per
+ * owner.  An owner that also has a placed member still gets that
+ * member's record from the pp_pmcs[] walk, exactly as it already does
+ * for two ordinary sampling PMCs on one target.
  */
 static void
 pmc_log_group_mapping(struct pmc_process *pp, pid_t pid, uintfptr_t start,
@@ -2639,9 +2647,10 @@ pmc_log_group_mapping(struct pmc_process *pp, pid_t pid, uintfptr_t start,
 			continue;
 
 		if (path != NULL)
-			pmclog_process_map_in(po, pid, start, path);
+			pmclog_process_map_in_nowakeup(po, pid, start, path);
 		else
-			pmclog_process_map_out(po, pid, start, end);
+			pmclog_process_map_out_nowakeup(po, pid, start,
+			    end);
 	}
 	mtx_unlock_spin(&pp->pp_pmu_lock);
 }
