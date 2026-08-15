@@ -285,10 +285,111 @@ ATF_TC_BODY(live_snapshot, tc)
 	cleanup_group(&group);
 }
 
+ATF_TC_WITHOUT_HEAD(sampling_member);
+ATF_TC_BODY(sampling_member, tc)
+{
+	struct pmc_group_member members[2];
+	struct pmc_group_times times;
+	struct test_group group;
+	uint32_t n;
+
+	require_hwpmc();
+	memset(&group, 0, sizeof(group));
+	group.tg_nmembers = 2;
+	group.tg_leader = 0;
+	group.tg_ids[0] = group.tg_ids[1] = PMC_ID_INVALID;
+	ATF_REQUIRE_MSG(pmc_allocate_group("instructions", PMC_MODE_TC, 0,
+	    PMC_CPU_ANY, &group.tg_ids[0], 0) == 0,
+	    "counting allocation failed: %s", strerror(errno));
+	ATF_REQUIRE_MSG(pmc_allocate_group("instructions", PMC_MODE_TS, 0,
+	    PMC_CPU_ANY, &group.tg_ids[1], 1000) == 0,
+	    "sampling allocation failed: %s", strerror(errno));
+	ATF_REQUIRE(pmc_group_create(&group.tg_groupid) == 0);
+	ATF_REQUIRE(pmc_group_add(group.tg_groupid, group.tg_ids[0], 1) == 0);
+	ATF_REQUIRE(pmc_group_add(group.tg_groupid, group.tg_ids[1], 0) == 0);
+	ATF_REQUIRE_MSG(pmc_group_commit(group.tg_groupid) == 0,
+	    "mixed group commit failed: %s", strerror(errno));
+
+	memset(members, 0, sizeof(members));
+	memset(&times, 0, sizeof(times));
+	n = nitems(members);
+	ATF_REQUIRE_MSG(pmc_group_read(group.tg_ids[0], &n, members,
+	    &times) == 0, "mixed group read failed: %s", strerror(errno));
+	ATF_CHECK_EQ(n, 2);
+	ATF_CHECK_EQ(members[0].pm_pmcid, group.tg_ids[0]);
+	ATF_CHECK_EQ(members[0].pm_mflags, 0);
+	ATF_CHECK_EQ(members[1].pm_pmcid, group.tg_ids[1]);
+	ATF_CHECK_EQ(members[1].pm_mflags, PMC_GROUP_MEMBER_F_SAMPLES);
+	ATF_CHECK_EQ(members[1].pm_value, 0);
+	cleanup_group(&group);
+}
+
+ATF_TC_WITHOUT_HEAD(sampling_live);
+ATF_TC_BODY(sampling_live, tc)
+{
+	struct pmc_group_member first, second;
+	struct pmc_group_times first_times, second_times;
+	struct test_group group;
+	pmc_value_t pair_value;
+	FILE *logfile;
+	uint64_t pair_enabled, pair_running;
+	uint32_t n;
+
+	require_hwpmc();
+	logfile = tmpfile();
+	ATF_REQUIRE(logfile != NULL);
+	ATF_REQUIRE_MSG(pmc_configure_logfile(fileno(logfile)) == 0,
+	    "logfile configuration failed: %s", strerror(errno));
+	memset(&group, 0, sizeof(group));
+	group.tg_nmembers = 1;
+	group.tg_leader = 0;
+	group.tg_ids[0] = group.tg_ids[1] = PMC_ID_INVALID;
+	ATF_REQUIRE_MSG(pmc_allocate_group("instructions", PMC_MODE_TS, 0,
+	    PMC_CPU_ANY, &group.tg_ids[0], 1000) == 0,
+	    "sampling allocation failed: %s", strerror(errno));
+	ATF_REQUIRE(pmc_group_create(&group.tg_groupid) == 0);
+	ATF_REQUIRE(pmc_group_add(group.tg_groupid, group.tg_ids[0], 1) == 0);
+	ATF_REQUIRE_MSG(pmc_group_commit(group.tg_groupid) == 0,
+	    "sampling group commit failed: %s", strerror(errno));
+	ATF_REQUIRE_MSG(pmc_attach(group.tg_ids[0], getpid()) == 0,
+	    "sampling attach failed: %s", strerror(errno));
+	ATF_REQUIRE_MSG(pmc_start(group.tg_ids[0]) == 0,
+	    "sampling start failed: %s", strerror(errno));
+	group.tg_started = true;
+
+	spin();
+	n = 1;
+	ATF_REQUIRE_MSG(pmc_group_read(group.tg_ids[0], &n, &first,
+	    &first_times) == 0, "live sampling read failed: %s",
+	    strerror(errno));
+	ATF_CHECK_EQ(first.pm_mflags, PMC_GROUP_MEMBER_F_SAMPLES);
+	ATF_CHECK(first.pm_value > 0);
+	ATF_CHECK(first_times.pgt_running <= first_times.pgt_enabled);
+	ATF_REQUIRE(pmc_stop(group.tg_ids[0]) == 0);
+	group.tg_started = false;
+	n = 1;
+	ATF_REQUIRE(pmc_group_read(group.tg_ids[0], &n, &second,
+	    &second_times) == 0);
+	ATF_CHECK(second.pm_value >= first.pm_value);
+	ATF_CHECK(second_times.pgt_enabled >= first_times.pgt_enabled);
+	ATF_CHECK(second_times.pgt_running >= first_times.pgt_running);
+
+	pair_value = pair_enabled = pair_running = 0;
+	ATF_REQUIRE(pmc_read_pair(group.tg_ids[0], &pair_value,
+	    &pair_enabled, &pair_running) == 0);
+	ATF_CHECK(pair_value >= second.pm_value);
+	ATF_CHECK(pair_running <= pair_enabled);
+	cleanup_group(&group);
+	ATF_REQUIRE(pmc_configure_logfile(-1) == 0);
+	ATF_REQUIRE(fclose(logfile) == 0);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 
 	ATF_TP_ADD_TC(tp, capacity_and_order);
 	ATF_TP_ADD_TC(tp, live_snapshot);
+	ATF_TP_ADD_TC(tp, sampling_member);
+	ATF_TP_ADD_TC(tp, sampling_live);
 	return (atf_no_error());
 }

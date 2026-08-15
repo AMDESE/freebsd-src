@@ -387,6 +387,7 @@ pmu_event_destroy(pmu_event_t *pe)
 {
 	if (pe == NULL)
 		return;
+	counter_u64_free(pe->pe_samples);
 	free(pe, M_PMU);
 }
 
@@ -752,6 +753,7 @@ pmu_group_on_allocate(struct pmc *pm, const struct pmc_op_pmcallocate *pa)
 
 	pe = malloc(sizeof(*pe), M_PMU, M_WAITOK | M_ZERO);
 	pe->pe_pmc = pm;
+	pe->pe_samples = counter_u64_alloc(M_WAITOK);
 	pe->pe_alloc = *pa;
 	pe->pe_state = PMU_EVENT_STATE_INACTIVE;
 	pe->pe_assigned_row = -1;

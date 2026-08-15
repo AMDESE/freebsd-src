@@ -2115,6 +2115,11 @@ pmc_group_snapshot_member(struct pmc_group_member *member, pmu_event_t *pe)
 
 	pm = pe->pe_pmc;
 	member->pm_pmcid = pm->pm_handle;
+	if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm))) {
+		member->pm_mflags = PMC_GROUP_MEMBER_F_SAMPLES;
+		member->pm_value = counter_u64_fetch(pe->pe_samples);
+		return;
+	}
 	mtx_pool_lock_spin(pmc_mtxpool, pm);
 	member->pm_value = pm->pm_gv.pm_savedvalue;
 	mtx_pool_unlock_spin(pmc_mtxpool, pm);
@@ -2138,7 +2143,8 @@ pmc_group_snapshot_cpu(void *arg)
 	critical_enter();
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 		pm = pe->pe_pmc;
-		if (pm == NULL || PMC_ROW_IS_UNASSIGNED(pm) ||
+		if (pm == NULL || PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)) ||
+		    PMC_ROW_IS_UNASSIGNED(pm) ||
 		    pm->pm_pcpu_state[cpu].pps_cpustate == 0)
 			continue;
 		ri = PMC_TO_ROWINDEX(pm);
@@ -2190,17 +2196,7 @@ pmc_group_snapshot_finalize(void *arg)
 		goto out;
 
 	pg = ctx->pgsc_group;
-	mtx_pool_lock_spin(pmc_mtxpool, pg);
 	snapshot = ctx->pgsc_snapshot;
-	pmu_group_time_snapshot_locked(pg, &times, cpu_ticks());
-	snapshot->pm_gflags = times.pgts_system ?
-	    PMC_GROUP_F_TIME_WALL_NS : PMC_GROUP_F_TIME_THREAD_NS;
-	snapshot->pm_enabled = times.pgts_enabled;
-	snapshot->pm_running = times.pgts_running;
-	snapshot->pm_enabled_wall = times.pgts_enabled_wall;
-	snapshot->pm_wall = times.pgts_wall;
-	mtx_pool_unlock_spin(pmc_mtxpool, pg);
-
 	i = 0;
 	pmc_group_snapshot_member(&snapshot->pm_members[i++], pg->pg_leader);
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
@@ -2211,6 +2207,16 @@ pmc_group_snapshot_finalize(void *arg)
 	    ("[pmc,%d] group %u snapshot has %u of %u members", __LINE__,
 	    pg->pg_id, i, pg->pg_nevents));
 
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_time_snapshot_locked(pg, &times, cpu_ticks());
+	snapshot->pm_gflags = times.pgts_system ?
+	    PMC_GROUP_F_TIME_WALL_NS : PMC_GROUP_F_TIME_THREAD_NS;
+	snapshot->pm_enabled = times.pgts_enabled;
+	snapshot->pm_running = times.pgts_running;
+	snapshot->pm_enabled_wall = times.pgts_enabled_wall;
+	snapshot->pm_wall = times.pgts_wall;
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+
 out:
 	atomic_store_rel_int(&ctx->pgsc_done, 1);
 }
@@ -2220,16 +2226,10 @@ pmc_group_snapshot_counts(pmu_group_t *pg,
     struct pmc_op_pmcgroupread *snapshot)
 {
 	struct pmc_group_snapshot_context ctx;
-	pmu_event_t *pe;
 	struct pmc *pm;
 	cpuset_t cpus;
 	bool transitioning;
 	int cpu;
-
-	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-		if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pe->pe_pmc)))
-			return (EOPNOTSUPP);
-	}
 
 	pm = pg->pg_leader->pe_pmc;
 	critical_enter();
@@ -6451,6 +6451,8 @@ pmc_add_sample(ring_type_t ring, struct pmc *pm, struct trapframe *tf,
 	counter_u64_add(pm->pm_runcount, 1);	/* hold onto PMC */
 	/* increment write pointer */
 	psb->ps_prodidx++;
+	if (pm->pm_pmu != NULL)
+		counter_u64_add(pm->pm_pmu->pe_samples, 1);
 done:
 	/* mark CPU as needing processing */
 	if (callchaindepth != PMC_USER_CALLCHAIN_PENDING)

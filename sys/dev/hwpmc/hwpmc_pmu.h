@@ -68,6 +68,7 @@ struct pmu_event {
 	TAILQ_ENTRY(pmu_event)		pe_sibling;
 	pmu_group_t			*pe_group;
 	struct pmc			*pe_pmc;
+	counter_u64_t			pe_samples;
 	enum pmu_event_state		pe_state;
 	bool				pe_is_leader;
 	struct pmc_op_pmcallocate	pe_alloc;
