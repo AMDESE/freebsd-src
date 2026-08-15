@@ -1804,12 +1804,19 @@ pmu_sys_group_on_start(struct pmc *pm)
 	pmu_group_running_start_locked(pg, cpu_ticks());
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 	if (!was_running) {
-		int sin_err __unused;
+		int sin_err;
 
 		sin_err = pmu_sys_schedule_in(cpu, pg);
 		PMCDBG3(PMC, OPS, 2,
 		    "sys_on_start: gid=%u cpu=%d schedule_in=%d",
 		    pg->pg_id, cpu, sin_err);
+		/* Only a MUX group may stay deferred; anyone else fails. */
+		if (sin_err != 0 && (sin_err != ENOSPC || !pg->pg_defer_ok)) {
+			mtx_pool_lock_spin(pmc_mtxpool, pg);
+			pmu_group_running_stop_locked(pg, cpu_ticks());
+			mtx_pool_unlock_spin(pmc_mtxpool, pg);
+			return (sin_err);
+		}
 	}
 
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
