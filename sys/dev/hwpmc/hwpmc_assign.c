@@ -120,10 +120,9 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 {
 	struct pmc *pm;
 	struct pmc_classdep *pcd;
-	struct pmc_mdep *mdep;
 	enum pmc_mode mode;
 	uint32_t allowed, free_mask;
-	int adjri, dummy_adjri, idcpu, n;
+	int adjri, idcpu, n;
 	bool sys;
 
 	/*
@@ -132,7 +131,9 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 	 * Global ri = pcd->pcd_ri + adjri.  We iterate adjri space and
 	 * convert to global ri only where the framework requires it.
 	 */
-	mdep = hwpmc_get_mdep();
+	pcd = pmu_class_to_classdep(pe->pe_alloc.pm_class);
+	if (pcd == NULL)
+		return (EBUSY);
 	pm = pe->pe_pmc;
 	mode = pe->pe_alloc.pm_mode;
 	allowed = pe->pe_cons.pc_allowed_rows;
@@ -162,18 +163,9 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 				return (EBUSY);
 			adjri = ffs(free_mask) - 1;
 		}
-		/* Locate the global ri that owns this adjri for our class. */
-		pcd = NULL;
-		for (n = 0; n < (int)mdep->pmd_npmc; n++) {
-			pcd = hwpmc_ri_to_classdep(n, &dummy_adjri);
-			if (pcd != NULL &&
-			    pcd->pcd_class == pe->pe_alloc.pm_class &&
-			    dummy_adjri == adjri)
-				break;
-			pcd = NULL;
-		}
-		if (pcd == NULL || n >= (int)mdep->pmd_npmc)
+		if (adjri >= pcd->pcd_num)
 			goto skip;
+		n = pcd->pcd_ri + adjri;
 		if (p != NULL && (!hwpmc_can_allocate_row(n, mode) ||
 		    !hwpmc_can_allocate_rowindex(p, n, idcpu)) &&
 		    (n >= 64 || (evictable_rows & (1ULL << n)) == 0))
@@ -288,15 +280,15 @@ static int
 pmu_group_probe(pmu_group_t *pg, struct proc *p, int cpu,
     uint64_t evictable_rows)
 {
-	pmu_event_t **order;
+	pmu_event_t *order[PMC_GROUP_MAX_MEMBERS];
 	uint32_t used_mask;
 	u_int i;
 	int error;
 
 	if (pg == NULL || pg->pg_nevents == 0)
 		return (EINVAL);
-	order = malloc(sizeof(*order) * pg->pg_nevents, M_PMC,
-	    M_WAITOK | M_ZERO);
+	KASSERT(pg->pg_nevents <= PMC_GROUP_MAX_MEMBERS,
+	    ("[pmu] probe: gid=%u nevents=%u", pg->pg_id, pg->pg_nevents));
 	pmu_sort_by_weight(pg, order, pg->pg_nevents);
 	used_mask = 0;
 	error = 0;
@@ -306,7 +298,6 @@ pmu_group_probe(pmu_group_t *pg, struct proc *p, int cpu,
 		if (error != 0)
 			break;
 	}
-	free(order, M_PMC);
 	return (error == 0 ? 0 : ENOSPC);
 }
 
@@ -343,8 +334,7 @@ pmu_group_satisfiable(pmu_group_t *pg, struct proc *p, int cpu,
 int
 pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu)
 {
-	pmu_event_t **order;
-	struct pmc_mdep *mdep;
+	pmu_event_t *order[PMC_GROUP_MAX_MEMBERS];
 	uint32_t used_mask;
 	u_int i;
 	int error;
@@ -365,16 +355,13 @@ pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu)
 	if (error != 0)
 		return (error);
 
-	mdep = hwpmc_get_mdep();
-	if (mdep == NULL || pg->pg_nevents == 0)
-		return (EINVAL);
+	KASSERT(pg->pg_nevents <= PMC_GROUP_MAX_MEMBERS,
+	    ("[pmu] assign: gid=%u nevents=%u", pg->pg_id, pg->pg_nevents));
 
 	/* See comment in pmu_unassign_group: AMD insists on cpu >= 0. */
 	if (cpu < 0)
 		cpu = 0;
 
-	order = malloc(sizeof(*order) * pg->pg_nevents, M_PMC,
-	    M_WAITOK | M_ZERO);
 	pmu_sort_by_weight(pg, order, pg->pg_nevents);
 
 	used_mask = 0;
@@ -384,7 +371,6 @@ pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu)
 		if (error != 0)
 			break;
 	}
-	free(order, M_PMC);
 
 	if (error != 0) {
 		pmu_unassign_group(pg, cpu);
