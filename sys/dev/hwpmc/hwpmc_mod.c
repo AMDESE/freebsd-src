@@ -2609,26 +2609,32 @@ pmc_group_needs_mapping(pmu_group_t *pg)
  * emits a MAP_OUT for [start, end).
  *
  * The callers run from a VM callback, so this may neither sleep nor
- * acquire pmc_sx.  The walk therefore runs entirely under pp_pmu_lock:
- * a group is unlinked from pp_pmu_groups under that lock before its
- * members are destroyed, and an owner descriptor outlives its groups,
- * so everything reached here stays valid.  Emission uses the nowakeup
- * record variants -- waking the log kthread under a spin mutex would
- * invert the scheduler lock order in which pmu_group_csw_in() takes
- * pp_pmu_lock; the buffered records are flushed by the next emitter.
+ * acquire pmc_sx.  The group list is therefore walked under
+ * pp_pmu_lock, which is what keeps it consistent: a group is unlinked
+ * from pp_pmu_groups under that lock before its members are destroyed.
+ * The owners found are snapshotted and their records emitted after the
+ * lock is dropped, so the log kthread is woken normally and the record
+ * reaches the log file ahead of the samples it describes.  Owners are
+ * dereferenced without the lock, the same exposure the pp_pmcs[] walks
+ * in the callers already have.
  *
  * Mapping records are owner-scoped, so this walk emits at most one per
  * owner.  An owner that also has a placed member still gets that
  * member's record from the pp_pmcs[] walk, exactly as it already does
  * for two ordinary sampling PMCs on one target.
  */
+#define	PMC_GROUP_MAP_OWNERS	8
+
 static void
 pmc_log_group_mapping(struct pmc_process *pp, pid_t pid, uintfptr_t start,
     uintfptr_t end, const char *path)
 {
+	struct pmc_owner *owners[PMC_GROUP_MAP_OWNERS];
 	pmu_group_t *pg, *other;
 	struct pmc_owner *po;
+	u_int i, nowners;
 
+	nowners = 0;
 	mtx_lock_spin(&pp->pp_pmu_lock);
 	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
 		if (!pmc_group_needs_mapping(pg))
@@ -2646,6 +2652,18 @@ pmc_log_group_mapping(struct pmc_process *pp, pid_t pid, uintfptr_t start,
 		if (other != pg)
 			continue;
 
+		if (nowners < nitems(owners)) {
+			owners[nowners++] = po;
+			continue;
+		}
+
+		/*
+		 * More distinct owners than the snapshot holds.  Emit the
+		 * remainder from here with the nowakeup variants: waking
+		 * the log kthread under a spin mutex would invert the
+		 * scheduler lock order in which pmu_group_csw_in() takes
+		 * pp_pmu_lock.
+		 */
 		if (path != NULL)
 			pmclog_process_map_in_nowakeup(po, pid, start, path);
 		else
@@ -2653,6 +2671,13 @@ pmc_log_group_mapping(struct pmc_process *pp, pid_t pid, uintfptr_t start,
 			    end);
 	}
 	mtx_unlock_spin(&pp->pp_pmu_lock);
+
+	for (i = 0; i < nowners; i++) {
+		if (path != NULL)
+			pmclog_process_map_in(owners[i], pid, start, path);
+		else
+			pmclog_process_map_out(owners[i], pid, start, end);
+	}
 }
 
 /*
