@@ -20,6 +20,7 @@
 #include <sys/pcpu.h>
 #include <sys/pmc.h>
 #include <sys/pmckern.h>
+#include <sys/pmclog.h>
 #include <sys/prng.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
@@ -1259,7 +1260,10 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
 		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
 	}
 
-	/* Phase 2: drain any in-flight csw_out. */
+	/* Phase 2: flush the owner's log once, then drain in-flight csw_out. */
+	if (pg->pg_owner != NULL &&
+	    (pg->pg_owner->po_flags & PMC_PO_OWNS_LOGFILE) != 0)
+		(void)pmclog_flush(pg->pg_owner, 1);
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
 		pmc_rotation_drain(pe->pe_pmc);
 

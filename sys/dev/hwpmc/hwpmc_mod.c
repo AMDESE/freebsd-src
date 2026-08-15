@@ -1049,7 +1049,6 @@ pmc_rotation_drain(struct pmc *pm)
 	 * PMC) -- re-poll briefly, never treat it as already drained.
 	 */
 	pmc_save_cpu_binding(&pb);
-	pmclog_flush(pm->pm_owner, 1);
 	while (counter_u64_fetch(pm->pm_runcount) > 0) {
 #ifdef INVARIANTS
 		KASSERT(maxloop-- > 0,
@@ -1068,7 +1067,9 @@ pmc_rotation_drain(struct pmc *pm)
 			visited = true;
 		}
 		if (!visited && counter_u64_fetch(pm->pm_runcount) > 0) {
-			pmclog_flush(pm->pm_owner, 1);
+			if ((pm->pm_owner->po_flags &
+			    PMC_PO_OWNS_LOGFILE) != 0)
+				pmclog_flush(pm->pm_owner, 1);
 			pause("pmcdrn", 1);
 		}
 	}
