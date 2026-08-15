@@ -1089,6 +1089,7 @@ pmc_rotation_drain(struct pmc *pm)
 {
 	struct pmc_binding pb;
 	int cpu;
+	bool visited;
 #ifdef INVARIANTS
 	int maxloop = 100 * pmc_cpu_max();
 #endif
@@ -1107,21 +1108,25 @@ pmc_rotation_drain(struct pmc *pm)
 	 * until the INVARIANTS cap trips and panics (or, on a production
 	 * kernel, stalls for a long time while holding pmc_sx).
 	 *
-	 * Drive the drain actively instead: walk every active CPU and, if
-	 * the counter is still loaded somewhere, migrate onto that CPU.
-	 * pmc_select_cpu() binds us there at PRI_MIN, which preempts the
-	 * resident target thread and forces its csw_out (that runs during
-	 * the switch *to* us, so by the time we execute on the CPU the
-	 * runcount for that CPU has already dropped).  Because rotation
-	 * has already stamped every sibling STOPPED before draining, the
-	 * preempted thread's next csw_in will not re-load the counter, so
-	 * a single visit per CPU is enough and runcount is monotone.
+	 * Drive the drain actively instead: migrate onto every CPU whose
+	 * pps_cpustate still advertises the counter (spec §7.5 -- the
+	 * cost is bounded by the PMC's own footprint, not the machine
+	 * size).  pmc_select_cpu() binds us there at PRI_MIN, which
+	 * preempts the resident target thread and forces its csw_out
+	 * (that runs during the switch *to* us, so by the time we execute
+	 * on the CPU the runcount for that CPU has already dropped).
+	 * Because rotation has already stamped every sibling STOPPED
+	 * before draining, the preempted thread's next csw_in will not
+	 * re-load the counter, so a single visit per CPU is enough.
+	 *
+	 * The derived CPU set is advisory under PerfMonV2: the csw-out
+	 * prepare pass clears pps_cpustate before the runcount drops, so
+	 * an empty set with pm_runcount > 0 means a switch-out is
+	 * completing right now (or queued samples still reference the
+	 * PMC) -- re-poll briefly, never treat it as already drained.
 	 */
 	pmc_save_cpu_binding(&pb);
-	for (cpu = 0; cpu < pmc_cpu_max(); cpu++) {
-		if (pmc_cpu_is_active(cpu))
-			pmc_drain_pmc_cpu(pm, cpu);
-	}
+	pmclog_flush(pm->pm_owner, 1);
 	while (counter_u64_fetch(pm->pm_runcount) > 0) {
 #ifdef INVARIANTS
 		KASSERT(maxloop-- > 0,
@@ -1129,12 +1134,19 @@ pmc_rotation_drain(struct pmc *pm)
 		    __LINE__, pm,
 		    (uintmax_t)counter_u64_fetch(pm->pm_runcount)));
 #endif
+		visited = false;
 		for (cpu = 0; cpu < pmc_cpu_max(); cpu++) {
 			if (counter_u64_fetch(pm->pm_runcount) == 0)
 				break;
-			if (!pmc_cpu_is_active(cpu))
+			if (!pmc_cpu_is_active(cpu) ||
+			    pm->pm_pcpu_state[cpu].pps_cpustate == 0)
 				continue;
 			pmc_drain_pmc_cpu(pm, cpu);
+			visited = true;
+		}
+		if (!visited && counter_u64_fetch(pm->pm_runcount) > 0) {
+			pmclog_flush(pm->pm_owner, 1);
+			pause("pmcdrn", 1);
 		}
 	}
 	pmc_restore_cpu_binding(&pb);
