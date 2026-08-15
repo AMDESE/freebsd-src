@@ -791,6 +791,23 @@ amd_start_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
 	    PMC_IS_VIRTUAL_MODE(mode))
 		amd_v2_stage_virtual(cpu, ri);
 
+	/*
+	 * Drop a stale overflow status bit before the row goes live.
+	 * amd_stop_pmc_v2() only waits OVERFLOW_WAIT_COUNT microseconds
+	 * for the previous occupant's in-flight NMI, and group rotation
+	 * makes row reuse systematic, so a surviving GLOBAL_STATUS bit
+	 * would be read by that late handler after the row was rearmed
+	 * and attributed to this PMC: a bogus sample plus a mid-window
+	 * reload for the wrong event.  With the bit cleared the late
+	 * handler sees no work and treats the NMI as spurious.  Legacy
+	 * AMD has no status plane to consult and keeps relying on the
+	 * bounded wait alone.
+	 */
+	if (pd->pm_subclass == PMC_AMD_SUB_CLASS_CORE &&
+	    PMC_IS_SAMPLING_MODE(mode) &&
+	    (rdmsr(AMD_PMC_GLOBAL_STATUS) & (1ULL << ri)) != 0)
+		wrmsr(AMD_PMC_GLOBAL_STATUS_CLR, 1ULL << ri);
+
 	/* enable EVSEL while virtual slot global bit off */
 	config = pm->pm_md.pm_amd.pm_amd_evsel | AMD_PMC_ENABLE;
 	wrmsr(pd->pm_evsel, config);
