@@ -5896,6 +5896,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 
 	case PMC_OP_PMCSTART:
 	{
+		pmu_group_t *pg;
 		pmc_id_t pmcid;
 		struct pmc *pm;
 		struct pmc_op_simple sp;
@@ -5922,6 +5923,17 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 
 		if ((error = pmc_group_leader_gate(pm)) != 0)
 			break;
+
+		/*
+		 * Gate before pmc_start(): its owner self-attach would
+		 * poison pg_attach_proc for the eventual real target.
+		 */
+		pg = pmu_group_from_pmc(pm);
+		if (pg != NULL && !pg->pg_committed) {
+			error = EXTERROR(EINVAL,
+			    "cannot start a member of an uncommitted group");
+			break;
+		}
 
 		if (pm->pm_state == PMC_STATE_RUNNING) /* already running */
 			break;
