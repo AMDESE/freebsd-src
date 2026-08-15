@@ -2538,9 +2538,9 @@ pmc_group_needs_mapping(pmu_group_t *pg)
  * from pp_pmu_groups under that lock before its members are destroyed.
  * The owners found are snapshotted and their records emitted after the
  * lock is dropped, so the log kthread is woken normally and the record
- * reaches the log file ahead of the samples it describes.  Owners are
- * dereferenced without the lock, the same exposure the pp_pmcs[] walks
- * in the callers already have.
+ * reaches the log file ahead of the samples it describes.  The callers
+ * hold the PMC epoch across that window and owner destruction waits for
+ * it, which is what keeps the snapshotted pointers alive.
  *
  * Mapping records are owner-scoped, so this walk emits at most one per
  * owner.  An owner that also has a placed member still gets that
@@ -2679,10 +2679,9 @@ pmc_process_munmap(struct thread *td, struct pmckern_map_out *pkm)
 			pmclog_process_map_out(po, pid, pkm->pm_address,
 			    pkm->pm_address + pkm->pm_size);
 	}
-	PMC_EPOCH_EXIT();
 
 	if ((pp = pmc_find_process_descriptor(td->td_proc, 0)) == NULL)
-		return;
+		goto done;
 
 	for (ri = 0; ri < md->pmd_npmc; ri++) {
 		pm = pp->pp_pmcs[ri].pp_pmc;
@@ -2695,6 +2694,8 @@ pmc_process_munmap(struct thread *td, struct pmckern_map_out *pkm)
 	/* Members of groups that are currently evicted from hardware. */
 	pmc_log_group_mapping(pp, pid, pkm->pm_address,
 	    pkm->pm_address + pkm->pm_size, NULL);
+done:
+	PMC_EPOCH_EXIT();
 }
 
 /*
@@ -3131,6 +3132,8 @@ pmc_destroy_owner_descriptor(struct pmc_owner *po)
 		LIST_REMOVE(pdh, pdh_next);
 		free(pdh, M_PMC);
 	}
+	/* The group mapping walks dereference pg_owner under the epoch. */
+	epoch_wait_preempt(global_epoch_preempt);
 	mtx_destroy(&po->po_mtx);
 	free(po, M_PMC);
 }
