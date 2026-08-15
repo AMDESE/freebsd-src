@@ -136,6 +136,7 @@ struct pmu_group {
 	bool				pg_account_placement_admit;
 	bool				pg_snapshot_pending;
 	bool				pg_snapshot_active;
+	bool				pg_releasing;
 	/*
 	 * System-wide (PMC_MODE_SC) group state.  Process-mode groups
 	 * hang off a pmc_process (pg_pp) and rotate in a per-pp kthread;
@@ -213,6 +214,8 @@ int pmu_group_create(struct pmc_owner *po, uint32_t *pg_id);
 int pmu_group_add(pmu_group_t *pg, struct pmc *pm, bool leader);
 int pmu_group_commit(pmu_group_t *pg);
 pmu_group_t *pmu_group_lookup(struct pmc_owner *po, uint32_t pg_id);
+u_int pmu_group_prepare_release(pmu_group_t *pg, struct pmc **members,
+    u_int capacity, struct pmc_process **released_pp);
 void pmu_group_release(pmu_group_t *pg);
 void pmu_group_accounting_initialize(void);
 void pmu_group_accounting_finalize(void);

@@ -94,7 +94,7 @@ main(void)
 {
 	pmc_id_t ids[MAX_EVENTS];
 	uint32_t gid = 0;
-	int i, core, target, allocated, rc;
+	int i, core, target, allocated, commit_errno, rc;
 
 	if (pmc_init() < 0)
 		err(1, "pmc_init");
@@ -151,8 +151,13 @@ main(void)
 	}
 
 	rc = pmc_group_commit(gid);
-	for (i = 0; i < allocated; i++)
-		(void)pmc_release(ids[i]);
+	commit_errno = errno;
+	if (rc == 0)
+		(void)pmc_release(ids[0]);
+	else {
+		for (i = 0; i < allocated; i++)
+			(void)pmc_release(ids[i]);
+	}
 
 	/*
 	 * Under the strictly-atomic group scheduler a single group
@@ -167,15 +172,16 @@ main(void)
 		    "split (within-group atomicity)\n", allocated, core);
 		return (1);
 	}
-	if (errno != ENOSPC) {
+	if (commit_errno != ENOSPC) {
 		fprintf(stderr,
 		    "FAIL: expected ENOSPC from oversubscribed commit, "
-		    "got errno=%d (%s)\n", errno, strerror(errno));
+		    "got errno=%d (%s)\n", commit_errno,
+		    strerror(commit_errno));
 		return (1);
 	}
 
 	printf("oversubscribed single group rejected (events=%d "
-	    "core_pool=%d errno=%d)\n", allocated, core, errno);
+	    "core_pool=%d errno=%d)\n", allocated, core, commit_errno);
 	printf("pmc_mux_test: OK\n");
 	return (0);
 }

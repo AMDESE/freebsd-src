@@ -257,13 +257,9 @@ test_basic_group(void)
 	if (v0 == 0 || v1 == 0 || v2 == 0) {
 		fprintf(stderr, "FAIL: at least one sibling never counted\n");
 		(void)pmc_release(pmc0);
-		(void)pmc_release(pmc1);
-		(void)pmc_release(pmc2);
 		return (1);
 	}
 	(void)pmc_release(pmc0);
-	(void)pmc_release(pmc1);
-	(void)pmc_release(pmc2);
 	return (0);
 }
 
@@ -283,7 +279,7 @@ test_oversubscription_rejected(void)
 {
 	uint32_t gid;
 	pmc_id_t *ids;
-	int core, target, i, allocated, err;
+	int core, target, i, allocated, commit_errno, err;
 
 	core = probe_core_pmcs();
 	if (core <= 0) {
@@ -318,8 +314,13 @@ test_oversubscription_rejected(void)
 		return (0);
 	}
 	err = pmc_group_commit(gid);
-	for (i = 0; i < allocated; i++)
-		(void)pmc_release(ids[i]);
+	commit_errno = errno;
+	if (err == 0)
+		(void)pmc_release(ids[0]);
+	else {
+		for (i = 0; i < allocated; i++)
+			(void)pmc_release(ids[i]);
+	}
 	free(ids);
 	if (err == 0) {
 		fprintf(stderr,
@@ -327,12 +328,13 @@ test_oversubscription_rejected(void)
 		    "core_pool=%d)\n", allocated, core);
 		return (1);
 	}
-	if (errno != ENOSPC) {
-		fprintf(stderr, "FAIL: expected ENOSPC got errno=%d\n", errno);
+	if (commit_errno != ENOSPC) {
+		fprintf(stderr, "FAIL: expected ENOSPC got errno=%d\n",
+		    commit_errno);
 		return (1);
 	}
 	printf("oversubscription rejected (allocated=%d core_pool=%d "
-	    "errno=%d)\n", allocated, core, errno);
+	    "errno=%d)\n", allocated, core, commit_errno);
 	return (0);
 }
 

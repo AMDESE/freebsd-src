@@ -81,6 +81,7 @@ static const char *event_pool[] = {
 struct pmu_grp {
 	uint32_t	gid;
 	int		nevents;
+	int		committed;
 	pmc_id_t	ids[MAX_PER_GROUP];
 	const char	*names[MAX_PER_GROUP];
 	pmc_value_t	v1[MAX_PER_GROUP];
@@ -201,8 +202,13 @@ release_group(struct pmu_grp *g)
 {
 	int i;
 
-	for (i = 0; i < g->nevents; i++)
-		(void)pmc_release(g->ids[i]);
+	if (g->committed)
+		(void)pmc_release(g->ids[0]);
+	else {
+		for (i = 0; i < g->nevents; i++)
+			(void)pmc_release(g->ids[i]);
+	}
+	g->committed = 0;
 	g->nevents = 0;
 }
 
@@ -289,6 +295,7 @@ main(void)
 				release_group(&grps[j]);
 			return (1);
 		}
+		grps[i].committed = 1;
 	}
 
 	for (i = 0; i < MAX_GROUPS; i++) {

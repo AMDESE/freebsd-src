@@ -76,6 +76,7 @@ struct pmu_syscpu {
 	LIST_HEAD(, pmu_group)	sc_groups;	/* groups bound to this CPU */
 	pmu_group_t		*sc_cursor;	/* round-robin start point */
 	struct thread		*sc_td;		/* rotation kthread */
+	u_int			sc_quiesce;
 	bool			sc_running;	/* kthread should keep going */
 };
 static struct pmu_syscpu pmu_syscpu[MAXCPU];
@@ -334,6 +335,24 @@ pmu_group_accounting_prepare_release(pmu_group_t *pg)
 	pmu_group_accounting_drain(pg, true);
 }
 
+static void
+pmu_pp_stop_rotate(struct pmc_process *pp, const char *wmesg)
+{
+
+	mtx_lock_spin(&pp->pp_pmu_lock);
+	pp->pp_pmu_rot_quiesce++;
+	pp->pp_pmu_rot_running = false;
+	mtx_unlock_spin(&pp->pp_pmu_lock);
+	wakeup(pp);
+	while (pp->pp_pmu_rot_td != NULL)
+		(void)hwpmc_pmu_sx_sleep(&pp->pp_pmu_rot_td, 1, wmesg);
+	mtx_lock_spin(&pp->pp_pmu_lock);
+	KASSERT(pp->pp_pmu_rot_quiesce > 0,
+	    ("[pmu] rotation quiesce underflow"));
+	pp->pp_pmu_rot_quiesce--;
+	mtx_unlock_spin(&pp->pp_pmu_lock);
+}
+
 pmu_event_t *
 pmu_event_from_pmc(struct pmc *pm)
 {
@@ -372,7 +391,7 @@ pmu_group_lookup(struct pmc_owner *po, uint32_t pg_id)
 	pmu_group_t *pg;
 
 	LIST_FOREACH(pg, &po->po_groups, pg_owner_next) {
-		if (pg->pg_id == pg_id)
+		if (pg->pg_id == pg_id && !pg->pg_releasing)
 			return (pg);
 	}
 	return (NULL);
@@ -568,59 +587,130 @@ pmu_group_commit(pmu_group_t *pg)
 	return (0);
 }
 
-void
-pmu_group_release(pmu_group_t *pg)
+u_int
+pmu_group_prepare_release(pmu_group_t *pg, struct pmc **members,
+    u_int capacity, struct pmc_process **released_pp)
 {
-	pmu_event_t *pe;
-	struct pmc_process *pp;
+	pmu_event_t *pe, *tmp;
+	pmu_group_t *other;
+	struct pmc_process *held_pp, *pp;
+	bool pp_unhashed;
+	u_int n;
 
-	if (pg == NULL)
-		return;
+	hwpmc_pmu_sx_assert_xlocked();
+	KASSERT(pg != NULL && members != NULL,
+	    ("[pmu] invalid group release preparation"));
+	KASSERT(capacity >= pg->pg_nevents,
+	    ("[pmu] group release capacity %u < %u", capacity,
+	    pg->pg_nevents));
+	KASSERT(!pg->pg_releasing,
+	    ("[pmu] group %u release already active", pg->pg_id));
 
-	pmu_group_accounting_prepare_release(pg);
+	pg->pg_releasing = true;
+	if (released_pp != NULL)
+		*released_pp = NULL;
 
-	/*
-	 * The per-pp rotation kthread is torn down by pmu_group_on_release
-	 * when the last group leaves a pp, so we have no per-group
-	 * kthread to drain here.  pmu_group_release is reachable only
-	 * after every sibling has been removed from the TAILQ, but be
-	 * defensive against direct callers that bypass that path.
-	 */
-	while ((pe = TAILQ_FIRST(&pg->pg_events)) != NULL) {
+	if (pg->pg_system) {
+		if (pg->pg_leader != NULL)
+			pmu_sys_group_pre_release(pg->pg_leader->pe_pmc);
+		if (pg->pg_committed && !pg->pg_account_blocked)
+			pmu_group_accounting_prepare_release(pg);
+	} else {
+		if (pg->pg_committed && !pg->pg_account_blocked)
+			pmu_group_accounting_prepare_release(pg);
+		held_pp = pg->pg_pp;
+		if (held_pp != NULL) {
+			mtx_lock_spin(&held_pp->pp_pmu_lock);
+			held_pp->pp_pmu_refs++;
+			mtx_unlock_spin(&held_pp->pp_pmu_lock);
+			pmu_pp_stop_rotate(held_pp, "muxrel");
+		}
+
+		pp = pg->pg_pp;
+		if (pg->pg_assigned) {
+			if (pp != NULL)
+				pmu_pp_schedule_out(pp, pg);
+			else
+				pmu_unassign_group(pg, 0);
+		}
+		if (pg->pg_pp != NULL) {
+			pp = pg->pg_pp;
+			mtx_lock_spin(&pp->pp_pmu_lock);
+			if (pp->pp_pmu_rot_cursor == pg)
+				pp->pp_pmu_rot_cursor = LIST_NEXT(pg,
+				    pg_proc_next);
+			LIST_REMOVE(pg, pg_proc_next);
+			pg->pg_pp = NULL;
+			pg->pg_attach_proc = NULL;
+			mtx_unlock_spin(&pp->pp_pmu_lock);
+			if (!pp->pp_pmu_unhashed) {
+				LIST_FOREACH(other, &pp->pp_pmu_groups, pg_proc_next) {
+					if (other->pg_running && !other->pg_assigned)
+						(void)pmu_pp_schedule_in(pp, other);
+				}
+				pmu_pp_kick_rotate(pp);
+			}
+		}
+		if (held_pp != NULL) {
+			mtx_lock_spin(&held_pp->pp_pmu_lock);
+			KASSERT(held_pp->pp_pmu_refs > 0,
+			    ("[pmu] process reference underflow"));
+			held_pp->pp_pmu_refs--;
+			pp_unhashed = held_pp->pp_pmu_unhashed;
+			mtx_unlock_spin(&held_pp->pp_pmu_lock);
+			wakeup(&held_pp->pp_pmu_refs);
+			if (released_pp != NULL && !pp_unhashed && pp == held_pp)
+				*released_pp = held_pp;
+		}
+	}
+
+	KASSERT(!pg->pg_assigned && pg->pg_pp == NULL &&
+	    !pg->pg_sys_listed,
+	    ("[pmu] group %u still scheduled during release", pg->pg_id));
+	n = 0;
+	TAILQ_FOREACH_SAFE(pe, &pg->pg_events, pe_sibling, tmp) {
+		KASSERT(n < capacity,
+		    ("[pmu] group %u release member overflow", pg->pg_id));
+		KASSERT(PMC_ROW_IS_UNASSIGNED(pe->pe_pmc),
+		    ("[pmu] group %u member still assigned", pg->pg_id));
+		members[n++] = pe->pe_pmc;
 		TAILQ_REMOVE(&pg->pg_events, pe, pe_sibling);
 		pe->pe_group = NULL;
 		pe->pe_is_leader = false;
 	}
-
-	if (pg->pg_owner != NULL)
+	pg->pg_leader = NULL;
+	pg->pg_nevents = 0;
+	if (pg->pg_owner != NULL) {
 		LIST_REMOVE(pg, pg_owner_next);
-	/*
-	 * Membership of pg on a pp's pp_pmu_groups list is tracked by
-	 * pg_pp, not pg_attach_proc.  pg_attach_proc is set by
-	 * pmc_attach_one_process even for groups that are never started
-	 * (so never inserted onto pp_pmu_groups), so gating the
-	 * LIST_REMOVE on pg_attach_proc would unlink a pg that was
-	 * never linked and panic LIST_REMOVE with "prev->next != elm".
-	 * Conversely, when pmu_group_on_release already pulled pg off
-	 * pp_pmu_groups it cleared pg_pp, so this branch correctly
-	 * skips the second LIST_REMOVE.
-	 */
-	if (pg->pg_pp != NULL) {
-		pp = pg->pg_pp;
-		mtx_lock_spin(&pp->pp_pmu_lock);
-		if (pp->pp_pmu_rot_cursor == pg)
-			pp->pp_pmu_rot_cursor = LIST_NEXT(pg, pg_proc_next);
-		LIST_REMOVE(pg, pg_proc_next);
-		pg->pg_pp = NULL;
-		mtx_unlock_spin(&pp->pp_pmu_lock);
+		pg->pg_owner = NULL;
 	}
-	KASSERT(pg->pg_account_blocked,
-	    ("[pmu] freeing group with accounting enabled"));
+	return (n);
+}
+
+void
+pmu_group_release(pmu_group_t *pg)
+{
+	u_int cpu;
+
+	if (pg == NULL)
+		return;
+
+	hwpmc_pmu_sx_assert_xlocked();
+	KASSERT(TAILQ_EMPTY(&pg->pg_events) && pg->pg_nevents == 0 &&
+	    pg->pg_leader == NULL,
+	    ("[pmu] freeing non-empty group %u", pg->pg_id));
+	KASSERT(!pg->pg_assigned && pg->pg_pp == NULL &&
+	    !pg->pg_sys_listed,
+	    ("[pmu] freeing scheduled group %u", pg->pg_id));
+	if (pg->pg_owner != NULL) {
+		LIST_REMOVE(pg, pg_owner_next);
+		pg->pg_owner = NULL;
+	}
 	KASSERT(pg->pg_oncpu_threads == 0 && pg->pg_running_threads == 0,
 	    ("[pmu] freeing group with active accounting"));
 	KASSERT(!pg->pg_snapshot_pending && !pg->pg_snapshot_active,
 	    ("[pmu] freeing group with active snapshot"));
-	for (u_int cpu = 0; cpu < pg->pg_ncpu; cpu++) {
+	for (cpu = 0; cpu < pg->pg_ncpu; cpu++) {
 		KASSERT(!pg->pg_cpu_state[cpu].pgcs_counted &&
 		    !pg->pg_cpu_state[cpu].pgcs_placed &&
 		    !pg->pg_cpu_state[cpu].pgcs_transitioning &&
@@ -744,7 +834,11 @@ pmu_group_on_start(struct pmc *pm)
 		return (EINVAL);
 	}
 
-	pp = pmc_find_process_descriptor_pmu(p, PMC_FLAG_ALLOCATE);
+	pp = pg->pg_pp;
+	if (pp != NULL && pp->pp_pmu_unhashed)
+		return (ESRCH);
+	if (pp == NULL)
+		pp = pmc_find_process_descriptor_pmu(p, PMC_FLAG_ALLOCATE);
 	if (pp == NULL)
 		return (ENOMEM);
 
@@ -1069,138 +1163,27 @@ pmu_group_on_release(struct pmc *pm)
 {
 	pmu_event_t *pe;
 	pmu_group_t *pg;
-	struct pmc_process *pp;
-	struct proc *p;
-	bool was_first_release;
 
 	pe = pmu_event_from_pmc(pm);
 	if (pe == NULL)
 		return;
 	pg = pe->pe_group;
-	if (pg == NULL)
-		goto destroy;
-
-	pmu_group_accounting_prepare_release(pg);
-
-	/*
-	 * System-wide group.  All HW teardown and rotation-kthread
-	 * shutdown already happened in pmu_sys_group_pre_release(), which
-	 * pmc_release_pmc_descriptor() invokes before it touches the row.
-	 * By the time we get here every sibling is UNASSIGNED and the
-	 * group is off its CPU's rotation list, so we only unwind the
-	 * pmu_event / pmu_group bookkeeping.
-	 */
-	if (pg->pg_system) {
+	if (pg != NULL) {
+		KASSERT(!pg->pg_committed,
+		    ("[pmu] committed group %u released by member", pg->pg_id));
 		TAILQ_REMOVE(&pg->pg_events, pe, pe_sibling);
-		pe->pe_group = NULL;
 		if (pg->pg_leader == pe)
-			pg->pg_leader = TAILQ_FIRST(&pg->pg_events);
-		if (pg->pg_nevents > 0)
-			pg->pg_nevents--;
-		if (pg->pg_nevents == 0) {
-			pg->pg_used_rows_mask = 0;
-			pmu_group_release(pg);
-		}
-		goto destroy;
-	}
-
-	/*
-	 * The pp we hung off pp_pmu_groups is recorded as pg->pg_pp.
-	 * It is the TARGET pp, NOT the owner.  Use that directly so we
-	 * tear down rotation on the same pp the scheduler walks; falling
-	 * back to looking up by attach_proc still works after pg_pp is
-	 * cleared by an earlier sibling.
-	 */
-	pp = pg->pg_pp;
-	p = pg->pg_attach_proc;
-	if (pp == NULL && p != NULL)
-		pp = pmc_find_process_descriptor_pmu(p, 0);
-
-	/*
-	 * Tear down the per-pp rotation kthread BEFORE we mutate any
-	 * group state.  Once we hit this path we are about to remove pe
-	 * from pg->pg_events; allowing the kthread to schedule_in or
-	 * schedule_out concurrently could race with that removal.  We
-	 * only do this on the FIRST release of any sibling (pg_pp set)
-	 * and only when this is the last group on the pp -- otherwise
-	 * other groups still want rotation.
-	 */
-	was_first_release = (pg->pg_pp != NULL);
-	if (was_first_release && pp != NULL) {
-		mtx_lock_spin(&pp->pp_pmu_lock);
-		was_first_release = LIST_FIRST(&pp->pp_pmu_groups) == pg &&
-		    LIST_NEXT(pg, pg_proc_next) == NULL;
-		mtx_unlock_spin(&pp->pp_pmu_lock);
-	}
-	if (was_first_release && pp != NULL && pp->pp_pmu_rot_running) {
-		pp->pp_pmu_rot_running = false;
-		wakeup(pp);
-		while (pp->pp_pmu_rot_td != NULL)
-			(void)hwpmc_pmu_sx_sleep(&pp->pp_pmu_rot_td, 1,
-			    "muxrel");
-	}
-
-	/*
-	 * Critical: remove THIS pe from pg_events before any whole-
-	 * group operation runs, because the framework's
-	 * pmc_release_pmc_descriptor already called pcd_release_pmc /
-	 * PMC_UNMARK_ROW_THREAD for this pm.  If pmu_pp_schedule_out
-	 * (below) walked the still-present pe it would invoke
-	 * pcd_release_pmc on this row a second time and corrupt the
-	 * per-class accounting.
-	 */
-	TAILQ_REMOVE(&pg->pg_events, pe, pe_sibling);
-	pe->pe_group = NULL;
-	if (pg->pg_leader == pe)
-		pg->pg_leader = TAILQ_FIRST(&pg->pg_events);
-	if (pg->pg_nevents > 0)
+			pg->pg_leader = NULL;
+		KASSERT(pg->pg_nevents > 0,
+		    ("[pmu] empty group %u member release", pg->pg_id));
 		pg->pg_nevents--;
-
-	/*
-	 * Schedule the remaining siblings out atomically: stop them,
-	 * drain in-flight csw, detach from pp, release their HW rows.
-	 * Skipped on subsequent sibling releases (pg_assigned was
-	 * cleared by the first one) and on the last release (no more
-	 * siblings to schedule out).
-	 */
-	if (pg->pg_assigned && pp != NULL && pg->pg_nevents > 0)
-		pmu_pp_schedule_out(pp, pg);
-	else if (pg->pg_assigned)
-		pg->pg_assigned = false;
-
-	/*
-	 * Unhook pg from pp->pp_pmu_groups now, while pp is still
-	 * alive.  Callers (pmc_release_pmc_descriptor) are required
-	 * to invoke us BEFORE their pm_targets unlink loop, because
-	 * that loop is what eventually drives pp_refcnt to zero and
-	 * frees pp; doing this LIST_REMOVE afterwards would touch
-	 * freed memory.  Subsequent sibling releases see pg_pp ==
-	 * NULL and skip this branch (and pmu_group_release below
-	 * also short-circuits on pg_pp == NULL).
-	 */
-	if (pg->pg_pp != NULL) {
-		PMCDBG3(PMC, OPS, 3,
-		    "release: unlinking pg=%p from pp=%p (cursor=%p)",
-		    pg, pp,
-		    pp != NULL ? pp->pp_pmu_rot_cursor : NULL);
-		KASSERT(pp != NULL, ("[pmu] linked group without pp"));
-		mtx_lock_spin(&pp->pp_pmu_lock);
-		if (pp->pp_pmu_rot_cursor == pg)
-			pp->pp_pmu_rot_cursor = LIST_NEXT(pg, pg_proc_next);
-		LIST_REMOVE(pg, pg_proc_next);
-		pg->pg_pp = NULL;
-		pg->pg_attach_proc = NULL;
-		mtx_unlock_spin(&pp->pp_pmu_lock);
+		pe->pe_group = NULL;
+		pe->pe_is_leader = false;
 	}
-
-	if (pg->pg_nevents == 0) {
-		pg->pg_used_rows_mask = 0;
-		pmu_group_release(pg);
-	}
-
-destroy:
 	pm->pm_pmu = NULL;
 	pmu_event_destroy(pe);
+	if (pg != NULL && pg->pg_nevents == 0)
+		pmu_group_release(pg);
 }
 
 /*
@@ -1393,13 +1376,10 @@ pmu_pp_release_all(struct pmc_process *pp)
 	 * pp_pmu_rot_running == false, clears pp_pmu_rot_td, and
 	 * exits.
 	 */
-	if (pp->pp_pmu_rot_running) {
-		pp->pp_pmu_rot_running = false;
-		wakeup(pp);
-		while (pp->pp_pmu_rot_td != NULL)
-			(void)hwpmc_pmu_sx_sleep(&pp->pp_pmu_rot_td, 1,
-			    "muxpurge");
-	}
+	pmu_pp_stop_rotate(pp, "muxpurge");
+	while (pp->pp_pmu_refs != 0)
+		(void)hwpmc_pmu_sx_sleep(&pp->pp_pmu_refs, 1,
+		    "muxrefs");
 
 	/*
 	 * Schedule out every group that is currently bound to pp, then
@@ -1438,7 +1418,9 @@ pmu_pp_kick_rotate(struct pmc_process *pp)
 	int n_running, n_deferred;
 	int error;
 
-	if (pp == NULL || pp->pp_pmu_rot_running)
+	if (pp == NULL || pp->pp_pmu_rot_running ||
+	    pp->pp_pmu_rot_td != NULL || pp->pp_pmu_rot_quiesce != 0 ||
+	    pp->pp_pmu_unhashed)
 		return;
 
 	n_running = n_deferred = 0;
@@ -1849,11 +1831,24 @@ pmu_sys_group_on_stop(struct pmc *pm)
 		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
 }
 
+static void
+pmu_syscpu_stop_rotate(struct pmu_syscpu *sc, const char *wmesg)
+{
+
+	sc->sc_quiesce++;
+	sc->sc_running = false;
+	wakeup(sc);
+	while (sc->sc_td != NULL)
+		(void)hwpmc_pmu_sx_sleep(&sc->sc_td, 1, wmesg);
+	KASSERT(sc->sc_quiesce > 0,
+	    ("[pmu] system rotation quiesce underflow"));
+	sc->sc_quiesce--;
+}
+
 /*
  * Called at the very top of pmc_release_pmc_descriptor(), BEFORE the
- * framework touches the row, for any system-wide group sibling.  Tears
- * down the per-CPU rotation kthread (when this is the last group on the
- * CPU), schedules the whole group out so every sibling becomes
+ * framework touches the row, for any system-wide group sibling.  Stops
+ * per-CPU rotation, schedules the whole group out so every sibling becomes
  * UNASSIGNED, and unlinks the group from the CPU's rotation list.  After
  * this returns the framework sees PMC_ROW_IS_UNASSIGNED() for the
  * releasing pm and takes its deferred-release path, so it never
@@ -1864,7 +1859,7 @@ void
 pmu_sys_group_pre_release(struct pmc *pm)
 {
 	pmu_event_t *pe;
-	pmu_group_t *pg;
+	pmu_group_t *other, *pg;
 	struct pmu_syscpu *sc;
 	int cpu;
 
@@ -1880,21 +1875,9 @@ pmu_sys_group_pre_release(struct pmc *pm)
 		return;
 	sc = &pmu_syscpu[cpu];
 
-	/*
-	 * Tear down the rotation kthread before mutating group state, but
-	 * only when this group is the last one on the CPU (otherwise other
-	 * groups still need rotation).  The sx_sleep below transiently
-	 * drops pmc_sx; the kthread wakes, sees sc_running == false, clears
-	 * sc_td and exits.
-	 */
-	if (pg->pg_sys_listed && sc->sc_running &&
-	    LIST_FIRST(&sc->sc_groups) == pg &&
-	    LIST_NEXT(pg, pg_proc_next) == NULL) {
-		sc->sc_running = false;
-		wakeup(sc);
-		while (sc->sc_td != NULL)
-			(void)hwpmc_pmu_sx_sleep(&sc->sc_td, 1, "muxsrel");
-	}
+	/* Stop rotation before changing the CPU's group set. */
+	if (pg->pg_sys_listed)
+		pmu_syscpu_stop_rotate(sc, "muxsrel");
 
 	if (pg->pg_assigned)
 		pmu_sys_schedule_out(cpu, pg);
@@ -1908,6 +1891,11 @@ pmu_sys_group_pre_release(struct pmc *pm)
 		LIST_REMOVE(pg, pg_proc_next);
 		pg->pg_sys_listed = false;
 	}
+	LIST_FOREACH(other, &sc->sc_groups, pg_proc_next) {
+		if (other->pg_running && !other->pg_assigned)
+			(void)pmu_sys_schedule_in(cpu, other);
+	}
+	pmu_syscpu_kick_rotate(cpu);
 }
 
 /*
@@ -1923,7 +1911,7 @@ pmu_syscpu_kick_rotate(int cpu)
 	int n_running, n_deferred, error;
 
 	sc = &pmu_syscpu[cpu];
-	if (sc->sc_running)
+	if (sc->sc_running || sc->sc_td != NULL || sc->sc_quiesce != 0)
 		return;
 
 	n_running = n_deferred = 0;

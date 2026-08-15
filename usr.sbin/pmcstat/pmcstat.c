@@ -142,20 +142,30 @@ pmcstat_get_cpumask(const char *cpuspec, cpuset_t *cpumask)
 void
 pmcstat_cleanup(void)
 {
-	struct pmcstat_ev *ev;
+	struct pmcstat_ev *ev, *ev2;
 
 	/* release allocated PMCs. */
-	STAILQ_FOREACH(ev, &args.pa_events, ev_next)
-		if (ev->ev_pmcid != PMC_ID_INVALID) {
-			if (pmc_stop(ev->ev_pmcid) < 0)
-				err(EX_OSERR,
-				    "ERROR: cannot stop pmc 0x%x \"%s\"",
-				    ev->ev_pmcid, ev->ev_name);
-			if (pmc_release(ev->ev_pmcid) < 0)
-				err(EX_OSERR,
-				    "ERROR: cannot release pmc 0x%x \"%s\"",
-				    ev->ev_pmcid, ev->ev_name);
+	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
+		if (ev->ev_pmcid == PMC_ID_INVALID ||
+		    (ev->ev_groupid != 0 && !ev->ev_is_leader))
+			continue;
+		if (pmc_stop(ev->ev_pmcid) < 0 && errno != EINVAL)
+			err(EX_OSERR,
+			    "ERROR: cannot stop pmc 0x%x \"%s\"",
+			    ev->ev_pmcid, ev->ev_name);
+		if (pmc_release(ev->ev_pmcid) < 0)
+			err(EX_OSERR,
+			    "ERROR: cannot release pmc 0x%x \"%s\"",
+			    ev->ev_pmcid, ev->ev_name);
+		if (ev->ev_groupid == 0)
+			ev->ev_pmcid = PMC_ID_INVALID;
+		else {
+			STAILQ_FOREACH(ev2, &args.pa_events, ev_next) {
+				if (ev2->ev_groupid == ev->ev_groupid)
+					ev2->ev_pmcid = PMC_ID_INVALID;
+			}
 		}
+	}
 
 	/* de-configure the log file if present. */
 	if (args.pa_flags & (FLAG_HAS_PIPE | FLAG_HAS_OUTPUT_LOGFILE))
@@ -254,15 +264,15 @@ pmcstat_start_pmcs(void)
 	struct pmcstat_ev *ev;
 
 	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
-
-	    assert(ev->ev_pmcid != PMC_ID_INVALID);
-
-	    if (pmc_start(ev->ev_pmcid) < 0) {
-	        warn("ERROR: Cannot start pmc 0x%x \"%s\"",
-		    ev->ev_pmcid, ev->ev_name);
-		pmcstat_cleanup();
-		exit(EX_OSERR);
-	    }
+		assert(ev->ev_pmcid != PMC_ID_INVALID);
+		if (ev->ev_groupid != 0 && !ev->ev_is_leader)
+			continue;
+		if (pmc_start(ev->ev_pmcid) < 0) {
+			warn("ERROR: Cannot start pmc 0x%x \"%s\"",
+			    ev->ev_pmcid, ev->ev_name);
+			pmcstat_cleanup();
+			exit(EX_OSERR);
+		}
 	}
 }
 

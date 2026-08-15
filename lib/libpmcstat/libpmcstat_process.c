@@ -338,12 +338,23 @@ pmcstat_attach_pmcs(struct pmcstat_args *args)
 {
 	struct pmcstat_ev *ev;
 	struct pmcstat_target *pt;
-	int count;
+	int count, grouped, ntargets;
+
+	grouped = ntargets = 0;
+	SLIST_FOREACH(pt, &args->pa_targets, pt_next)
+		ntargets++;
+	STAILQ_FOREACH(ev, &args->pa_events, ev_next) {
+		if (!PMC_IS_SYSTEM_MODE(ev->ev_mode) && ev->ev_groupid != 0)
+			grouped = 1;
+	}
+	if (grouped && ntargets > 1)
+		errx(EX_USAGE, "ERROR: grouped PMCs support one target");
 
 	/* Attach all process PMCs to target processes. */
 	count = 0;
 	STAILQ_FOREACH(ev, &args->pa_events, ev_next) {
-		if (PMC_IS_SYSTEM_MODE(ev->ev_mode))
+		if (PMC_IS_SYSTEM_MODE(ev->ev_mode) ||
+		    (ev->ev_groupid != 0 && !ev->ev_is_leader))
 			continue;
 		SLIST_FOREACH(pt, &args->pa_targets, pt_next) {
 			if (pmc_attach(ev->ev_pmcid, pt->pt_pid) == 0)

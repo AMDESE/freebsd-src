@@ -266,6 +266,7 @@ static void	pmc_process_thread_add(struct thread *td);
 static void	pmc_process_thread_delete(struct thread *td);
 static void	pmc_process_thread_userret(struct thread *td);
 static void	pmc_release_pmc_descriptor(struct pmc *pmc);
+static void	pmc_release_pmu_group(pmu_group_t *pg);
 static void	pmc_remove_owner(struct pmc_owner *po);
 static void	pmc_remove_process_descriptor(struct pmc_process *pp);
 static int	pmc_start(struct pmc *pm);
@@ -861,6 +862,7 @@ void
 pmc_remove_owner(struct pmc_owner *po)
 {
 	struct pmc *pm, *tmp;
+	pmu_group_t *pg;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
 
@@ -869,7 +871,11 @@ pmc_remove_owner(struct pmc_owner *po)
 	/* Remove descriptor from the owner hash table */
 	LIST_REMOVE(po, po_next);
 
-	/* release all owned PMC descriptors */
+	/* release groups before any remaining standalone PMCs */
+	while ((pg = LIST_FIRST(&po->po_groups)) != NULL)
+		pmc_release_pmu_group(pg);
+
+	/* release all remaining owned PMC descriptors */
 	LIST_FOREACH_SAFE(pm, &po->po_pmcs, pm_next, tmp) {
 		PMCDBG1(OWN,ORM,2, "pmc=%p", pm);
 		KASSERT(pm->pm_owner == po,
@@ -883,6 +889,8 @@ pmc_remove_owner(struct pmc_owner *po)
 	    ("[pmc,%d] SS count not zero", __LINE__));
 	KASSERT(LIST_EMPTY(&po->po_pmcs),
 	    ("[pmc,%d] PMC list not empty", __LINE__));
+	KASSERT(LIST_EMPTY(&po->po_groups),
+	    ("[pmc,%d] group list not empty", __LINE__));
 
 	/* de-configure the log file if present */
 	if (po->po_flags & PMC_PO_OWNS_LOGFILE)
@@ -904,7 +912,7 @@ pmc_maybe_remove_owner(struct pmc_owner *po)
 	 * - this process has no deferred-handle generation state
 	 * - this process has not allocated a system-wide sampling buffer
 	 */
-	if (LIST_EMPTY(&po->po_pmcs) &&
+	if (LIST_EMPTY(&po->po_pmcs) && LIST_EMPTY(&po->po_groups) &&
 	    LIST_EMPTY(&po->po_deferred_handles) &&
 	    ((po->po_flags & PMC_PO_OWNS_LOGFILE) == 0)) {
 		pmc_remove_owner(po);
@@ -2971,6 +2979,10 @@ pmc_destroy_owner_descriptor(struct pmc_owner *po)
 
 	PMCDBG4(OWN,REL,1, "destroy-owner po=%p proc=%p (%d, %s)",
 	    po, po->po_owner, po->po_owner->p_pid, po->po_owner->p_comm);
+	KASSERT(LIST_EMPTY(&po->po_pmcs),
+	    ("[pmc,%d] destroying owner with PMCs", __LINE__));
+	KASSERT(LIST_EMPTY(&po->po_groups),
+	    ("[pmc,%d] destroying owner with groups", __LINE__));
 
 	LIST_FOREACH_SAFE(pdh, &po->po_deferred_handles, pdh_next, tmp) {
 		KASSERT(pdh->pdh_used == 0,
@@ -3290,8 +3302,10 @@ pmc_find_process_descriptor(struct proc *p, uint32_t mode)
 			break;
 	}
 
-	if ((mode & PMC_FLAG_REMOVE) != 0 && pp != NULL)
+	if ((mode & PMC_FLAG_REMOVE) != 0 && pp != NULL) {
 		LIST_REMOVE(pp, pp_next);
+		pp->pp_pmu_unhashed = true;
+	}
 
 	if ((mode & PMC_FLAG_ALLOCATE) != 0 && pp == NULL && ppnew != NULL) {
 		ppnew->pp_proc = p;
@@ -3327,6 +3341,7 @@ pmc_remove_process_descriptor(struct pmc_process *pp)
 
 	mtx_lock_spin(&pmc_processhash_mtx);
 	LIST_REMOVE(pp, pp_next);
+	pp->pp_pmu_unhashed = true;
 	mtx_unlock_spin(&pmc_processhash_mtx);
 }
 
@@ -3347,6 +3362,11 @@ pmc_destroy_process_descriptor(struct pmc_process *pp)
 	 * here so the pgs never see a freed pp.
 	 */
 	pmu_pp_release_all(pp);
+	KASSERT(pp->pp_pmu_unhashed,
+	    ("[pmc,%d] destroying hashed process descriptor", __LINE__));
+	KASSERT(pp->pp_pmu_refs == 0 && pp->pp_pmu_rot_quiesce == 0 &&
+	    pp->pp_pmu_rot_td == NULL,
+	    ("[pmc,%d] destroying referenced process descriptor", __LINE__));
 
 	while ((pmc_td = LIST_FIRST(&pp->pp_tds)) != NULL) {
 		LIST_REMOVE(pmc_td, pt_next);
@@ -4075,21 +4095,15 @@ pmc_start(struct pmc *pm)
 		return (error);
 	}
 
-	/*
-	 * Multiplexed group siblings are only periodically bound to a
-	 * HW row by the rotation kthread; in between they live with
-	 * pm_id encoding PMC_ROW_UNASSIGNED.  Calling pmc_ri_to_classdep
-	 * on ri == 255 would assert and panic, so for those we just
-	 * mark RUNNING and let the rotation pick the PMC up on its
-	 * next window.  Userland already saw a successful pmc_start.
-	 */
+	/* Route unassigned virtual members through the group layer. */
 	if (PMC_ROW_IS_UNASSIGNED(pm)) {
 		KASSERT(PMC_IS_VIRTUAL_MODE(mode),
 		    ("[pmc,%d] start on unassigned non-virtual pmc=%p",
 		    __LINE__, pm));
-		(void)pmu_group_on_start(pm);
-		pm->pm_state = PMC_STATE_RUNNING;
-		return (0);
+		error = pmu_group_on_start(pm);
+		if (error == 0)
+			pm->pm_state = PMC_STATE_RUNNING;
+		return (error);
 	}
 	ri   = PMC_TO_ROWINDEX(pm);
 	pcd  = pmc_ri_to_classdep(md, ri, &adjri);
@@ -4730,6 +4744,8 @@ pmc_do_op_pmcattach(struct thread *td, struct pmc_op_pmcattach a)
 
 	pe = pmu_event_from_pmc(pm);
 	pg = pe != NULL ? pe->pe_group : NULL;
+	if (pg != NULL && pg->pg_releasing)
+		return (EBUSY);
 	if (pg != NULL && pg->pg_committed && pg->pg_leader != pe)
 		return (ENOTTY);
 
@@ -4786,6 +4802,7 @@ pmc_do_op_pmcattach(struct thread *td, struct pmc_op_pmcattach a)
 static int
 pmc_do_op_pmcdetach(struct thread *td, struct pmc_op_pmcattach a)
 {
+	pmu_event_t *pe;
 	struct pmc *pm;
 	struct proc *p;
 	int error;
@@ -4799,6 +4816,10 @@ pmc_do_op_pmcdetach(struct thread *td, struct pmc_op_pmcattach a)
 	error = pmc_find_pmc(a.pm_pmc, &pm);
 	if (error != 0)
 		return (error);
+	pe = pmu_event_from_pmc(pm);
+	if (pe != NULL && pe->pe_group != NULL &&
+	    pe->pe_group->pg_committed)
+		return (EBUSY);
 
 	if ((p = pfind(a.pm_pid)) == NULL)
 		return (ESRCH);
@@ -4820,12 +4841,34 @@ pmc_do_op_pmcdetach(struct thread *td, struct pmc_op_pmcattach a)
 	return (error);
 }
 
+static void
+pmc_release_pmu_group(pmu_group_t *pg)
+{
+	struct pmc *members[PMC_GROUP_MAX_MEMBERS];
+	struct pmc_process *pp;
+	u_int i, n;
+
+	n = pmu_group_prepare_release(pg, members, nitems(members), &pp);
+	if (pp != NULL && !pp->pp_pmu_unhashed && pp->pp_refcnt == 0 &&
+	    LIST_EMPTY(&pp->pp_pmu_groups)) {
+		pmc_remove_process_descriptor(pp);
+		pmc_destroy_process_descriptor(pp);
+	}
+	for (i = 0; i < n; i++) {
+		pmc_release_pmc_descriptor(members[i]);
+		pmc_destroy_pmc_descriptor(members[i]);
+	}
+	pmu_group_release(pg);
+}
+
 /*
  * Main body of PMC_OP_PMCRELEASE.
  */
 static int
 pmc_do_op_pmcrelease(pmc_id_t pmcid)
 {
+	pmu_event_t *pe;
+	pmu_group_t *pg;
 	struct pmc_owner *po;
 	struct pmc *pm;
 	int error;
@@ -4847,6 +4890,17 @@ pmc_do_op_pmcrelease(pmc_id_t pmcid)
 		return (error);
 
 	po = pm->pm_owner;
+	pe = pmu_event_from_pmc(pm);
+	pg = pe != NULL ? pe->pe_group : NULL;
+	if (pg != NULL && pg->pg_releasing)
+		return (EBUSY);
+	if (pg != NULL && pg->pg_committed) {
+		if (pg->pg_leader != pe)
+			return (EBUSY);
+		pmc_release_pmu_group(pg);
+		pmc_maybe_remove_owner(po);
+		return (0);
+	}
 	pmc_release_pmc_descriptor(pm);
 	pmc_maybe_remove_owner(po);
 	pmc_destroy_pmc_descriptor(pm);
@@ -5728,6 +5782,11 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 
 		pe = pmu_event_from_pmc(pm);
 		if (pe != NULL && pe->pe_group != NULL &&
+		    pe->pe_group->pg_releasing) {
+			error = EBUSY;
+			break;
+		}
+		if (pe != NULL && pe->pe_group != NULL &&
 		    pe->pe_group->pg_committed &&
 		    pe->pe_group->pg_leader != pe) {
 			error = ENOTTY;
@@ -5777,6 +5836,11 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 			pm->pm_handle, pmcid));
 
 		pe = pmu_event_from_pmc(pm);
+		if (pe != NULL && pe->pe_group != NULL &&
+		    pe->pe_group->pg_releasing) {
+			error = EBUSY;
+			break;
+		}
 		if (pe != NULL && pe->pe_group != NULL &&
 		    pe->pe_group->pg_committed &&
 		    pe->pe_group->pg_leader != pe) {
@@ -5959,6 +6023,10 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 			break;
 		}
 		pg = pe->pe_group;
+		if (pg->pg_releasing) {
+			error = EBUSY;
+			break;
+		}
 		KASSERT(pg->pg_nevents <= PMC_GROUP_MAX_MEMBERS,
 		    ("[pmc,%d] group %u has %u members", __LINE__, pg->pg_id,
 		    pg->pg_nevents));
@@ -6722,6 +6790,9 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 	    "process_exit: pid=%d pp=%p draining pmu groups",
 	    p->p_pid, pp);
 	pmu_pp_release_all(pp);
+	KASSERT(pp->pp_pmu_refs == 0 && pp->pp_pmu_rot_quiesce == 0 &&
+	    pp->pp_pmu_rot_td == NULL,
+	    ("[pmc,%d] exiting process descriptor still referenced", __LINE__));
 	mtx_destroy(&pp->pp_pmu_lock);
 	free(pp, M_PMC);
 

@@ -976,7 +976,10 @@ struct pmc_process {
 	 * together or none of them is.
 	 */
 	struct thread	*pp_pmu_rot_td;
+	u_int		pp_pmu_refs;
+	u_int		pp_pmu_rot_quiesce;
 	bool		pp_pmu_rot_running;
+	bool		pp_pmu_unhashed;
 	/*
 	 * Round-robin cursor: the next group to attempt scheduling-in
 	 * at the start of each rotation tick.  When a group fails to

@@ -44,15 +44,10 @@ is_amd(void)
 static void
 cleanup_group(struct test_group *group)
 {
-	u_int i;
 
 	if (group->tg_started)
 		(void)pmc_stop(group->tg_ids[group->tg_leader]);
 	(void)pmc_release(group->tg_ids[group->tg_leader]);
-	for (i = 0; i < group->tg_nmembers; i++) {
-		if (i != group->tg_leader)
-			(void)pmc_release(group->tg_ids[i]);
-	}
 }
 
 static int
