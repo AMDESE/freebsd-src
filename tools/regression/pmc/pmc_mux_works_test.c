@@ -291,21 +291,12 @@ main(void)
 		}
 	}
 
-	/*
-	 * Process-mode PMCs require an explicit attach before start;
-	 * the kernel's pmu_group_target_proc() resolves the target proc
-	 * exclusively from pm_targets and pg_attach_proc, never the
-	 * owner.  Attach every sibling so the whole group binds when
-	 * we start the leader.
-	 */
 	for (i = 0; i < MAX_GROUPS; i++) {
-		for (j = 0; j < grps[i].nevents; j++) {
-			if (pmc_attach(grps[i].ids[j], getpid()) < 0) {
-				warn("pmc_attach group %d sibling %d", i, j);
-				for (int k = 0; k < MAX_GROUPS; k++)
-					release_group(&grps[k]);
-				return (1);
-			}
+		if (pmc_attach(grps[i].ids[0], getpid()) < 0) {
+			warn("pmc_attach group %d leader", i);
+			for (int k = 0; k < MAX_GROUPS; k++)
+				release_group(&grps[k]);
+			return (1);
 		}
 	}
 

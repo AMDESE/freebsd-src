@@ -302,15 +302,13 @@ main(void)
 		}
 	}
 
-	/* Attach every sibling to this process (covers all its threads). */
 	for (i = 0; i < MAX_GROUPS; i++)
-		for (j = 0; j < grps[i].nevents; j++)
-			if (pmc_attach(grps[i].ids[j], getpid()) < 0) {
-				warn("pmc_attach g%d s%d", i, j);
-				for (int k = 0; k < MAX_GROUPS; k++)
-					release_group(&grps[k]);
-				return (1);
-			}
+		if (pmc_attach(grps[i].ids[0], getpid()) < 0) {
+			warn("pmc_attach g%d leader", i);
+			for (int k = 0; k < MAX_GROUPS; k++)
+				release_group(&grps[k]);
+			return (1);
+		}
 
 	/* Fastest rotation the kernel accepts, to hammer the drain. */
 	new_period = 1;

@@ -40,6 +40,38 @@ is_amd(void)
  * single core-class group.
  */
 static int
+expect_errno(const char *operation, int error, int expected)
+{
+	if (error < 0 && errno == expected)
+		return (0);
+	fprintf(stderr, "FAIL: %s: expected errno %d, got error=%d errno=%d\n",
+	    operation, expected, error, errno);
+	return (1);
+}
+
+static int
+test_allocation_gates(void)
+{
+	pmc_id_t pmcid;
+
+	pmcid = PMC_ID_INVALID;
+	if (expect_errno("grouped descendants",
+	    pmc_allocate_group("instructions", PMC_MODE_TC,
+	    PMC_F_DESCENDANTS, PMC_CPU_ANY, &pmcid, 0), EOPNOTSUPP) != 0)
+		return (1);
+	if (expect_errno("grouped counting initial value",
+	    pmc_allocate_group("instructions", PMC_MODE_TC, 0,
+	    PMC_CPU_ANY, &pmcid, 1), EINVAL) != 0)
+		return (1);
+	if (pmc_allocate_group("instructions", PMC_MODE_TS, 0,
+	    PMC_CPU_ANY, &pmcid, 1000) < 0) {
+		warn("grouped sampling reload count");
+		return (1);
+	}
+	return (pmc_release(pmcid) < 0);
+}
+
+static int
 probe_core_pmcs(void)
 {
 	pmc_id_t ids[64];
@@ -98,44 +130,33 @@ test_basic_group(void)
 		warn("group_add sibling 2");
 		return (1);
 	}
+	if (expect_errno("attach before commit",
+	    pmc_attach(pmc0, getpid()), EINVAL) != 0)
+		return (1);
 	if (pmc_group_commit(gid) < 0) {
 		warn("group_commit");
 		return (1);
 	}
-
-	/*
-	 * Process-mode PMCs require an explicit attach before start.
-	 * pmu_group_target_proc() now insists on an attached target proc
-	 * (the owner is intentionally NOT used as a fallback because that
-	 * confused csw_in/out under the multiplex rework), so calling
-	 * pmc_start without first pmc_attach'ing to ourselves now returns
-	 * EINVAL.  Attach every sibling so the whole group can bind.
-	 */
+	if (expect_errno("non-leader attach",
+	    pmc_attach(pmc1, getpid()), ENOTTY) != 0)
+		return (1);
+	if (expect_errno("committed setcount", pmc_set(pmc1, 0), EBUSY) != 0)
+		return (1);
 	if (pmc_attach(pmc0, getpid()) < 0) {
-		warn("pmc_attach pmc0");
+		warn("pmc_attach leader");
 		return (1);
 	}
-	if (pmc_attach(pmc1, getpid()) < 0) {
-		warn("pmc_attach pmc1");
+	if (expect_errno("second attach",
+	    pmc_attach(pmc0, getpid()), EBUSY) != 0)
 		return (1);
-	}
-	if (pmc_attach(pmc2, getpid()) < 0) {
-		warn("pmc_attach pmc2");
+	if (expect_errno("non-leader start", pmc_start(pmc1), ENOTTY) != 0)
 		return (1);
-	}
-
 	if (pmc_start(pmc0) < 0) {
 		warn("pmc_start leader");
 		return (1);
 	}
-	if (pmc_start(pmc1) < 0) {
-		warn("pmc_start sibling 1");
+	if (expect_errno("non-leader stop", pmc_stop(pmc1), ENOTTY) != 0)
 		return (1);
-	}
-	if (pmc_start(pmc2) < 0) {
-		warn("pmc_start sibling 2");
-		return (1);
-	}
 
 	for (spin = 0; spin < 100000000ULL; spin++)
 		;
@@ -146,8 +167,6 @@ test_basic_group(void)
 		return (1);
 	}
 	(void)pmc_stop(pmc0);
-	(void)pmc_stop(pmc1);
-	(void)pmc_stop(pmc2);
 	printf("3-event group: pmc0=%ju pmc1=%ju pmc2=%ju\n",
 	    (uintmax_t)v0, (uintmax_t)v1, (uintmax_t)v2);
 	if (v0 == 0 || v1 == 0 || v2 == 0) {
@@ -242,6 +261,8 @@ main(void)
 		printf("SKIP: non-AMD CPU\n");
 		return (77);
 	}
+	if (test_allocation_gates() != 0)
+		return (1);
 	if (test_basic_group() != 0)
 		return (1);
 	if (test_oversubscription_rejected() != 0)
