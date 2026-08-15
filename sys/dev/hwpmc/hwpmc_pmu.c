@@ -168,7 +168,6 @@ pmu_group_commit(pmu_group_t *pg)
 	pmu_event_t *pe;
 	struct pmc_owner *po;
 	struct proc *p;
-	u_int hw_slots, class_total;
 	int error;
 
 	if (pg == NULL)
@@ -202,8 +201,14 @@ pmu_group_commit(pmu_group_t *pg)
 	pg->pg_defer_ok = (pg->pg_leader->pe_alloc.pm_flags &
 	    PMC_F_GROUP_MUX) != 0;
 
+	error = pmu_group_can_fit(pg);
+	if (error != 0)
+		return (error);
+
 	po = pg->pg_owner;
 	p = po != NULL ? po->po_owner : NULL;
+	if (p == NULL)
+		return (EINVAL);
 
 	/*
 	 * System-wide group.  There is no target process: the group is
@@ -219,83 +224,52 @@ pmu_group_commit(pmu_group_t *pg)
 		pg->pg_system = true;
 		pg->pg_cpu = pg->pg_leader->pe_alloc.pm_cpu;
 
-		class_total = pmu_count_class_total(pg);
-		if (class_total == 0)
-			return (EOPNOTSUPP);
-		if (pg->pg_nevents > class_total)
-			return (ENOSPC);
-
-		hw_slots = pmu_count_core_hw_slots(pg, p);
+		error = pmu_group_can_place(pg, p, pg->pg_cpu);
 		PMCDBG5(PMC, OPS, 1,
 		    "group_commit: SYS gid=%u cpu=%d nevents=%u "
-		    "hw_slots=%u defer_ok=%d", pg->pg_id, pg->pg_cpu,
-		    pg->pg_nevents, hw_slots, (int)pg->pg_defer_ok);
-		if (pg->pg_nevents > hw_slots && !pg->pg_defer_ok)
+		    "place=%d defer_ok=%d", pg->pg_id, pg->pg_cpu,
+		    pg->pg_nevents, error, (int)pg->pg_defer_ok);
+		if (error != 0 && error != ENOSPC)
+			return (error);
+		if (error == ENOSPC && !pg->pg_defer_ok)
 			return (ENOSPC);
 
 		pg->pg_committed = true;
 		return (0);
 	}
 
-	if (p != NULL) {
-		class_total = pmu_count_class_total(pg);
-		if (class_total == 0)
-			return (EOPNOTSUPP);
-		/*
-		 * Reject groups that can never fit on the hardware no
-		 * matter what.  Within-group placement is strictly
-		 * all-or-none, so a single group with more events than
-		 * the entire class has rows is unschedulable forever.
-		 */
-		if (pg->pg_nevents > class_total)
-			return (ENOSPC);
-
-		hw_slots = pmu_count_core_hw_slots(pg, p);
-
-		/*
-		 * Two scheduling regimes, both atomic:
-		 *
-		 * 1. The group fits in the rows currently free for this
-		 *    target proc -- bind every sibling to a HW row right
-		 *    now.  pmc_start(leader) finds an already-scheduled
-		 *    group and just flips the per-PMC running flag.
-		 *
-		 * 2. The group does NOT fit at the moment (other groups
-		 *    already attached to this proc are holding the rows
-		 *    we would need).  If the caller passed
-		 *    PMC_F_GROUP_MUX on the leader we accept the commit
-		 *    in the DEFERRED state; the per-pp rotation kthread
-		 *    will atomically schedule this group in -- ALL of
-		 *    its siblings, never a subset -- whenever an evicted
-		 *    peer frees enough rows for it.  Without the flag we
-		 *    preserve the historical strict semantics and reject
-		 *    with ENOSPC so the caller can pick a smaller group.
-		 */
-		PMCDBG5(PMC, OPS, 1,
-		    "group_commit: gid=%u nevents=%u class_total=%u "
-		    "hw_slots=%u defer_ok=%d", pg->pg_id, pg->pg_nevents,
-		    class_total, hw_slots, (int)pg->pg_defer_ok);
-
-		if (pg->pg_nevents <= hw_slots) {
-			error = pmu_assign_group(pg, p, PMC_CPU_ANY);
-			if (error != 0) {
-				PMCDBG2(PMC, OPS, 1,
-				    "group_commit: assign gid=%u err=%d",
-				    pg->pg_id, error);
-				return (error);
-			}
-			PMCDBG1(PMC, OPS, 1,
-			    "group_commit: gid=%u BOUND", pg->pg_id);
-		} else if (!pg->pg_defer_ok) {
-			PMCDBG3(PMC, OPS, 1,
-			    "group_commit: gid=%u ENOSPC %u > %u slots",
-			    pg->pg_id, pg->pg_nevents, hw_slots);
-			return (ENOSPC);
-		} else {
-			PMCDBG3(PMC, OPS, 1,
-			    "group_commit: gid=%u DEFERRED %u > %u slots",
-			    pg->pg_id, pg->pg_nevents, hw_slots);
-		}
+	/*
+	 * Two scheduling regimes, both atomic:
+	 *
+	 * 1. The group fits in the rows currently free for this
+	 *    target proc -- bind every sibling to a HW row right
+	 *    now.  pmc_start(leader) finds an already-scheduled
+	 *    group and just flips the per-PMC running flag.
+	 *
+	 * 2. The group does NOT fit at the moment (other groups
+	 *    already attached to this proc are holding the rows
+	 *    we would need).  If the caller passed
+	 *    PMC_F_GROUP_MUX on the leader we accept the commit
+	 *    in the DEFERRED state; the per-pp rotation kthread
+	 *    will atomically schedule this group in -- ALL of
+	 *    its siblings, never a subset -- whenever an evicted
+	 *    peer frees enough rows for it.  Without the flag we
+	 *    preserve the historical strict semantics and reject
+	 *    with ENOSPC so the caller can pick a smaller group.
+	 */
+	error = pmu_group_can_place(pg, p, PMC_CPU_ANY);
+	if (error == 0)
+		error = pmu_assign_group(pg, p, PMC_CPU_ANY);
+	if (error == 0) {
+		PMCDBG1(PMC, OPS, 1,
+		    "group_commit: gid=%u BOUND", pg->pg_id);
+	} else if (error != EBUSY && error != ENOSPC) {
+		return (error);
+	} else if (!pg->pg_defer_ok) {
+		return (ENOSPC);
+	} else {
+		PMCDBG1(PMC, OPS, 1,
+		    "group_commit: gid=%u DEFERRED", pg->pg_id);
 	}
 
 	pg->pg_committed = true;
@@ -745,7 +719,6 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 {
 	pmu_event_t *pe;
 	struct proc *p;
-	u_int hw_slots;
 	int error;
 
 	if (pg == NULL || pg->pg_assigned)
@@ -764,11 +737,13 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 	    ("[pmu] schedule_in: pp/p mismatch pp=%p pp->proc=%p p=%p",
 	    pp, pp != NULL ? pp->pp_proc : NULL, p));
 
-	hw_slots = pmu_count_core_hw_slots(pg, p);
-	if (pg->pg_nevents > hw_slots)
-		return (ENOSPC);
+	error = pmu_group_can_place(pg, p, PMC_CPU_ANY);
+	if (error != 0)
+		return (error);
 
 	error = pmu_assign_group(pg, p, PMC_CPU_ANY);
+	if (error == EBUSY)
+		error = ENOSPC;
 	if (error != 0) {
 		PMCDBG2(PMC, OPS, 1,
 		    "pp_schedule_in: assign gid=%u err=%d",
@@ -1145,7 +1120,6 @@ pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
 {
 	pmu_event_t *pe;
 	struct proc *owner;
-	u_int hw_slots;
 	int error;
 
 	if (pg == NULL || pg->pg_assigned)
@@ -1160,11 +1134,13 @@ pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
 	if (owner == NULL)
 		return (EINVAL);
 
-	hw_slots = pmu_count_core_hw_slots(pg, owner);
-	if (pg->pg_nevents > hw_slots)
-		return (ENOSPC);
+	error = pmu_group_can_place(pg, owner, cpu);
+	if (error != 0)
+		return (error);
 
 	error = pmu_assign_group(pg, owner, cpu);
+	if (error == EBUSY)
+		error = ENOSPC;
 	if (error != 0) {
 		PMCDBG3(PMC, OPS, 1,
 		    "sys_schedule_in: assign gid=%u cpu=%d err=%d",

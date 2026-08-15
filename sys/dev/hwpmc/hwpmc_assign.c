@@ -106,98 +106,13 @@ pmu_class_supports_grouping(enum pmc_class class)
 	return (pcd != NULL && pcd->pcd_get_sched_constraint != NULL);
 }
 
-u_int
-pmu_count_core_hw_slots(pmu_group_t *pg, struct proc *p)
-{
-	pmu_event_t *pe;
-	struct pmc_mdep *mdep;
-	struct pmc_classdep *pcd;
-	enum pmc_mode mode;
-	u_int n, slots;
-	int adjri, chk_cpu;
-
-	mdep = hwpmc_get_mdep();
-	if (mdep == NULL || pg == NULL || pg->pg_leader == NULL)
-		return (0);
-
-	pe = pg->pg_leader;
-	mode = pe->pe_alloc.pm_mode;
-	/*
-	 * Virtual groups float across CPUs (PMC_CPU_ANY); system-wide
-	 * groups are pinned to one CPU and must count free rows on that
-	 * specific CPU so that two system groups oversubscribing the same
-	 * core are correctly detected.
-	 */
-	chk_cpu = PMC_IS_SYSTEM_MODE(mode) ? pe->pe_alloc.pm_cpu :
-	    PMC_CPU_ANY;
-	slots = 0;
-	for (n = 0; n < mdep->pmd_npmc; n++) {
-		/*
-		 * Restrict to rows belonging to the same PMC class as the
-		 * leader, then translate the global row index `n' into the
-		 * class-relative `adjri' before calling the class back-end's
-		 * pcd_can_assign_pmc().  Class helpers index into per-class
-		 * descriptor tables (e.g., amd_pmcdesc[]) sized to that
-		 * class's PMC count, so feeding them the global `n' would
-		 * trip their KASSERT bounds check or read the wrong row.
-		 */
-		pcd = hwpmc_ri_to_classdep(n, &adjri);
-		if (pcd == NULL || pcd->pcd_caps == 0 ||
-		    pcd->pcd_class != pe->pe_alloc.pm_class)
-			continue;
-		if (!hwpmc_can_allocate_row(n, mode) ||
-		    !hwpmc_can_allocate_rowindex(p, n, chk_cpu))
-			continue;
-		if (pmu_can_assign_pmc(pcd, adjri, pe->pe_pmc,
-		    &pe->pe_alloc) != 0)
-			continue;
-		slots++;
-	}
-	PMCDBG3(MDP, ALL, 2, "count_slots: gid=%u class=%d slots=%u",
-	    pg->pg_id, pe->pe_alloc.pm_class, slots);
-	return (slots);
-}
-
-/*
- * Total number of HW rows that belong to the leader's PMC class on
- * this kernel, regardless of whether they are currently in use.
- * pmu_group_commit uses this to reject groups that could never fit
- * even on a freshly-booted system (nevents > class_total -> ENOSPC).
- * Per-process / per-row contention is the job of pmu_count_core_hw_slots.
- */
-u_int
-pmu_count_class_total(pmu_group_t *pg)
-{
-	pmu_event_t *pe;
-	struct pmc_mdep *mdep;
-	struct pmc_classdep *pcd;
-	u_int n, slots;
-	int adjri;
-
-	mdep = hwpmc_get_mdep();
-	if (mdep == NULL || pg == NULL || pg->pg_leader == NULL)
-		return (0);
-
-	pe = pg->pg_leader;
-	slots = 0;
-	for (n = 0; n < mdep->pmd_npmc; n++) {
-		pcd = hwpmc_ri_to_classdep(n, &adjri);
-		if (pcd == NULL || pcd->pcd_caps == 0)
-			continue;
-		if (pcd->pcd_class != pe->pe_alloc.pm_class)
-			continue;
-		slots++;
-	}
-	return (slots);
-}
-
 /*
  * Try to bind one event to a row.  used_mask tracks rows already
  * consumed by earlier events in this group.
  */
 static int
 pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
-    uint32_t *used_mask)
+    uint32_t *used_mask, bool dry_run, bool empty_view)
 {
 	struct pmc *pm;
 	struct pmc_classdep *pcd;
@@ -227,6 +142,8 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 
 	if ((pe->pe_cons.pc_flags & PMC_SC_F_FIXED) != 0) {
 		adjri = pe->pe_cons.pc_fixed_row;
+		if (adjri < 0 || adjri >= 32)
+			return (EBUSY);
 		if (((1u << adjri) & allowed) == 0 ||
 		    (*used_mask & (1u << adjri)) != 0)
 			return (EBUSY);
@@ -253,15 +170,18 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 		}
 		if (pcd == NULL || n >= (int)mdep->pmd_npmc)
 			goto skip;
-		if (!hwpmc_can_allocate_row(n, mode) ||
-		    !hwpmc_can_allocate_rowindex(p, n, idcpu))
+		if (!empty_view && (!hwpmc_can_allocate_row(n, mode) ||
+		    !hwpmc_can_allocate_rowindex(p, n, idcpu)))
 			goto skip;
 		if (pmu_can_assign_pmc(pcd, adjri, pm, &pe->pe_alloc) != 0)
 			goto skip;
-		if (pcd->pcd_allocate_pmc(cpu, adjri, pm, &pe->pe_alloc) != 0)
+		if (!dry_run &&
+		    pcd->pcd_allocate_pmc(cpu, adjri, pm, &pe->pe_alloc) != 0)
 			goto skip;
 
 		*used_mask |= 1u << adjri;
+		if (dry_run)
+			return (0);
 		pm->pm_id = PMC_ID_MAKE_ID(idcpu, mode,
 		    pe->pe_alloc.pm_class, n);
 		/*
@@ -364,6 +284,43 @@ pmu_sort_by_weight(pmu_group_t *pg, pmu_event_t **order, u_int n)
 	}
 }
 
+static int
+pmu_group_probe(pmu_group_t *pg, struct proc *p, int cpu, bool empty_view)
+{
+	pmu_event_t **order;
+	uint32_t used_mask;
+	u_int i;
+	int error;
+
+	if (pg == NULL || pg->pg_nevents == 0 || (!empty_view && p == NULL))
+		return (EINVAL);
+	order = malloc(sizeof(*order) * pg->pg_nevents, M_PMC,
+	    M_WAITOK | M_ZERO);
+	pmu_sort_by_weight(pg, order, pg->pg_nevents);
+	used_mask = 0;
+	error = 0;
+	for (i = 0; i < pg->pg_nevents; i++) {
+		error = pmu_assign_one(order[i], p, cpu, &used_mask, true,
+		    empty_view);
+		if (error != 0)
+			break;
+	}
+	free(order, M_PMC);
+	return (error == 0 ? 0 : ENOSPC);
+}
+
+int
+pmu_group_can_fit(pmu_group_t *pg)
+{
+	return (pmu_group_probe(pg, NULL, 0, true));
+}
+
+int
+pmu_group_can_place(pmu_group_t *pg, struct proc *p, int cpu)
+{
+	return (pmu_group_probe(pg, p, cpu, false));
+}
+
 int
 pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu)
 {
@@ -404,7 +361,8 @@ pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu)
 	used_mask = 0;
 	error = 0;
 	for (i = 0; i < pg->pg_nevents; i++) {
-		error = pmu_assign_one(order[i], p, cpu, &used_mask);
+		error = pmu_assign_one(order[i], p, cpu, &used_mask, false,
+		    false);
 		if (error != 0)
 			break;
 	}

@@ -172,8 +172,8 @@ void hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm);
  */
 int pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu);
 void pmu_unassign_group(pmu_group_t *pg, int cpu);
-u_int pmu_count_core_hw_slots(pmu_group_t *pg, struct proc *p);
-u_int pmu_count_class_total(pmu_group_t *pg);
+int pmu_group_can_fit(pmu_group_t *pg);
+int pmu_group_can_place(pmu_group_t *pg, struct proc *p, int cpu);
 int pmu_validate_group(pmu_group_t *pg);
 int pmu_event_get_constraint(pmu_event_t *pe,
     pmc_sched_constraint_t *cons);
