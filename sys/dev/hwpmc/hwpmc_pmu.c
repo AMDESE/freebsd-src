@@ -1861,15 +1861,19 @@ static void
 pmu_syscpu_stop_rotate(struct pmu_syscpu *sc, const char *wmesg)
 {
 
+	mtx_pool_lock_spin(pmc_mtxpool, sc);
 	sc->sc_quiesce++;
 	sc->sc_running = false;
 	sc->sc_needed = false;
+	mtx_pool_unlock_spin(pmc_mtxpool, sc);
 	wakeup(&sc->sc_needed);
 	while (sc->sc_td != NULL)
 		(void)sx_sleep(&sc->sc_td, &pmc_sx, 0, wmesg, 1);
+	mtx_pool_lock_spin(pmc_mtxpool, sc);
 	KASSERT(sc->sc_quiesce > 0,
 	    ("[pmu] system rotation quiesce underflow"));
 	sc->sc_quiesce--;
+	mtx_pool_unlock_spin(pmc_mtxpool, sc);
 }
 
 /*
