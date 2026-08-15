@@ -203,6 +203,8 @@ int pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu);
 void pmu_unassign_group(pmu_group_t *pg, int cpu);
 int pmu_group_can_fit(pmu_group_t *pg);
 int pmu_group_can_place(pmu_group_t *pg, struct proc *p, int cpu);
+int pmu_group_satisfiable(pmu_group_t *pg, struct proc *p, int cpu,
+    uint64_t evictable_rows);
 int pmu_validate_group(pmu_group_t *pg);
 int pmu_event_get_constraint(pmu_event_t *pe,
     pmc_sched_constraint_t *cons);

@@ -108,11 +108,15 @@ pmu_class_supports_grouping(enum pmc_class class)
 
 /*
  * Try to bind one event to a row.  used_mask tracks rows already
- * consumed by earlier events in this group.
+ * consumed by earlier events in this group.  evictable_rows is a
+ * global-ri mask of rows whose current occupant rotation could evict;
+ * those rows are treated as allocatable even when the framework's
+ * occupancy checks reject them.
  */
 static int
 pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
-    uint32_t *used_mask, bool dry_run, bool empty_view)
+    uint32_t *used_mask, bool dry_run, bool empty_view,
+    uint64_t evictable_rows)
 {
 	struct pmc *pm;
 	struct pmc_classdep *pcd;
@@ -171,7 +175,8 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 		if (pcd == NULL || n >= (int)mdep->pmd_npmc)
 			goto skip;
 		if (!empty_view && (!hwpmc_can_allocate_row(n, mode) ||
-		    !hwpmc_can_allocate_rowindex(p, n, idcpu)))
+		    !hwpmc_can_allocate_rowindex(p, n, idcpu)) &&
+		    (n >= 64 || (evictable_rows & (1ULL << n)) == 0))
 			goto skip;
 		if (pmu_can_assign_pmc(pcd, adjri, pm, &pe->pe_alloc) != 0)
 			goto skip;
@@ -285,7 +290,8 @@ pmu_sort_by_weight(pmu_group_t *pg, pmu_event_t **order, u_int n)
 }
 
 static int
-pmu_group_probe(pmu_group_t *pg, struct proc *p, int cpu, bool empty_view)
+pmu_group_probe(pmu_group_t *pg, struct proc *p, int cpu, bool empty_view,
+    uint64_t evictable_rows)
 {
 	pmu_event_t **order;
 	uint32_t used_mask;
@@ -301,7 +307,7 @@ pmu_group_probe(pmu_group_t *pg, struct proc *p, int cpu, bool empty_view)
 	error = 0;
 	for (i = 0; i < pg->pg_nevents; i++) {
 		error = pmu_assign_one(order[i], p, cpu, &used_mask, true,
-		    empty_view);
+		    empty_view, evictable_rows);
 		if (error != 0)
 			break;
 	}
@@ -312,13 +318,27 @@ pmu_group_probe(pmu_group_t *pg, struct proc *p, int cpu, bool empty_view)
 int
 pmu_group_can_fit(pmu_group_t *pg)
 {
-	return (pmu_group_probe(pg, NULL, 0, true));
+	return (pmu_group_probe(pg, NULL, 0, true, 0));
 }
 
 int
 pmu_group_can_place(pmu_group_t *pg, struct proc *p, int cpu)
 {
-	return (pmu_group_probe(pg, p, cpu, false));
+	return (pmu_group_probe(pg, p, cpu, false, 0));
+}
+
+/*
+ * Third probe view (spec §7.2): could pg be placed if every row in
+ * evictable_rows -- the rows currently held by the domain's placed MUX
+ * groups -- were freed?  ENOSPC here means the group is genuinely
+ * unsatisfiable: pinned groups and ungrouped PMCs hold the rows it
+ * needs permanently, so rotation must skip it rather than evict for it.
+ */
+int
+pmu_group_satisfiable(pmu_group_t *pg, struct proc *p, int cpu,
+    uint64_t evictable_rows)
+{
+	return (pmu_group_probe(pg, p, cpu, false, evictable_rows));
 }
 
 int
@@ -362,7 +382,7 @@ pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu)
 	error = 0;
 	for (i = 0; i < pg->pg_nevents; i++) {
 		error = pmu_assign_one(order[i], p, cpu, &used_mask, false,
-		    false);
+		    false, 0);
 		if (error != 0)
 			break;
 	}
