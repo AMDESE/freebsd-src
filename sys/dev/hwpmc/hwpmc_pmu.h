@@ -82,6 +82,14 @@ struct pmu_group_cpu_state {
 	bool				pgcs_placed;
 };
 
+struct pmu_group_time_snapshot {
+	uint64_t	pgts_enabled;
+	uint64_t	pgts_running;
+	uint64_t	pgts_enabled_wall;
+	uint64_t	pgts_wall;
+	bool		pgts_system;
+};
+
 /*
  * pmu_group is the unit of all-or-none scheduling.  Either every
  * sibling is bound to a HW row and attached to the target process
@@ -203,6 +211,8 @@ pmu_group_t *pmu_group_lookup(struct pmc_owner *po, uint32_t pg_id);
 void pmu_group_release(pmu_group_t *pg);
 void pmu_group_accounting_initialize(void);
 void pmu_group_accounting_finalize(void);
+void pmu_group_time_snapshot(pmu_group_t *pg,
+    struct pmu_group_time_snapshot *snapshot);
 void pmu_event_destroy(pmu_event_t *pe);
 pmu_event_t *pmu_event_from_pmc(struct pmc *pm);
 
@@ -253,6 +263,7 @@ void pmu_rotate_groups(int cpu);
  */
 struct pmc_process *pmc_find_process_descriptor_pmu(struct proc *p,
     uint32_t mode);
+struct pmc_owner *pmc_find_owner_descriptor_pmu(struct proc *p);
 void pmc_unlink_target_process_pmu(struct pmc *pm, struct pmc_process *pp);
 
 void hwpmc_pmu_sx_xlock(void);

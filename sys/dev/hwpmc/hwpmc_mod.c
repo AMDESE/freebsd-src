@@ -3056,6 +3056,12 @@ pmc_find_process_descriptor_pmu(struct proc *p, uint32_t mode)
 	return (pmc_find_process_descriptor(p, mode));
 }
 
+struct pmc_owner *
+pmc_find_owner_descriptor_pmu(struct proc *p)
+{
+	return (pmc_find_owner_descriptor(p));
+}
+
 static struct pmc_process *
 pmc_find_process_descriptor(struct proc *p, uint32_t mode)
 {

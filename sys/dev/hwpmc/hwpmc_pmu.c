@@ -35,8 +35,15 @@ extern struct mtx_pool *pmc_mtxpool;
 
 LIST_HEAD(pmu_group_cpu_list, pmu_group_cpu_state);
 static struct pmu_group_cpu_list pmu_group_cpu_active[MAXCPU];
+static uint32_t pmu_group_time_id;
+static int pmu_group_time_sysctl(SYSCTL_HANDLER_ARGS);
 
 SYSCTL_DECL(_kern_hwpmc);
+SYSCTL_UINT(_kern_hwpmc, OID_AUTO, group_time_id, CTLFLAG_RWTUN,
+    &pmu_group_time_id, 0, "Selected PMU group accounting id");
+SYSCTL_PROC(_kern_hwpmc, OID_AUTO, group_time,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, 0, 0,
+    pmu_group_time_sysctl, "A", "Selected PMU group accounting in ns");
 
 /*
  * Multiplex rotation period.  Default 50ms balances counter accuracy
@@ -153,6 +160,79 @@ pmu_group_running_stop_locked(pmu_group_t *pg, uint64_t now)
 		pg->pg_wall_ticks += now - pg->pg_wall_start_ticks;
 	pg->pg_wall_start_ticks = 0;
 	pg->pg_running = false;
+}
+
+static uint64_t
+pmu_group_ticks_to_ns(uint64_t ticks, uint64_t tickrate)
+{
+	__uint128_t ns;
+
+	if (tickrate == 0)
+		return (0);
+	ns = (__uint128_t)ticks * 1000000000;
+	ns /= tickrate;
+	if (ns > UINT64_MAX)
+		return (UINT64_MAX);
+	return ((uint64_t)ns);
+}
+
+void
+pmu_group_time_snapshot(pmu_group_t *pg,
+    struct pmu_group_time_snapshot *snapshot)
+{
+	uint64_t enabled, enabled_wall, now, running, tickrate, wall;
+
+	KASSERT(pg != NULL && snapshot != NULL,
+	    ("[pmu] invalid group time snapshot"));
+	now = cpu_ticks();
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_time_update_locked(pg, now);
+	enabled = pg->pg_time_enabled_ticks;
+	running = MIN(pg->pg_time_running_ticks, enabled);
+	enabled_wall = pg->pg_enabled_wall_ticks;
+	wall = pg->pg_wall_ticks;
+	if (pg->pg_running && now > pg->pg_wall_start_ticks)
+		wall += now - pg->pg_wall_start_ticks;
+	tickrate = pg->pg_tickrate;
+	snapshot->pgts_system = pg->pg_system;
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+
+	snapshot->pgts_enabled = pmu_group_ticks_to_ns(enabled, tickrate);
+	snapshot->pgts_running = pmu_group_ticks_to_ns(running, tickrate);
+	snapshot->pgts_enabled_wall = pmu_group_ticks_to_ns(enabled_wall,
+	    tickrate);
+	snapshot->pgts_wall = pmu_group_ticks_to_ns(wall, tickrate);
+	if (snapshot->pgts_running > snapshot->pgts_enabled)
+		snapshot->pgts_running = snapshot->pgts_enabled;
+}
+
+static int
+pmu_group_time_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct pmu_group_time_snapshot snapshot;
+	struct pmc_owner *po;
+	pmu_group_t *pg;
+	char buf[256];
+	uint32_t group_id;
+
+	group_id = pmu_group_time_id;
+	hwpmc_pmu_sx_xlock();
+	po = pmc_find_owner_descriptor_pmu(curproc);
+	pg = po != NULL ? pmu_group_lookup(po, group_id) : NULL;
+	if (pg != NULL)
+		pmu_group_time_snapshot(pg, &snapshot);
+	hwpmc_pmu_sx_xunlock();
+	if (pg == NULL)
+		return (ENOENT);
+
+	snprintf(buf, sizeof(buf),
+	    "gid=%u unit=%s enabled=%ju running=%ju enabled_wall=%ju "
+	    "wall=%ju", group_id, snapshot.pgts_system ? "wall-ns" :
+	    "thread-ns", (uintmax_t)snapshot.pgts_enabled,
+	    (uintmax_t)snapshot.pgts_running,
+	    (uintmax_t)snapshot.pgts_enabled_wall,
+	    (uintmax_t)snapshot.pgts_wall);
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
 }
 
 static void
