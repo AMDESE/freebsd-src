@@ -545,10 +545,9 @@ pmu_group_commit(pmu_group_t *pg)
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 		error = pmu_event_get_constraint(pe, &pe->pe_cons);
 		if (error != 0) {
-			PMCDBG3(PMC, OPS, 1,
-			    "group_commit: constraint err=%d class=%d sub=%d",
-			    error, (int)pe->pe_alloc.pm_class,
-			    (int)pe->pe_alloc.pm_md.pm_amd.pm_amd_sub_class);
+			PMCDBG2(PMC, OPS, 1,
+			    "group_commit: constraint err=%d class=%d",
+			    error, (int)pe->pe_alloc.pm_class);
 			return (error);
 		}
 	}

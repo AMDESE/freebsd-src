@@ -467,10 +467,9 @@ pmu_validate_group(pmu_group_t *pg)
 		}
 		rc = pmu_event_get_constraint(pe, &cons);
 		if (rc != 0) {
-			PMCDBG3(PMC, OPS, 1,
-			    "validate: constraint err=%d class=%d sub=%d",
-			    rc, (int)pe->pe_alloc.pm_class,
-			    (int)pe->pe_alloc.pm_md.pm_amd.pm_amd_sub_class);
+			PMCDBG2(PMC, OPS, 1,
+			    "validate: constraint err=%d class=%d",
+			    rc, (int)pe->pe_alloc.pm_class);
 			return (EOPNOTSUPP);
 		}
 		if (cons.pc_allowed_rows == 0)
