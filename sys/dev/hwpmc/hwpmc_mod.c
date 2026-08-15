@@ -3676,6 +3676,7 @@ hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
 	(void)pcd->pcd_write_pmc(cpu, adjri, pm, pm->pm_gv.pm_savedvalue);
 	pm->pm_pcpu_state[cpu].pps_cpustate = 1;
 	(void)pcd->pcd_start_pmc(cpu, adjri, pm);
+	pmu_group_sys_row_started(pm);
 	critical_exit();
 	pmc_restore_cpu_binding(&pb);
 }
@@ -3706,6 +3707,7 @@ hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm)
 	v = pm->pm_gv.pm_savedvalue;
 	if (pcd->pcd_read_pmc(cpu, adjri, pm, &v) == 0)
 		pm->pm_gv.pm_savedvalue = v;
+	pmu_group_sys_row_stopped(pm);
 	critical_exit();
 	pmc_restore_cpu_binding(&pb);
 }

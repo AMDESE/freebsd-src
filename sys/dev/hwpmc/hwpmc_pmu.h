@@ -161,6 +161,8 @@ void hwpmc_unmark_row_standalone(int ri);
  */
 void hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm);
 void hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm);
+void pmu_group_sys_row_started(struct pmc *pm);
+void pmu_group_sys_row_stopped(struct pmc *pm);
 
 /*
  * The PMU grouping/multiplex scheduler is architecture-independent:

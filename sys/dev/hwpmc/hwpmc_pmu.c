@@ -112,14 +112,47 @@ pmu_group_time_update_locked(pmu_group_t *pg, uint64_t now)
 
 	delta = now - pg->pg_timestamp_ticks;
 	if (pg->pg_running) {
-		pg->pg_time_enabled_ticks +=
-		    (uint64_t)pg->pg_oncpu_threads * delta;
-		pg->pg_time_running_ticks +=
-		    (uint64_t)pg->pg_running_threads * delta;
-		if (pg->pg_oncpu_threads != 0)
-			pg->pg_enabled_wall_ticks += delta;
+		if (pg->pg_system) {
+			if (pg->pg_cpu >= 0 && pmc_cpu_is_active(pg->pg_cpu)) {
+				pg->pg_time_enabled_ticks += delta;
+				pg->pg_enabled_wall_ticks += delta;
+				if (pg->pg_account_placement_admit)
+					pg->pg_time_running_ticks += delta;
+			}
+		} else {
+			pg->pg_time_enabled_ticks +=
+			    (uint64_t)pg->pg_oncpu_threads * delta;
+			pg->pg_time_running_ticks +=
+			    (uint64_t)pg->pg_running_threads * delta;
+			if (pg->pg_oncpu_threads != 0)
+				pg->pg_enabled_wall_ticks += delta;
+		}
 	}
 	pg->pg_timestamp_ticks = now;
+}
+
+static void
+pmu_group_running_start_locked(pmu_group_t *pg, uint64_t now)
+{
+
+	pmu_group_time_update_locked(pg, now);
+	if (!pg->pg_running) {
+		pg->pg_running = true;
+		pg->pg_wall_start_ticks = now;
+	}
+}
+
+static void
+pmu_group_running_stop_locked(pmu_group_t *pg, uint64_t now)
+{
+
+	pmu_group_time_update_locked(pg, now);
+	if (!pg->pg_running)
+		return;
+	if (now > pg->pg_wall_start_ticks)
+		pg->pg_wall_ticks += now - pg->pg_wall_start_ticks;
+	pg->pg_wall_start_ticks = 0;
+	pg->pg_running = false;
 }
 
 static void
@@ -184,8 +217,7 @@ pmu_group_accounting_drain(pmu_group_t *pg, bool release)
 		pmc_restore_cpu_binding(&pb);
 
 	mtx_pool_lock_spin(pmc_mtxpool, pg);
-	pmu_group_time_update_locked(pg, cpu_ticks());
-	pg->pg_running = false;
+	pmu_group_running_stop_locked(pg, cpu_ticks());
 	if (!release)
 		pg->pg_account_blocked = false;
 	KASSERT(pg->pg_running_threads == 0,
@@ -630,11 +662,9 @@ pmu_group_on_start(struct pmc *pm)
 		mtx_pool_unlock_spin(pmc_mtxpool, pg);
 		return (EBUSY);
 	}
-	pmu_group_time_update_locked(pg, cpu_ticks());
-	if (!pg->pg_running) {
-		pg->pg_running = true;
+	if (!pg->pg_running)
 		pg->pg_account_placement_admit = false;
-	}
+	pmu_group_running_start_locked(pg, cpu_ticks());
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 
 	if (pg->pg_assigned) {
@@ -1436,6 +1466,41 @@ pmu_pp_rotate_thread(void *arg)
  *     pm->pm_gv.pm_savedvalue so values are continuous across windows.
  */
 
+/* Enter and leave SC residency at the final sibling's hardware edge. */
+void
+pmu_group_sys_row_started(struct pmc *pm)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || pe->pe_group == NULL ||
+	    TAILQ_NEXT(pe, pe_sibling) != NULL)
+		return;
+	pg = pe->pe_group;
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_time_update_locked(pg, cpu_ticks());
+	pg->pg_account_placement_admit = true;
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+}
+
+void
+pmu_group_sys_row_stopped(struct pmc *pm)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || pe->pe_group == NULL ||
+	    TAILQ_NEXT(pe, pe_sibling) != NULL)
+		return;
+	pg = pe->pe_group;
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_time_update_locked(pg, cpu_ticks());
+	pg->pg_account_placement_admit = false;
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+}
+
 /*
  * Atomically schedule a system group in on its CPU: reserve a HW row
  * for every sibling (all-or-none) and program+start each one.  Returns
@@ -1523,6 +1588,7 @@ pmu_sys_group_on_start(struct pmc *pm)
 {
 	pmu_event_t *pe;
 	pmu_group_t *pg;
+	bool was_running;
 	int cpu;
 
 	pe = pmu_event_from_pmc(pm);
@@ -1537,16 +1603,25 @@ pmu_sys_group_on_start(struct pmc *pm)
 	cpu = pg->pg_cpu;
 	if (cpu < 0 || cpu >= MAXCPU)
 		return (EINVAL);
+	if (!pmc_cpu_is_active(cpu))
+		return (ENXIO);
 
 	if (!pg->pg_sys_listed) {
 		LIST_INSERT_HEAD(&pmu_syscpu[cpu].sc_groups, pg, pg_proc_next);
 		pg->pg_sys_listed = true;
 	}
 
-	if (!pg->pg_running) {
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	if (pg->pg_account_blocked) {
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+		return (EBUSY);
+	}
+	was_running = pg->pg_running;
+	pmu_group_running_start_locked(pg, cpu_ticks());
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+	if (!was_running) {
 		int sin_err __unused;
 
-		pg->pg_running = true;
 		sin_err = pmu_sys_schedule_in(cpu, pg);
 		PMCDBG3(PMC, OPS, 2,
 		    "sys_on_start: gid=%u cpu=%d schedule_in=%d",
@@ -1580,9 +1655,11 @@ pmu_sys_group_on_stop(struct pmc *pm)
 	if (!pg->pg_system || !pg->pg_running)
 		return;
 
-	pg->pg_running = false;
 	if (pg->pg_assigned)
 		pmu_sys_schedule_out(pg->pg_cpu, pg);
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_running_stop_locked(pg, cpu_ticks());
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
 		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
@@ -1637,7 +1714,9 @@ pmu_sys_group_pre_release(struct pmc *pm)
 
 	if (pg->pg_assigned)
 		pmu_sys_schedule_out(cpu, pg);
-	pg->pg_running = false;
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_running_stop_locked(pg, cpu_ticks());
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 
 	if (pg->pg_sys_listed) {
 		if (sc->sc_cursor == pg)
