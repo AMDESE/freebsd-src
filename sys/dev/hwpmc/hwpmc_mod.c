@@ -245,6 +245,9 @@ static void	pmc_link_target_process(struct pmc *pm,
 static void	pmc_log_all_process_mappings(struct pmc_owner *po);
 static void	pmc_log_kernel_mappings(struct pmc *pm);
 static void	pmc_log_process_mappings(struct pmc_owner *po, struct proc *p);
+static bool	pmc_group_needs_mapping(pmu_group_t *pg);
+static void	pmc_log_group_mapping(struct pmc_process *pp, pid_t pid,
+    uintfptr_t start, uintfptr_t end, const char *path);
 static void	pmc_maybe_remove_owner(struct pmc_owner *po);
 static void	pmc_post_callchain_callback(void);
 static void	pmc_process_allproc(struct pmc *pm);
@@ -2571,13 +2574,86 @@ pmc_process_thread_userret(struct thread *td)
 }
 
 /*
+ * Does 'pg' have a sampling member that is not currently on a hardware
+ * row?  Placed members are also reachable through pp_pmcs[], and are
+ * logged by the normal walk in the mapping hooks; only members a
+ * multiplex window has evicted (or never placed) need the group list.
+ */
+static bool
+pmc_group_needs_mapping(pmu_group_t *pg)
+{
+	pmu_event_t *pe;
+	struct pmc *pm;
+
+	if (pg->pg_releasing || pg->pg_owner == NULL ||
+	    (pg->pg_owner->po_flags & PMC_PO_OWNS_LOGFILE) == 0)
+		return (false);
+
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		pm = pe->pe_pmc;
+		if (pm != NULL && PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)) &&
+		    PMC_ROW_IS_UNASSIGNED(pm))
+			return (true);
+	}
+	return (false);
+}
+
+/*
+ * Log a mapping change to the owners of grouped sampling PMCs targeting
+ * 'pp'.  A group stays hooked to pp->pp_pmu_groups while it is evicted
+ * from hardware, so its members are invisible to the pp_pmcs[] walk and
+ * would otherwise miss every mapping taken during that window, leaving
+ * the samples of the next window unsymbolizable.
+ *
+ * 'path' selects the record: non-NULL emits a MAP_IN at 'start', NULL
+ * emits a MAP_OUT for [start, end).
+ *
+ * The callers run from a VM callback, so this may neither sleep nor
+ * acquire pmc_sx.  The walk therefore runs entirely under pp_pmu_lock,
+ * which keeps every visited group -- and hence its owner descriptor --
+ * linked and alive, and pmclog emission is spin-lock safe.  Mapping
+ * records are owner-scoped, so at most one is emitted per owner.
+ */
+static void
+pmc_log_group_mapping(struct pmc_process *pp, pid_t pid, uintfptr_t start,
+    uintfptr_t end, const char *path)
+{
+	pmu_group_t *pg, *other;
+	struct pmc_owner *po;
+
+	mtx_lock_spin(&pp->pp_pmu_lock);
+	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
+		if (!pmc_group_needs_mapping(pg))
+			continue;
+		po = pg->pg_owner;
+
+		/* Skip owners an earlier group of this target covered. */
+		LIST_FOREACH(other, &pp->pp_pmu_groups, pg_proc_next) {
+			if (other == pg)
+				break;
+			if (other->pg_owner == po &&
+			    pmc_group_needs_mapping(other))
+				break;
+		}
+		if (other != pg)
+			continue;
+
+		if (path != NULL)
+			pmclog_process_map_in(po, pid, start, path);
+		else
+			pmclog_process_map_out(po, pid, start, end);
+	}
+	mtx_unlock_spin(&pp->pp_pmu_lock);
+}
+
+/*
  * A mapping change for a process.
  */
 static void
 pmc_process_mmap(struct thread *td, struct pmckern_map_in *pkm)
 {
 	const struct pmc *pm;
-	const struct pmc_process *pp;
+	struct pmc_process *pp;
 	struct pmc_owner *po;
 	char *fullpath, *freepath;
 	pid_t pid;
@@ -2612,6 +2688,9 @@ pmc_process_mmap(struct thread *td, struct pmckern_map_in *pkm)
 		}
 	}
 
+	/* Members of groups that are currently evicted from hardware. */
+	pmc_log_group_mapping(pp, pid, pkm->pm_address, 0, fullpath);
+
 done:
 	if (freepath != NULL)
 		free(freepath, M_TEMP);
@@ -2625,7 +2704,7 @@ static void
 pmc_process_munmap(struct thread *td, struct pmckern_map_out *pkm)
 {
 	const struct pmc *pm;
-	const struct pmc_process *pp;
+	struct pmc_process *pp;
 	struct pmc_owner *po;
 	pid_t pid;
 	int ri;
@@ -2650,6 +2729,10 @@ pmc_process_munmap(struct thread *td, struct pmckern_map_out *pkm)
 			    pkm->pm_address, pkm->pm_address + pkm->pm_size);
 		}
 	}
+
+	/* Members of groups that are currently evicted from hardware. */
+	pmc_log_group_mapping(pp, pid, pkm->pm_address,
+	    pkm->pm_address + pkm->pm_size, NULL);
 }
 
 /*
