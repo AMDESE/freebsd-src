@@ -1060,11 +1060,21 @@ hwpmc_pmu_accumulate_remove(int cpu, int ri, struct pmc *pm,
 	mtx_pool_unlock_spin(pmc_mtxpool, pm);
 }
 
+static void
+pmc_drain_pmc_cpu(struct pmc *pm, int cpu)
+{
+
+	pmc_select_cpu(cpu);
+	pmc_force_context_switch();
+	if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm))) {
+		pmc_process_samples(cpu, PMC_HR);
+		pmc_process_samples(cpu, PMC_SR);
+		pmc_process_samples(cpu, PMC_UR);
+	}
+}
+
 /*
- * Wait until pm->pm_runcount drops to zero - i.e. no CPU is currently
- * running this PMC.  Mirrors pmc_wait_for_pmc_idle but is called by
- * the multiplex rotation path which transitions pm_state to STOPPED
- * (not DELETED) before draining.
+ * Wait until no CPU or queued sample references this PMC.
  */
 void
 pmc_rotation_drain(struct pmc *pm)
@@ -1100,6 +1110,10 @@ pmc_rotation_drain(struct pmc *pm)
 	 * a single visit per CPU is enough and runcount is monotone.
 	 */
 	pmc_save_cpu_binding(&pb);
+	for (cpu = 0; cpu < pmc_cpu_max(); cpu++) {
+		if (pmc_cpu_is_active(cpu))
+			pmc_drain_pmc_cpu(pm, cpu);
+	}
 	while (counter_u64_fetch(pm->pm_runcount) > 0) {
 #ifdef INVARIANTS
 		KASSERT(maxloop-- > 0,
@@ -1112,11 +1126,11 @@ pmc_rotation_drain(struct pmc *pm)
 				break;
 			if (!pmc_cpu_is_active(cpu))
 				continue;
-			pmc_select_cpu(cpu);
-			pmc_force_context_switch();
+			pmc_drain_pmc_cpu(pm, cpu);
 		}
 	}
 	pmc_restore_cpu_binding(&pb);
+	atomic_store_rel_int(&pm->pm_rotation_drain, 0);
 }
 
 /*
@@ -1130,6 +1144,7 @@ void
 pmc_rotation_detach(struct pmc *pm, struct pmc_process *pp)
 {
 	struct pmc_target *ptgt;
+	struct pmc_thread *pt;
 	int ri;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
@@ -1145,6 +1160,12 @@ pmc_rotation_detach(struct pmc *pm, struct pmc_process *pp)
 
 	pp->pp_pmcs[ri].pp_pmc = NULL;
 	pp->pp_pmcs[ri].pp_pmcval = (pmc_value_t)0;
+	if (PMC_TO_MODE(pm) == PMC_MODE_TS) {
+		mtx_lock_spin(pp->pp_tdslock);
+		LIST_FOREACH(pt, &pp->pp_tds, pt_next)
+			pt->pt_pmcs[ri].pt_pmcval = (pmc_value_t)0;
+		mtx_unlock_spin(pp->pp_tdslock);
+	}
 
 	LIST_FOREACH(ptgt, &pm->pm_targets, pt_next) {
 		if (ptgt->pt_process == pp) {
@@ -1160,12 +1181,7 @@ pmc_rotation_detach(struct pmc *pm, struct pmc_process *pp)
 }
 
 /*
- * Re-attach a PMC to a process target after rotation has assigned it
- * a fresh row.  Mirrors pmc_link_target_process minus the owner-list
- * gymnastics and the per-thread KASSERTs that don't apply here.  pp_pmcval
- * is left at zero so the next csw_in can copy pm->pm_gv.pm_savedvalue
- * into PMC_PCPU_SAVED and the HW counter, continuing the count exactly
- * where the prior window left off.
+ * Re-attach a PMC after rotation, restarting sampling residuals.
  */
 void
 pmc_rotation_attach(struct pmc *pm, struct pmc_process *pp)
@@ -1189,7 +1205,8 @@ pmc_rotation_attach(struct pmc *pm, struct pmc_process *pp)
 
 	atomic_store_rel_ptr((uintptr_t *)&pp->pp_pmcs[ri].pp_pmc,
 	    (uintptr_t)pm);
-	pp->pp_pmcs[ri].pp_pmcval = (pmc_value_t)0;
+	pp->pp_pmcs[ri].pp_pmcval = PMC_TO_MODE(pm) == PMC_MODE_TS ?
+	    pm->pm_sc.pm_reloadcount : 0;
 	pp->pp_refcnt++;
 
 	if (pm->pm_owner != NULL && pm->pm_owner->po_owner == pp->pp_proc)
@@ -2285,8 +2302,8 @@ pmc_reclaim_pmc_from_cpu(struct pmc *pm, struct pmc_process *pp, int cpu)
 		}
 	}
 
-	counter_u64_add(pm->pm_runcount, -1);
 	(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
+	counter_u64_add(pm->pm_runcount, -1);
 }
 
 /*
@@ -2372,9 +2389,6 @@ pmc_process_csw_out(struct thread *td)
 		KASSERT(counter_u64_fetch(pm->pm_runcount) > 0,
 		    ("[pmc,%d] pm=%p runcount %ju", __LINE__, pm,
 		    (uintmax_t)counter_u64_fetch(pm->pm_runcount)));
-
-		/* reduce this PMC's runcount */
-		counter_u64_add(pm->pm_runcount, -1);
 
 		/*
 		 * If this PMC is associated with this process,
@@ -2464,8 +2478,9 @@ pmc_process_csw_out(struct thread *td)
 			}
 		}
 
-		/* Mark hardware as free. */
+		/* Mark hardware as free before publishing drain completion. */
 		(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
+		counter_u64_add(pm->pm_runcount, -1);
 	}
 
 	/*
@@ -3514,8 +3529,13 @@ pmc_wait_for_pmc_idle(struct pmc *pm)
 	 * path below handles those and no migration is needed.
 	 */
 	active_drain = PMC_IS_VIRTUAL_MODE(PMC_TO_MODE(pm));
-	if (active_drain)
+	if (active_drain) {
 		pmc_save_cpu_binding(&pb);
+		for (cpu = 0; cpu < pmc_cpu_max(); cpu++) {
+			if (pmc_cpu_is_active(cpu))
+				pmc_drain_pmc_cpu(pm, cpu);
+		}
+	}
 
 	/*
 	 * Loop (with a forced context switch) till the PMC's runcount
@@ -3537,8 +3557,7 @@ pmc_wait_for_pmc_idle(struct pmc *pm)
 					break;
 				if (!pmc_cpu_is_active(cpu))
 					continue;
-				pmc_select_cpu(cpu);
-				pmc_force_context_switch();
+				pmc_drain_pmc_cpu(pm, cpu);
 			}
 		} else
 			pmc_force_context_switch();
@@ -6570,9 +6589,10 @@ pmc_process_samples(int cpu, ring_type_t ring)
 		if (__predict_false(ps->ps_nsamples == PMC_SAMPLE_FREE))
 			continue;
 
-		/* skip non-running samples */
+		/* Drain completed rotation samples before row reuse. */
 		pm = ps->ps_pmc;
-		if (pm->pm_state != PMC_STATE_RUNNING)
+		if (pm->pm_state != PMC_STATE_RUNNING &&
+		    atomic_load_acq_int(&pm->pm_rotation_drain) == 0)
 			goto entrydone;
 
 		KASSERT(counter_u64_fetch(pm->pm_runcount) > 0,
@@ -6583,6 +6603,11 @@ pmc_process_samples(int cpu, ring_type_t ring)
 		    pm, PMC_TO_MODE(pm)));
 
 		po = pm->pm_owner;
+
+		/* A stopped target cannot finish a deferred user callchain. */
+		if (ps->ps_nsamples == PMC_USER_CALLCHAIN_PENDING &&
+		    pm->pm_state != PMC_STATE_RUNNING)
+			goto entrydone;
 
 		/* If there is a pending AST wait for completion */
 		if (ps->ps_nsamples == PMC_USER_CALLCHAIN_PENDING) {
@@ -6807,8 +6832,8 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 		KASSERT(counter_u64_fetch(pm->pm_runcount) > 0,
 		    ("[pmc,%d] runcount is %d", __LINE__, ri));
 
-		counter_u64_add(pm->pm_runcount, -1);
 		(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
+		counter_u64_add(pm->pm_runcount, -1);
 	}
 
 	/*

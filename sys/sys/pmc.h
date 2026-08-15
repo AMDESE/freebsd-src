@@ -858,7 +858,8 @@ struct pmc {
 	enum pmc_event	pm_event;	/* event being measured */
 	uint32_t	pm_flags;	/* additional flags PMC_F_... */
 	struct pmc_owner *pm_owner;	/* owner thread state */
-	counter_u64_t		pm_runcount;	/* #cpus currently on */
+	counter_u64_t		pm_runcount;	/* #cpus and queued samples */
+	volatile u_int	pm_rotation_drain;
 	enum pmc_state	pm_state;	/* current PMC state */
 
 	/*
