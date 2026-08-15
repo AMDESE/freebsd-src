@@ -710,8 +710,6 @@ pmu_group_on_allocate(struct pmc *pm, const struct pmc_op_pmcallocate *pa)
 	pe->pe_pmc = pm;
 	pe->pe_samples = counter_u64_alloc(M_WAITOK);
 	pe->pe_alloc = *pa;
-	pe->pe_state = PMU_EVENT_STATE_INACTIVE;
-	pe->pe_assigned_row = -1;
 	pm->pm_pmu = pe;
 	return (0);
 }
@@ -1160,14 +1158,11 @@ pmu_group_on_release(struct pmc *pm)
 }
 
 /*
- * Hook every still-active sibling of pg onto pp via the rotation
- * attach helper.  Called both from pmu_group_on_start (initial
- * placement when commit already bound the rows) and from
- * pmu_pp_schedule_in (rotation brings the group in mid-flight).
- * Non-ACTIVE siblings should never exist when we get here -- group
- * scheduling is all-or-none, so once pmu_assign_group succeeds every
- * pe is ACTIVE; we still skip them defensively to keep an inconsistent
- * state from panicking.
+ * Hook every sibling of pg onto pp via the rotation attach helper.
+ * Called both from pmu_group_on_start (initial placement when commit
+ * already bound the rows) and from pmu_pp_schedule_in (rotation brings
+ * the group in mid-flight).  All-or-none scheduling means every
+ * sibling holds a row once pmu_assign_group succeeds.
  */
 static int
 pmu_group_attach_siblings(pmu_group_t *pg, struct pmc_process *pp)
@@ -1176,9 +1171,10 @@ pmu_group_attach_siblings(pmu_group_t *pg, struct pmc_process *pp)
 	struct pmc *pm;
 
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-		if (pe->pe_state != PMU_EVENT_STATE_ACTIVE)
-			continue;
 		pm = pe->pe_pmc;
+		KASSERT(!PMC_ROW_IS_UNASSIGNED(pm),
+		    ("[pmu] attach_siblings: gid=%u pm_id=0x%jx unassigned",
+		    pg->pg_id, (uintmax_t)pm->pm_id));
 		if (pp->pp_pmcs[PMC_TO_ROWINDEX(pm)].pp_pmc == pm)
 			continue;	/* idempotent: already attached */
 		pmc_rotation_attach(pm, pp);
@@ -1240,8 +1236,8 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 	 * of eviction and let new csw_in traffic increment pm_runcount
 	 * while we were detaching.
 	 *
-	 * Doing the restore here -- after assign (rows are valid, pe
-	 * is ACTIVE) but before attach (pp_pmcs[ri] is still NULL) --
+	 * Doing the restore here -- after assign (rows are valid)
+	 * but before attach (pp_pmcs[ri] is still NULL) --
 	 * means by the time pmc_rotation_attach publishes the row via
 	 * atomic_store_rel, pm_state is already RUNNING and any csw_in
 	 * that observes the new row will load the counter immediately.
@@ -1251,10 +1247,8 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 	 * which is the bug behind "Group 0 delta=0 between snapshots
 	 * after a single eviction window" in pmc_mux_works_test.
 	 */
-	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-		if (pe->pe_state == PMU_EVENT_STATE_ACTIVE)
-			pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
-	}
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
 
 	(void)pmu_group_attach_siblings(pg, pp);
 	mtx_pool_lock_spin(pmc_mtxpool, pg);
@@ -1286,8 +1280,6 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
 
 	/* Phase 1: stop every sibling so csw_in/csw_out skip them. */
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-		if (pe->pe_state != PMU_EVENT_STATE_ACTIVE)
-			continue;
 		if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pe->pe_pmc))) {
 			atomic_store_rel_int(&pe->pe_pmc->pm_rotation_drain,
 			    drain_samples);
@@ -1297,18 +1289,16 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
 	}
 
 	/* Phase 2: drain any in-flight csw_out. */
-	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-		if (pe->pe_state != PMU_EVENT_STATE_ACTIVE)
-			continue;
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
 		pmc_rotation_drain(pe->pe_pmc);
-	}
 
-	/* Phase 3: detach every active sibling from the target. */
+	/* Phase 3: detach every sibling from the target. */
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 		struct pmc *pm = pe->pe_pmc;
 
-		if (pe->pe_state != PMU_EVENT_STATE_ACTIVE)
-			continue;
+		KASSERT(!PMC_ROW_IS_UNASSIGNED(pm),
+		    ("[pmu] schedule_out: gid=%u pm_id=0x%jx unassigned",
+		    pg->pg_id, (uintmax_t)pm->pm_id));
 		if (pp->pp_pmcs[PMC_TO_ROWINDEX(pm)].pp_pmc == pm)
 			pmc_rotation_detach(pm, pp);
 	}
@@ -1495,15 +1485,16 @@ pmu_pp_evictable_rows(struct pmc_process *pp)
 	pmu_event_t *pe;
 	pmu_group_t *pg;
 	uint64_t evictable;
+	u_int n;
 
 	evictable = 0;
 	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
 		if (!pg->pg_running || !pg->pg_assigned || !pg->pg_defer_ok)
 			continue;
 		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-			if (pe->pe_assigned_row >= 0 &&
-			    pe->pe_assigned_row < 64)
-				evictable |= 1ULL << pe->pe_assigned_row;
+			n = PMC_TO_ROWINDEX(pe->pe_pmc);
+			if (n < 64)
+				evictable |= 1ULL << n;
 		}
 	}
 	return (evictable);
@@ -1800,8 +1791,6 @@ pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
 	}
 
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-		if (pe->pe_state != PMU_EVENT_STATE_ACTIVE)
-			continue;
 		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
 		hwpmc_pmu_sys_start_row(cpu, pe->pe_pmc);
 	}
@@ -1824,8 +1813,6 @@ pmu_sys_schedule_out(int cpu, pmu_group_t *pg)
 		return;
 
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-		if (pe->pe_state != PMU_EVENT_STATE_ACTIVE)
-			continue;
 		hwpmc_pmu_sys_stop_row(cpu, pe->pe_pmc);
 		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
 	}
@@ -2046,15 +2033,16 @@ pmu_syscpu_evictable_rows(struct pmu_syscpu *sc)
 	pmu_event_t *pe;
 	pmu_group_t *pg;
 	uint64_t evictable;
+	u_int n;
 
 	evictable = 0;
 	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
 		if (!pg->pg_running || !pg->pg_assigned || !pg->pg_defer_ok)
 			continue;
 		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-			if (pe->pe_assigned_row >= 0 &&
-			    pe->pe_assigned_row < 64)
-				evictable |= 1ULL << pe->pe_assigned_row;
+			n = PMC_TO_ROWINDEX(pe->pe_pmc);
+			if (n < 64)
+				evictable |= 1ULL << n;
 		}
 	}
 	return (evictable);

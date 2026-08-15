@@ -111,12 +111,12 @@ pmu_class_supports_grouping(enum pmc_class class)
  * consumed by earlier events in this group.  evictable_rows is a
  * global-ri mask of rows whose current occupant rotation could evict;
  * those rows are treated as allocatable even when the framework's
- * occupancy checks reject them.
+ * occupancy checks reject them.  A NULL p probes against an empty
+ * machine: the framework occupancy checks are skipped entirely.
  */
 static int
 pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
-    uint32_t *used_mask, bool dry_run, bool empty_view,
-    uint64_t evictable_rows)
+    uint32_t *used_mask, bool dry_run, uint64_t evictable_rows)
 {
 	struct pmc *pm;
 	struct pmc_classdep *pcd;
@@ -174,7 +174,7 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 		}
 		if (pcd == NULL || n >= (int)mdep->pmd_npmc)
 			goto skip;
-		if (!empty_view && (!hwpmc_can_allocate_row(n, mode) ||
+		if (p != NULL && (!hwpmc_can_allocate_row(n, mode) ||
 		    !hwpmc_can_allocate_rowindex(p, n, idcpu)) &&
 		    (n >= 64 || (evictable_rows & (1ULL << n)) == 0))
 			goto skip;
@@ -198,8 +198,6 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 			hwpmc_mark_row_standalone(n);
 		else
 			hwpmc_mark_row_thread(n);
-		pe->pe_state = PMU_EVENT_STATE_ACTIVE;
-		pe->pe_assigned_row = n;
 		return (0);
 
 skip:
@@ -254,8 +252,6 @@ pmu_unassign_group(pmu_group_t *pg, int cpu)
 			hwpmc_unmark_row_standalone(n);
 		else
 			hwpmc_unmark_row_thread(n);
-		pe->pe_state = PMU_EVENT_STATE_INACTIVE;
-		pe->pe_assigned_row = -1;
 	}
 	pg->pg_assigned = false;
 }
@@ -289,7 +285,7 @@ pmu_sort_by_weight(pmu_group_t *pg, pmu_event_t **order, u_int n)
 }
 
 static int
-pmu_group_probe(pmu_group_t *pg, struct proc *p, int cpu, bool empty_view,
+pmu_group_probe(pmu_group_t *pg, struct proc *p, int cpu,
     uint64_t evictable_rows)
 {
 	pmu_event_t **order;
@@ -297,7 +293,7 @@ pmu_group_probe(pmu_group_t *pg, struct proc *p, int cpu, bool empty_view,
 	u_int i;
 	int error;
 
-	if (pg == NULL || pg->pg_nevents == 0 || (!empty_view && p == NULL))
+	if (pg == NULL || pg->pg_nevents == 0)
 		return (EINVAL);
 	order = malloc(sizeof(*order) * pg->pg_nevents, M_PMC,
 	    M_WAITOK | M_ZERO);
@@ -306,7 +302,7 @@ pmu_group_probe(pmu_group_t *pg, struct proc *p, int cpu, bool empty_view,
 	error = 0;
 	for (i = 0; i < pg->pg_nevents; i++) {
 		error = pmu_assign_one(order[i], p, cpu, &used_mask, true,
-		    empty_view, evictable_rows);
+		    evictable_rows);
 		if (error != 0)
 			break;
 	}
@@ -317,13 +313,15 @@ pmu_group_probe(pmu_group_t *pg, struct proc *p, int cpu, bool empty_view,
 int
 pmu_group_can_fit(pmu_group_t *pg)
 {
-	return (pmu_group_probe(pg, NULL, 0, true, 0));
+	return (pmu_group_probe(pg, NULL, 0, 0));
 }
 
 int
 pmu_group_can_place(pmu_group_t *pg, struct proc *p, int cpu)
 {
-	return (pmu_group_probe(pg, p, cpu, false, 0));
+	if (p == NULL)
+		return (EINVAL);
+	return (pmu_group_probe(pg, p, cpu, 0));
 }
 
 /*
@@ -337,7 +335,9 @@ int
 pmu_group_satisfiable(pmu_group_t *pg, struct proc *p, int cpu,
     uint64_t evictable_rows)
 {
-	return (pmu_group_probe(pg, p, cpu, false, evictable_rows));
+	if (p == NULL)
+		return (EINVAL);
+	return (pmu_group_probe(pg, p, cpu, evictable_rows));
 }
 
 int
@@ -380,8 +380,7 @@ pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu)
 	used_mask = 0;
 	error = 0;
 	for (i = 0; i < pg->pg_nevents; i++) {
-		error = pmu_assign_one(order[i], p, cpu, &used_mask, false,
-		    false, 0);
+		error = pmu_assign_one(order[i], p, cpu, &used_mask, false, 0);
 		if (error != 0)
 			break;
 	}

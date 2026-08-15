@@ -36,17 +36,6 @@ enum pmc_flags {
 };
 
 /*
- * Per-event lifecycle state.  Events transition INACTIVE -> ACTIVE on
- * a successful pmu_group_on_start, and back to INACTIVE on csw_out
- * (when multiplexed) or on group release.
- */
-enum pmu_event_state {
-	PMU_EVENT_STATE_INACTIVE = 0,
-	PMU_EVENT_STATE_ACTIVE,
-	PMU_EVENT_STATE_ERROR,
-};
-
-/*
  * Scheduling constraint emitted by the per-class backend.  pc_allowed_rows
  * is a bitmask over the backend-defined row index namespace ("row 0..N-1
  * for this class on this CPU"), not a raw MSR/RDPMC number.
@@ -62,17 +51,15 @@ struct pmc_sched_constraint {
 };
 typedef struct pmc_sched_constraint pmc_sched_constraint_t;
 
-/* A pmu_event wraps one PMC with immutable allocation and placement state. */
+/* A pmu_event wraps one PMC with its immutable allocation state. */
 struct pmu_event {
 	TAILQ_ENTRY(pmu_event)		pe_sibling;
 	pmu_group_t			*pe_group;
 	struct pmc			*pe_pmc;
 	counter_u64_t			pe_samples;
-	enum pmu_event_state		pe_state;
 	bool				pe_is_leader;
 	struct pmc_op_pmcallocate	pe_alloc;
 	pmc_sched_constraint_t		pe_cons;
-	int				pe_assigned_row;
 };
 
 struct pmu_group_cpu_state {
