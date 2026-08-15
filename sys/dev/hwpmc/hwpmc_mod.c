@@ -1317,17 +1317,53 @@ pmc_can_attach(struct pmc *pm, struct proc *t)
 	return (!decline_attach);
 }
 
+static void
+pmc_group_log_attach(pmu_group_t *pg, struct proc *p)
+{
+	pmu_event_t *pe;
+	struct pmc *pm;
+	struct pmc_owner *po;
+	char *fullpath, *freepath;
+	bool sampling;
+
+	po = pg->pg_owner;
+	sampling = false;
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		pm = pe->pe_pmc;
+		pm->pm_flags |= PMC_F_ATTACH_DONE;
+		if (!PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)))
+			continue;
+		sampling = true;
+		if (pm->pm_owner->po_owner != p)
+			pm->pm_flags |= PMC_F_NEEDS_LOGFILE;
+	}
+	if ((po->po_flags & PMC_PO_OWNS_LOGFILE) == 0)
+		return;
+	if ((p->p_flag & P_KPROC) == 0) {
+		pmc_getfilename(p->p_textvp, &fullpath, &freepath);
+		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+			pmclog_process_pmcattach(pe->pe_pmc, p->p_pid, fullpath);
+		free(freepath, M_TEMP);
+	}
+	if (sampling)
+		pmc_log_process_mappings(po, p);
+}
+
 /*
  * Attach a process to a PMC.
  */
 static int
 pmc_attach_one_process(struct proc *p, struct pmc *pm)
 {
+	pmu_event_t *pe;
+	pmu_group_t *pg;
 	int ri, error;
 	char *fullpath, *freepath;
 	struct pmc_process	*pp;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
+	pe = pmu_event_from_pmc(pm);
+	pg = pe != NULL ? pe->pe_group : NULL;
 
 	/*
 	 * Deferred grouped sibling: under the new all-or-none scheduling
@@ -1352,7 +1388,9 @@ pmc_attach_one_process(struct proc *p, struct pmc *pm)
 		error = pmu_group_on_attach(pm, p);
 		if (error != 0)
 			return (error);
-		pm->pm_flags |= PMC_F_ATTACH_DONE;
+		KASSERT(pg != NULL,
+		    ("[pmc,%d] unassigned PMC without group", __LINE__));
+		pmc_group_log_attach(pg, p);
 		PROC_LOCK(p);
 		p->p_flag |= P_HWPMC;
 		PROC_UNLOCK(p);
@@ -1400,6 +1438,10 @@ pmc_attach_one_process(struct proc *p, struct pmc *pm)
 	if (error != 0)
 		goto fail;
 	pmc_link_target_process(pm, pp);
+	if (pg != NULL) {
+		pmc_group_log_attach(pg, p);
+		return (0);
+	}
 
 	if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)) &&
 	    (pm->pm_flags & PMC_F_ATTACHED_TO_OWNER) == 0)
@@ -4066,9 +4108,12 @@ pmc_find_pmc(pmc_id_t pmcid, struct pmc **pmc)
 static int
 pmc_start(struct pmc *pm)
 {
+	pmu_event_t *member, *pe;
+	pmu_group_t *pg;
 	struct pmc_binding pb;
 	struct pmc_classdep *pcd;
 	struct pmc_owner *po;
+	struct pmc *sampling_pm;
 	pmc_value_t v;
 	enum pmc_mode mode;
 	int adjri, error, cpu, ri;
@@ -4095,40 +4140,55 @@ pmc_start(struct pmc *pm)
 		return (error);
 	}
 
+	po = pm->pm_owner;
+	pe = pmu_event_from_pmc(pm);
+	pg = pe != NULL ? pe->pe_group : NULL;
+	sampling_pm = NULL;
+	if (pg != NULL) {
+		TAILQ_FOREACH(member, &pg->pg_events, pe_sibling) {
+			if (!PMC_IS_SAMPLING_MODE(
+			    PMC_TO_MODE(member->pe_pmc)))
+				continue;
+			sampling_pm = member->pe_pmc;
+			if ((sampling_pm->pm_flags & PMC_F_NEEDS_LOGFILE) != 0 &&
+			    (po->po_flags & PMC_PO_OWNS_LOGFILE) == 0)
+				return (EDOOFUS);
+		}
+	} else {
+		if ((pm->pm_flags & PMC_F_NEEDS_LOGFILE) != 0 &&
+		    (po->po_flags & PMC_PO_OWNS_LOGFILE) == 0)
+			return (EDOOFUS);
+		if (PMC_IS_SAMPLING_MODE(mode))
+			sampling_pm = pm;
+	}
+	if (sampling_pm != NULL)
+		pmc_log_kernel_mappings(sampling_pm);
+	if (PMC_IS_VIRTUAL_MODE(mode) && pg != NULL &&
+	    pg->pg_attach_proc == NULL) {
+		error = (pm->pm_flags & PMC_F_ATTACH_DONE) != 0 ? ESRCH :
+		    pmc_attach_process(po->po_owner, pm);
+		if (error != 0)
+			return (error);
+	}
+
 	/* Route unassigned virtual members through the group layer. */
 	if (PMC_ROW_IS_UNASSIGNED(pm)) {
 		KASSERT(PMC_IS_VIRTUAL_MODE(mode),
 		    ("[pmc,%d] start on unassigned non-virtual pmc=%p",
 		    __LINE__, pm));
 		error = pmu_group_on_start(pm);
-		if (error == 0)
+		if (error == 0) {
 			pm->pm_state = PMC_STATE_RUNNING;
+			if (pg != NULL && pg->pg_attach_proc == po->po_owner)
+				pmc_force_context_switch();
+		}
 		return (error);
 	}
 	ri   = PMC_TO_ROWINDEX(pm);
 	pcd  = pmc_ri_to_classdep(md, ri, &adjri);
 
 	error = 0;
-	po = pm->pm_owner;
-
 	PMCDBG3(PMC,OPS,1, "start pmc=%p mode=%d ri=%d", pm, mode, ri);
-
-	po = pm->pm_owner;
-
-	/*
-	 * Disallow PMCSTART if a logfile is required but has not been
-	 * configured yet.
-	 */
-	if ((pm->pm_flags & PMC_F_NEEDS_LOGFILE) != 0 &&
-	    (po->po_flags & PMC_PO_OWNS_LOGFILE) == 0)
-		return (EDOOFUS);	/* programming error */
-
-	/*
-	 * If this is a sampling mode PMC, log mapping information for
-	 * the kernel modules that are currently loaded.
-	 */
-	if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)))
-		pmc_log_kernel_mappings(pm);
 
 	if (PMC_IS_VIRTUAL_MODE(mode)) {
 		error = pmu_group_on_start(pm);

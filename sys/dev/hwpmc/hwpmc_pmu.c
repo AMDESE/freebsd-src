@@ -857,9 +857,6 @@ pmu_group_on_start(struct pmc *pm)
 		mtx_pool_unlock_spin(pmc_mtxpool, pg);
 		return (EBUSY);
 	}
-	if (!pg->pg_running)
-		pg->pg_account_placement_admit = false;
-	pmu_group_running_start_locked(pg, cpu_ticks());
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 
 	if (pg->pg_assigned) {
@@ -878,6 +875,8 @@ pmu_group_on_start(struct pmc *pm)
 		PMCDBG4(PMC, OPS, 2,
 		    "on_start: gid=%u pm=%p DEFERRED schedule_in=%d pp=%p",
 		    pg->pg_id, pm, error, pp);
+		if (error != 0 && error != ENOSPC)
+			return (error);
 	}
 
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
@@ -888,6 +887,7 @@ pmu_group_on_start(struct pmc *pm)
 	}
 
 	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_running_start_locked(pg, cpu_ticks());
 	pg->pg_account_placement_admit = pg->pg_assigned;
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 
