@@ -1033,8 +1033,7 @@ hwpmc_pmu_sx_assert_xlocked(void)
  * Sleep on 'chan' while the caller holds pmc_sx.  Releases pmc_sx for
  * the duration of the sleep and reacquires it on wakeup; lets the
  * multiplex rotation kthread wait between windows while still being
- * promptly woken up by wakeup(pg) from pmu_group_on_stop /
- * pmu_group_on_release.
+ * promptly woken up by the rotation kick and stop paths.
  */
 int
 hwpmc_pmu_sx_sleep(void *chan, int timo, const char *wmesg)

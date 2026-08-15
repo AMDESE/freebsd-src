@@ -79,6 +79,7 @@ struct pmu_syscpu {
 	struct thread		*sc_td;		/* rotation kthread */
 	u_int			sc_quiesce;
 	bool			sc_running;	/* kthread should keep going */
+	bool			sc_needed;	/* unplaced MUX group waiting */
 };
 static struct pmu_syscpu pmu_syscpu[MAXCPU];
 
@@ -365,8 +366,9 @@ pmu_pp_stop_rotate(struct pmc_process *pp, const char *wmesg)
 	mtx_lock_spin(&pp->pp_pmu_lock);
 	pp->pp_pmu_rot_quiesce++;
 	pp->pp_pmu_rot_running = false;
+	pp->pp_pmu_rot_needed = false;
 	mtx_unlock_spin(&pp->pp_pmu_lock);
-	wakeup(pp);
+	wakeup(&pp->pp_pmu_rot_needed);
 	while (pp->pp_pmu_rot_td != NULL)
 		(void)hwpmc_pmu_sx_sleep(&pp->pp_pmu_rot_td, 1, wmesg);
 	mtx_lock_spin(&pp->pp_pmu_lock);
@@ -1481,39 +1483,40 @@ pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp)
 	pmu_pp_kick_rotate(pp);
 }
 
+/* True if any running MUX group on pp is waiting for hardware. */
+static bool
+pmu_pp_has_deferred(struct pmc_process *pp)
+{
+	pmu_group_t *pg;
+
+	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
+		if (pg->pg_running && !pg->pg_assigned && pg->pg_defer_ok)
+			return (true);
+	}
+	return (false);
+}
+
 /*
- * Spawn the per-pp rotation kthread the first time multiple groups
- * are attached to one pp, OR if a deferred group is sitting on the
- * pp waiting to be brought in.  Idempotent: returns immediately once
- * the kthread is up.
+ * Ensure pp's deferred MUX groups will be serviced: mark rotation
+ * needed and wake the per-pp kthread, spawning it if absent.  Every
+ * path that leaves a running MUX group unplaced must end up here --
+ * a missed kick is a permanent silent stall (spec §7.3).  Idempotent.
  */
 static void
 pmu_pp_kick_rotate(struct pmc_process *pp)
 {
-	pmu_group_t *pg;
-	int n_running, n_deferred;
 	int error;
 
-	if (pp == NULL || pp->pp_pmu_rot_running ||
-	    pp->pp_pmu_rot_td != NULL || pp->pp_pmu_rot_quiesce != 0 ||
-	    pp->pp_pmu_unhashed)
+	if (pp == NULL || pp->pp_pmu_rot_quiesce != 0 || pp->pp_pmu_unhashed)
+		return;
+	if (!pmu_pp_has_deferred(pp))
 		return;
 
-	n_running = n_deferred = 0;
-	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
-		if (!pg->pg_running)
-			continue;
-		n_running++;
-		if (!pg->pg_assigned)
-			n_deferred++;
-	}
-	/*
-	 * Only worth running rotation if at least one running group
-	 * is currently deferred (i.e., something is waiting for HW)
-	 * AND there is at least one peer that could be evicted.
-	 */
-	if (n_deferred == 0 || n_running < 2)
+	pp->pp_pmu_rot_needed = true;
+	if (pp->pp_pmu_rot_running || pp->pp_pmu_rot_td != NULL) {
+		wakeup(&pp->pp_pmu_rot_needed);
 		return;
+	}
 
 	pp->pp_pmu_rot_running = true;
 	error = kthread_add(pmu_pp_rotate_thread, pp, NULL,
@@ -1618,8 +1621,12 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 	int sin_err;
 	bool found_cursor, placed_any, satisfiable;
 
-	if (pp == NULL || LIST_EMPTY(&pp->pp_pmu_groups))
+	if (pp == NULL)
 		return;
+	if (LIST_EMPTY(&pp->pp_pmu_groups)) {
+		pp->pp_pmu_rot_needed = false;
+		return;
+	}
 
 	/*
 	 * Validate the cursor: a release path could have removed the
@@ -1654,7 +1661,7 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 		}
 	}
 	if (!satisfiable)
-		return;
+		goto out;
 
 	/* Evict the single victim at the cursor, advance past it. */
 	vpg = cursor;
@@ -1702,20 +1709,24 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 			placed_any = true;
 		} else if (sin_err == ENOSPC) {
 			pp->pp_pmu_rot_cursor = pg;
-			return;
+			goto out;
 		}
 		/* Hard failure: skip the group for this tick. */
 next:
 		pg = LIST_NEXT(pg, pg_proc_next);
 	}
 	pp->pp_pmu_rot_cursor = cursor;
+out:
+	/* §7.3: the kthread self-stops once nothing is left deferred. */
+	pp->pp_pmu_rot_needed = pmu_pp_has_deferred(pp);
 }
 
 /*
- * Per-pp rotation kthread.  Wakes every kern.hwpmc.mux_period_ms,
- * runs one pmu_pp_rotate_one tick, and goes back to sleep.  Exits
- * when the last group is released from the pp (pmu_group_on_release
- * clears pp_pmu_rot_running and wakes us).
+ * Per-pp rotation kthread.  Wakes every kern.hwpmc.mux_period_ms (or
+ * early on a kick), runs one pmu_pp_rotate_one tick, and goes back to
+ * sleep.  Exits when a tick leaves nothing deferred (spec §7.3 idle
+ * self-stop) or when pmu_pp_stop_rotate() clears pp_pmu_rot_running;
+ * pmu_pp_kick_rotate() respawns it when a group is deferred again.
  */
 static void
 pmu_pp_rotate_thread(void *arg)
@@ -1728,11 +1739,15 @@ pmu_pp_rotate_thread(void *arg)
 		period_ticks = (pmu_mux_period_ms * hz) / 1000;
 		if (period_ticks < 1)
 			period_ticks = 1;
-		(void)hwpmc_pmu_sx_sleep(pp, period_ticks, "muxrot");
+		(void)hwpmc_pmu_sx_sleep(&pp->pp_pmu_rot_needed,
+		    period_ticks, "muxrot");
 		if (!pp->pp_pmu_rot_running)
 			break;
 		pmu_pp_rotate_one(pp);
+		if (!pp->pp_pmu_rot_needed)
+			break;
 	}
+	pp->pp_pmu_rot_running = false;
 	pp->pp_pmu_rot_td = NULL;
 	wakeup(&pp->pp_pmu_rot_td);
 	hwpmc_pmu_sx_xunlock();
@@ -1875,8 +1890,8 @@ pmu_sys_schedule_out(int cpu, pmu_group_t *pg)
  * pmc_start() entry point for a system-wide group sibling.  Registers
  * the group on its CPU's rotation list, drives the initial HW placement
  * (first sibling only -- the rest are no-ops because the group is
- * already running), and starts the per-CPU rotation kthread if the CPU
- * is oversubscribed.  Idempotent across siblings.
+ * already running), and kicks the per-CPU rotation kthread if the group
+ * was left deferred.  Idempotent across siblings.
  */
 int
 pmu_sys_group_on_start(struct pmc *pm)
@@ -1966,7 +1981,8 @@ pmu_syscpu_stop_rotate(struct pmu_syscpu *sc, const char *wmesg)
 
 	sc->sc_quiesce++;
 	sc->sc_running = false;
-	wakeup(sc);
+	sc->sc_needed = false;
+	wakeup(&sc->sc_needed);
 	while (sc->sc_td != NULL)
 		(void)hwpmc_pmu_sx_sleep(&sc->sc_td, 1, wmesg);
 	KASSERT(sc->sc_quiesce > 0,
@@ -2027,32 +2043,40 @@ pmu_sys_group_pre_release(struct pmc *pm)
 	pmu_syscpu_kick_rotate(cpu);
 }
 
+/* System-mode mirror of pmu_pp_has_deferred(), keyed on sc_groups. */
+static bool
+pmu_syscpu_has_deferred(struct pmu_syscpu *sc)
+{
+	pmu_group_t *pg;
+
+	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
+		if (pg->pg_running && !pg->pg_assigned && pg->pg_defer_ok)
+			return (true);
+	}
+	return (false);
+}
+
 /*
- * Spawn the per-CPU rotation kthread the first time a CPU is
- * oversubscribed (>= 2 running groups, at least one of them deferred).
- * Idempotent: returns immediately once the kthread is up.
+ * System-mode mirror of pmu_pp_kick_rotate(): mark rotation needed
+ * and wake the per-CPU kthread, spawning it if absent.  Idempotent.
  */
 static void
 pmu_syscpu_kick_rotate(int cpu)
 {
 	struct pmu_syscpu *sc;
-	pmu_group_t *pg;
-	int n_running, n_deferred, error;
+	int error;
 
 	sc = &pmu_syscpu[cpu];
-	if (sc->sc_running || sc->sc_td != NULL || sc->sc_quiesce != 0)
+	if (sc->sc_quiesce != 0)
+		return;
+	if (!pmu_syscpu_has_deferred(sc))
 		return;
 
-	n_running = n_deferred = 0;
-	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
-		if (!pg->pg_running)
-			continue;
-		n_running++;
-		if (!pg->pg_assigned)
-			n_deferred++;
-	}
-	if (n_deferred == 0 || n_running < 2)
+	sc->sc_needed = true;
+	if (sc->sc_running || sc->sc_td != NULL) {
+		wakeup(&sc->sc_needed);
 		return;
+	}
 
 	sc->sc_running = true;
 	error = kthread_add(pmu_syscpu_rotate_thread,
@@ -2126,8 +2150,10 @@ pmu_syscpu_rotate_one(int cpu)
 	bool found_cursor, placed_any, satisfiable;
 
 	sc = &pmu_syscpu[cpu];
-	if (LIST_EMPTY(&sc->sc_groups))
+	if (LIST_EMPTY(&sc->sc_groups)) {
+		sc->sc_needed = false;
 		return;
+	}
 
 	ngroups = 0;
 	cursor = sc->sc_cursor;
@@ -2153,7 +2179,7 @@ pmu_syscpu_rotate_one(int cpu)
 		}
 	}
 	if (!satisfiable)
-		return;
+		goto out;
 
 	/* Evict the single victim at the cursor, advance past it. */
 	vpg = cursor;
@@ -2198,20 +2224,24 @@ pmu_syscpu_rotate_one(int cpu)
 			placed_any = true;
 		} else if (sin_err == ENOSPC) {
 			sc->sc_cursor = pg;
-			return;
+			goto out;
 		}
 		/* Hard failure: skip the group for this tick. */
 next:
 		pg = LIST_NEXT(pg, pg_proc_next);
 	}
 	sc->sc_cursor = cursor;
+out:
+	/* §7.3: the kthread self-stops once nothing is left deferred. */
+	sc->sc_needed = pmu_syscpu_has_deferred(sc);
 }
 
 /*
- * Per-CPU rotation kthread.  Wakes every kern.hwpmc.mux_period_ms, runs
- * one rotation tick, and goes back to sleep.  Exits when the last group
- * leaves the CPU (pmu_sys_group_pre_release clears sc_running and wakes
- * us).
+ * Per-CPU rotation kthread.  Wakes every kern.hwpmc.mux_period_ms (or
+ * early on a kick), runs one rotation tick, and goes back to sleep.
+ * Exits when a tick leaves nothing deferred (spec §7.3 idle self-stop)
+ * or when pmu_syscpu_stop_rotate() clears sc_running;
+ * pmu_syscpu_kick_rotate() respawns it when a group is deferred again.
  */
 static void
 pmu_syscpu_rotate_thread(void *arg)
@@ -2225,11 +2255,15 @@ pmu_syscpu_rotate_thread(void *arg)
 		period_ticks = (pmu_mux_period_ms * hz) / 1000;
 		if (period_ticks < 1)
 			period_ticks = 1;
-		(void)hwpmc_pmu_sx_sleep(sc, period_ticks, "muxsys");
+		(void)hwpmc_pmu_sx_sleep(&sc->sc_needed, period_ticks,
+		    "muxsys");
 		if (!sc->sc_running)
 			break;
 		pmu_syscpu_rotate_one(cpu);
+		if (!sc->sc_needed)
+			break;
 	}
+	sc->sc_running = false;
 	sc->sc_td = NULL;
 	wakeup(&sc->sc_td);
 	hwpmc_pmu_sx_xunlock();

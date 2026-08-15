@@ -980,15 +980,17 @@ struct pmc_process {
 	u_int		pp_pmu_refs;
 	u_int		pp_pmu_rot_quiesce;
 	bool		pp_pmu_rot_running;
+	bool		pp_pmu_rot_needed;	/* unplaced MUX group waiting */
 	bool		pp_pmu_unhashed;
 	/*
-	 * Round-robin cursor: the next group to attempt scheduling-in
-	 * at the start of each rotation tick.  When a group fails to
-	 * fit (ENOSPC) we record it as the next cursor and stop the
-	 * tick; the next tick begins from there.  When a group is
-	 * removed from pp_pmu_groups (release path) it must clear
-	 * this if it points at itself, so the kthread does not chase
-	 * a freed pmu_group.
+	 * Round-robin cursor: where the next rotation tick starts.
+	 * Both the victim scan (the placed MUX group evicted this
+	 * tick) and the placement walk begin here.  When a group
+	 * fails to fit (ENOSPC) we record it as the next cursor and
+	 * stop the tick; the next tick begins from there.  When a
+	 * group is removed from pp_pmu_groups (release path) it must
+	 * clear this if it points at itself, so the kthread does not
+	 * chase a freed pmu_group.
 	 */
 	pmu_group_t	*pp_pmu_rot_cursor;
 #endif
