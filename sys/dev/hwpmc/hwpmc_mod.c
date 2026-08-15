@@ -1944,6 +1944,7 @@ pmc_process_csw_in(struct thread *td)
 			mtx_pool_lock_spin(pmc_mtxpool, pm);
 			newvalue = PMC_PCPU_SAVED(cpu, ri) =
 			    pm->pm_gv.pm_savedvalue;
+			pm->pm_pcpu_state[cpu].pps_read_delta = 0;
 			mtx_pool_unlock_spin(pmc_mtxpool, pm);
 		}
 
@@ -1970,6 +1971,7 @@ pmc_process_csw_in(struct thread *td)
 
 	/* commit all class PMC start updates at one boundary */
 	pmc_process_csw_start_all(cpu);
+	pmu_group_csw_in_complete(td, cpu);
 
 	critical_exit();
 }
@@ -1990,6 +1992,195 @@ pmc_delta(const struct pmc_classdep *pcd, pmc_value_t newvalue,
 	if (pcd->pcd_width < 64)
 		delta &= ((pmc_value_t)1 << pcd->pcd_width) - 1;
 	return (delta);
+}
+
+struct pmc_group_snapshot_context {
+	pmu_group_t			*pgsc_group;
+	struct pmc_op_pmcgroupread	*pgsc_snapshot;
+	volatile u_int			pgsc_error;
+	volatile u_int			pgsc_finalizer;
+	volatile u_int			pgsc_done;
+};
+
+static void
+pmc_group_snapshot_member(struct pmc_group_member *member, pmu_event_t *pe)
+{
+	struct pmc *pm;
+
+	pm = pe->pe_pmc;
+	member->pm_pmcid = pm->pm_handle;
+	mtx_pool_lock_spin(pmc_mtxpool, pm);
+	member->pm_value = pm->pm_gv.pm_savedvalue;
+	mtx_pool_unlock_spin(pmc_mtxpool, pm);
+}
+
+static void
+pmc_group_snapshot_cpu(void *arg)
+{
+	struct pmc_group_snapshot_context *ctx;
+	struct pmc_classdep *pcd;
+	struct pmc_process *pp;
+	pmc_value_t newvalue, tmp;
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	struct pmc *pm;
+	int adjri, cpu, error, ri;
+
+	ctx = arg;
+	pg = ctx->pgsc_group;
+	cpu = PCPU_GET(cpuid);
+	critical_enter();
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		pm = pe->pe_pmc;
+		if (pm == NULL || PMC_ROW_IS_UNASSIGNED(pm) ||
+		    pm->pm_pcpu_state[cpu].pps_cpustate == 0)
+			continue;
+		ri = PMC_TO_ROWINDEX(pm);
+		pcd = pmc_ri_to_classdep(md, ri, &adjri);
+		if (pcd == NULL || pcd->pcd_read_pmc == NULL) {
+			atomic_cmpset_int(&ctx->pgsc_error, 0, EOPNOTSUPP);
+			continue;
+		}
+		mtx_pool_lock_spin(pmc_mtxpool, pm);
+		error = pcd->pcd_read_pmc(cpu, adjri, pm, &newvalue);
+		if (error == 0) {
+			tmp = pmc_delta(pcd, newvalue,
+			    PMC_PCPU_SAVED(cpu, ri));
+			pm->pm_gv.pm_savedvalue += tmp;
+			PMC_PCPU_SAVED(cpu, ri) = newvalue;
+			if (!ctx->pgsc_group->pg_system) {
+				pp = ctx->pgsc_group->pg_pp;
+				if (pp != NULL && pp->pp_pmcs[ri].pp_pmc == pm) {
+					pp->pp_pmcs[ri].pp_pmcval += tmp;
+					pm->pm_pcpu_state[cpu].pps_read_delta += tmp;
+				}
+			}
+		}
+		mtx_pool_unlock_spin(pmc_mtxpool, pm);
+		if (error != 0)
+			atomic_cmpset_int(&ctx->pgsc_error, 0,
+			    error > 0 ? error : EIO);
+	}
+	critical_exit();
+}
+
+static void
+pmc_group_snapshot_finalize(void *arg)
+{
+	struct pmc_group_snapshot_context *ctx;
+	struct pmc_op_pmcgroupread *snapshot;
+	struct pmu_group_time_snapshot times;
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	u_int i;
+
+	ctx = arg;
+	if (!atomic_cmpset_int(&ctx->pgsc_finalizer, 0, 1)) {
+		while (atomic_load_acq_int(&ctx->pgsc_done) == 0)
+			cpu_spinwait();
+		return;
+	}
+	if (ctx->pgsc_error != 0)
+		goto out;
+
+	pg = ctx->pgsc_group;
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	snapshot = ctx->pgsc_snapshot;
+	pmu_group_time_snapshot_locked(pg, &times, cpu_ticks());
+	snapshot->pm_gflags = times.pgts_system ?
+	    PMC_GROUP_F_TIME_WALL_NS : PMC_GROUP_F_TIME_THREAD_NS;
+	snapshot->pm_enabled = times.pgts_enabled;
+	snapshot->pm_running = times.pgts_running;
+	snapshot->pm_enabled_wall = times.pgts_enabled_wall;
+	snapshot->pm_wall = times.pgts_wall;
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+
+	i = 0;
+	pmc_group_snapshot_member(&snapshot->pm_members[i++], pg->pg_leader);
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (pe != pg->pg_leader)
+			pmc_group_snapshot_member(&snapshot->pm_members[i++], pe);
+	}
+	KASSERT(i == pg->pg_nevents,
+	    ("[pmc,%d] group %u snapshot has %u of %u members", __LINE__,
+	    pg->pg_id, i, pg->pg_nevents));
+
+out:
+	atomic_store_rel_int(&ctx->pgsc_done, 1);
+}
+
+static int
+pmc_group_snapshot_counts(pmu_group_t *pg,
+    struct pmc_op_pmcgroupread *snapshot)
+{
+	struct pmc_group_snapshot_context ctx;
+	pmu_event_t *pe;
+	struct pmc *pm;
+	cpuset_t cpus;
+	bool transitioning;
+	int cpu;
+
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pe->pe_pmc)))
+			return (EOPNOTSUPP);
+	}
+
+	pm = pg->pg_leader->pe_pmc;
+	critical_enter();
+	for (;;) {
+		CPU_ZERO(&cpus);
+		transitioning = false;
+		mtx_lock_spin(&pg->pg_snapshot_lock);
+		pg->pg_snapshot_pending = true;
+		mtx_pool_lock_spin(pmc_mtxpool, pg);
+		if (!pg->pg_system) {
+			for (cpu = 0; (u_int)cpu < pg->pg_ncpu; cpu++) {
+				if (pg->pg_cpu_state[cpu].pgcs_transitioning) {
+					transitioning = true;
+					break;
+				}
+			}
+		}
+		if (!transitioning) {
+			pg->pg_snapshot_active = true;
+			pg->pg_snapshot_pending = false;
+			if (!PMC_ROW_IS_UNASSIGNED(pm)) {
+				for (cpu = 0; cpu < pmc_cpu_max(); cpu++) {
+					if (!pmc_cpu_is_active(cpu))
+						continue;
+					if (pm->pm_pcpu_state[cpu].pps_cpustate != 0 ||
+					    (!pg->pg_system &&
+					    (u_int)cpu < pg->pg_ncpu &&
+					    pg->pg_cpu_state[cpu].pgcs_counted))
+						CPU_SET(cpu, &cpus);
+				}
+			}
+		}
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+		mtx_unlock_spin(&pg->pg_snapshot_lock);
+		if (!transitioning)
+			break;
+		DELAY(1);
+	}
+
+	ctx.pgsc_group = pg;
+	ctx.pgsc_snapshot = snapshot;
+	ctx.pgsc_error = 0;
+	ctx.pgsc_finalizer = 0;
+	ctx.pgsc_done = 0;
+	if (CPU_EMPTY(&cpus))
+		pmc_group_snapshot_finalize(&ctx);
+	else
+		smp_rendezvous_cpus(cpus, NULL, pmc_group_snapshot_cpu,
+		    pmc_group_snapshot_finalize, &ctx);
+
+	mtx_lock_spin(&pg->pg_snapshot_lock);
+	KASSERT(pg->pg_snapshot_active,
+	    ("[pmc,%d] inactive group snapshot", __LINE__));
+	pg->pg_snapshot_active = false;
+	mtx_unlock_spin(&pg->pg_snapshot_lock);
+	critical_exit();
+	return (ctx.pgsc_error);
 }
 
 /*
@@ -2038,6 +2229,7 @@ pmc_reclaim_pmc_from_cpu(struct pmc *pm, struct pmc_process *pp, int cpu)
 				mtx_pool_lock_spin(pmc_mtxpool, pm);
 				pm->pm_gv.pm_savedvalue += tmp;
 				pp->pp_pmcs[ri].pp_pmcval += tmp;
+				pm->pm_pcpu_state[cpu].pps_read_delta = 0;
 				mtx_pool_unlock_spin(pmc_mtxpool, pm);
 			}
 		}
@@ -2059,7 +2251,7 @@ pmc_process_csw_out(struct thread *td)
 	struct pmc_process *pp;
 	struct pmc_thread *pt = NULL;
 	struct proc *p;
-	pmc_value_t newvalue, tmp;
+	pmc_value_t logvalue, newvalue, tmp;
 	enum pmc_mode mode;
 	int cpu;
 	u_int adjri, ri;
@@ -2212,10 +2404,13 @@ pmc_process_csw_out(struct thread *td)
 				mtx_pool_lock_spin(pmc_mtxpool, pm);
 				pm->pm_gv.pm_savedvalue += tmp;
 				pp->pp_pmcs[ri].pp_pmcval += tmp;
+				logvalue = tmp +
+				    pm->pm_pcpu_state[cpu].pps_read_delta;
+				pm->pm_pcpu_state[cpu].pps_read_delta = 0;
 				mtx_pool_unlock_spin(pmc_mtxpool, pm);
 
 				if (pm->pm_flags & PMC_F_LOG_PROCCSW)
-					pmclog_process_proccsw(pm, pp, tmp, td);
+					pmclog_process_proccsw(pm, pp, logvalue, td);
 			}
 		}
 
@@ -2228,6 +2423,7 @@ pmc_process_csw_out(struct thread *td)
 	 * switch out functions.
 	 */
 	(void)(*md->pmd_switch_out)(pc, pp);
+	pmu_group_csw_out_complete(td, cpu);
 
 	critical_exit();
 }
@@ -3682,6 +3878,9 @@ hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
 	pmc_select_cpu(cpu);
 	critical_enter();
 	(void)pcd->pcd_write_pmc(cpu, adjri, pm, 0);
+	mtx_pool_lock_spin(pmc_mtxpool, pm);
+	PMC_PCPU_SAVED(cpu, ri) = 0;
+	mtx_pool_unlock_spin(pmc_mtxpool, pm);
 	pm->pm_pcpu_state[cpu].pps_cpustate = 1;
 	(void)pcd->pcd_start_pmc(cpu, adjri, pm);
 	pmu_group_sys_row_started(pm);
@@ -3699,7 +3898,7 @@ hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm)
 {
 	struct pmc_binding pb;
 	struct pmc_classdep *pcd;
-	pmc_value_t v;
+	pmc_value_t tmp, v;
 	int adjri, ri;
 
 	ri = PMC_TO_ROWINDEX(pm);
@@ -3715,7 +3914,9 @@ hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm)
 	v = 0;
 	if (pcd->pcd_read_pmc(cpu, adjri, pm, &v) == 0) {
 		mtx_pool_lock_spin(pmc_mtxpool, pm);
-		pm->pm_gv.pm_savedvalue += v;
+		tmp = pmc_delta(pcd, v, PMC_PCPU_SAVED(cpu, ri));
+		pm->pm_gv.pm_savedvalue += tmp;
+		PMC_PCPU_SAVED(cpu, ri) = v;
 		mtx_pool_unlock_spin(pmc_mtxpool, pm);
 	}
 	pmu_group_sys_row_stopped(pm);
@@ -5728,11 +5929,12 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 
 	case PMC_OP_PMCGROUPREAD:
 	{
-		struct pmc_op_pmcgroupread gr;
+		struct pmc_op_pmcgroupread gr, *snapshot;
 		struct pmc_owner *po;
 		struct pmc *pm;
 		pmu_event_t *pe;
 		pmu_group_t *pg;
+		size_t snapshot_size;
 		uint32_t capacity;
 
 		sx_assert(&pmc_sx, SX_XLOCKED);
@@ -5751,7 +5953,8 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		}
 		pe = pmu_event_from_pmc(pm);
 		if (pe == NULL || pe->pe_group == NULL ||
-		    !pe->pe_group->pg_committed || pe->pe_group->pg_leader != pe) {
+		    !pe->pe_group->pg_committed ||
+		    pe->pe_group->pg_leader != pe) {
 			error = ENOTTY;
 			break;
 		}
@@ -5768,7 +5971,21 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 				error = E2BIG;
 			break;
 		}
-		error = EOPNOTSUPP;
+
+		snapshot_size = sizeof(*snapshot) + pg->pg_nevents *
+		    sizeof(snapshot->pm_members[0]);
+		snapshot = malloc(snapshot_size, M_PMC, M_WAITOK | M_ZERO);
+		snapshot->pm_leader = pm->pm_handle;
+		snapshot->pm_nmembers = pg->pg_nevents;
+		error = pmc_group_snapshot_counts(pg, snapshot);
+		if (error != 0) {
+			free(snapshot, M_PMC);
+			break;
+		}
+
+		PMC_DOWNGRADE_SX();
+		error = copyout(snapshot, arg, snapshot_size);
+		free(snapshot, M_PMC);
 	}
 	break;
 
@@ -6473,6 +6690,7 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 	 * Inform the MD layer of this pseudo "context switch out".
 	 */
 	(void)md->pmd_switch_out(pmc_pcpu[cpu], pp);
+	pmu_group_csw_out_complete(curthread, cpu);
 
 	critical_exit(); /* ok to be pre-empted now */
 

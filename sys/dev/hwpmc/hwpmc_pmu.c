@@ -177,15 +177,13 @@ pmu_group_ticks_to_ns(uint64_t ticks, uint64_t tickrate)
 }
 
 void
-pmu_group_time_snapshot(pmu_group_t *pg,
-    struct pmu_group_time_snapshot *snapshot)
+pmu_group_time_snapshot_locked(pmu_group_t *pg,
+    struct pmu_group_time_snapshot *snapshot, uint64_t now)
 {
-	uint64_t enabled, enabled_wall, now, running, tickrate, wall;
+	uint64_t enabled, enabled_wall, running, tickrate, wall;
 
 	KASSERT(pg != NULL && snapshot != NULL,
 	    ("[pmu] invalid group time snapshot"));
-	now = cpu_ticks();
-	mtx_pool_lock_spin(pmc_mtxpool, pg);
 	pmu_group_time_update_locked(pg, now);
 	enabled = pg->pg_time_enabled_ticks;
 	running = MIN(pg->pg_time_running_ticks, enabled);
@@ -195,7 +193,6 @@ pmu_group_time_snapshot(pmu_group_t *pg,
 		wall += now - pg->pg_wall_start_ticks;
 	tickrate = pg->pg_tickrate;
 	snapshot->pgts_system = pg->pg_system;
-	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 
 	snapshot->pgts_enabled = pmu_group_ticks_to_ns(enabled, tickrate);
 	snapshot->pgts_running = pmu_group_ticks_to_ns(running, tickrate);
@@ -204,6 +201,18 @@ pmu_group_time_snapshot(pmu_group_t *pg,
 	snapshot->pgts_wall = pmu_group_ticks_to_ns(wall, tickrate);
 	if (snapshot->pgts_running > snapshot->pgts_enabled)
 		snapshot->pgts_running = snapshot->pgts_enabled;
+}
+
+void
+pmu_group_time_snapshot(pmu_group_t *pg,
+    struct pmu_group_time_snapshot *snapshot)
+{
+	uint64_t now;
+
+	now = cpu_ticks();
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_time_snapshot_locked(pg, snapshot, now);
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 }
 
 static int
@@ -267,20 +276,18 @@ pmu_group_accounting_drain(pmu_group_t *pg, bool release)
 		pmc_save_cpu_binding(&pb);
 	for (;;) {
 		mtx_pool_lock_spin(pmc_mtxpool, pg);
-		if (pg->pg_oncpu_threads == 0) {
-			mtx_pool_unlock_spin(pmc_mtxpool, pg);
-			break;
-		}
 		for (cpu = 0; cpu < pg->pg_ncpu; cpu++) {
 			if (pg->pg_cpu_state[cpu].pgcs_counted)
 				break;
 		}
+		if (cpu == pg->pg_ncpu) {
+			KASSERT(pg->pg_oncpu_threads == 0,
+			    ("[pmu] group %u has count without marker",
+			    pg->pg_id));
+			mtx_pool_unlock_spin(pmc_mtxpool, pg);
+			break;
+		}
 		mtx_pool_unlock_spin(pmc_mtxpool, pg);
-
-		KASSERT(cpu < pg->pg_ncpu,
-		    ("[pmu] group %u has count without marker", pg->pg_id));
-		if (cpu >= pg->pg_ncpu)
-			continue;
 #ifdef INVARIANTS
 		KASSERT(maxloop-- > 0,
 		    ("[pmu] group %u accounting drain stuck", pg->pg_id));
@@ -305,6 +312,7 @@ pmu_group_accounting_drain(pmu_group_t *pg, bool release)
 	for (cpu = 0; cpu < pg->pg_ncpu; cpu++) {
 		KASSERT(!pg->pg_cpu_state[cpu].pgcs_counted &&
 		    !pg->pg_cpu_state[cpu].pgcs_placed &&
+		    !pg->pg_cpu_state[cpu].pgcs_transitioning &&
 		    pg->pg_cpu_state[cpu].pgcs_td == NULL,
 		    ("[pmu] group %u has active CPU %u marker", pg->pg_id,
 		    cpu));
@@ -349,6 +357,7 @@ pmu_group_create(struct pmc_owner *po, uint32_t *pg_id)
 	    ("[pmu] pmu_group_create: null po=%p pg_id=%p", po, pg_id));
 
 	pg = malloc(sizeof(*pg), M_PMU, M_WAITOK | M_ZERO);
+	mtx_init(&pg->pg_snapshot_lock, "pmu group snapshot", NULL, MTX_SPIN);
 	pg->pg_id = pmu_next_group_id++;
 	pg->pg_owner = po;
 	TAILQ_INIT(&pg->pg_events);
@@ -609,13 +618,17 @@ pmu_group_release(pmu_group_t *pg)
 	    ("[pmu] freeing group with accounting enabled"));
 	KASSERT(pg->pg_oncpu_threads == 0 && pg->pg_running_threads == 0,
 	    ("[pmu] freeing group with active accounting"));
+	KASSERT(!pg->pg_snapshot_pending && !pg->pg_snapshot_active,
+	    ("[pmu] freeing group with active snapshot"));
 	for (u_int cpu = 0; cpu < pg->pg_ncpu; cpu++) {
 		KASSERT(!pg->pg_cpu_state[cpu].pgcs_counted &&
 		    !pg->pg_cpu_state[cpu].pgcs_placed &&
+		    !pg->pg_cpu_state[cpu].pgcs_transitioning &&
 		    pg->pg_cpu_state[cpu].pgcs_td == NULL,
 		    ("[pmu] freeing group with active CPU marker"));
 	}
 	free(pg->pg_cpu_state, M_PMU);
+	mtx_destroy(&pg->pg_snapshot_lock);
 	free(pg, M_PMU);
 }
 
@@ -845,6 +858,19 @@ void pmu_event_account_out(pmu_event_t *pe __unused,
     uint64_t now __unused) { }
 void pmu_rotate_groups(int cpu __unused) { }
 
+static void
+pmu_group_transition_lock(pmu_group_t *pg)
+{
+
+	for (;;) {
+		mtx_lock_spin(&pg->pg_snapshot_lock);
+		if (!pg->pg_snapshot_pending && !pg->pg_snapshot_active)
+			return;
+		mtx_unlock_spin(&pg->pg_snapshot_lock);
+		cpu_spinwait();
+	}
+}
+
 void
 pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
 {
@@ -860,10 +886,12 @@ pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
 		if (pg->pg_system || cpu < 0 || (u_int)cpu >= pg->pg_ncpu)
 			continue;
 		pgcs = &pg->pg_cpu_state[cpu];
+		pmu_group_transition_lock(pg);
 		mtx_pool_lock_spin(pmc_mtxpool, pg);
 		if (!pg->pg_committed || !pg->pg_running ||
 		    pg->pg_account_blocked) {
 			mtx_pool_unlock_spin(pmc_mtxpool, pg);
+			mtx_unlock_spin(&pg->pg_snapshot_lock);
 			continue;
 		}
 		KASSERT(!pgcs->pgcs_counted,
@@ -871,17 +899,45 @@ pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
 		    pg->pg_id));
 		if (pgcs->pgcs_counted) {
 			mtx_pool_unlock_spin(pmc_mtxpool, pg);
+			mtx_unlock_spin(&pg->pg_snapshot_lock);
 			continue;
 		}
 		pmu_group_time_update_locked(pg, now);
 		pgcs->pgcs_td = td;
 		pgcs->pgcs_counted = true;
 		pgcs->pgcs_placed = false;
+		pgcs->pgcs_transitioning = true;
 		pg->pg_oncpu_threads++;
 		LIST_INSERT_HEAD(&pmu_group_cpu_active[cpu], pgcs, pgcs_next);
 		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+		mtx_unlock_spin(&pg->pg_snapshot_lock);
 	}
 	mtx_unlock_spin(&pp->pp_pmu_lock);
+}
+
+void
+pmu_group_csw_in_complete(struct thread *td, int cpu)
+{
+	struct pmu_group_cpu_state *pgcs;
+	pmu_group_t *pg;
+
+	KASSERT(cpu >= 0 && cpu < MAXCPU,
+	    ("[pmu] invalid csw-in completion CPU %d", cpu));
+	if (cpu < 0 || cpu >= MAXCPU)
+		return;
+
+	LIST_FOREACH(pgcs, &pmu_group_cpu_active[cpu], pgcs_next) {
+		if (pgcs->pgcs_td != td)
+			continue;
+		pg = pgcs->pgcs_group;
+		mtx_lock_spin(&pg->pg_snapshot_lock);
+		mtx_pool_lock_spin(pmc_mtxpool, pg);
+		if (pgcs->pgcs_counted && pgcs->pgcs_td == td &&
+		    pgcs->pgcs_transitioning)
+			pgcs->pgcs_transitioning = false;
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+		mtx_unlock_spin(&pg->pg_snapshot_lock);
+	}
 }
 
 bool
@@ -919,12 +975,37 @@ pmu_group_csw_can_start(struct pmc *pm, struct thread *td, int cpu)
 void
 pmu_group_csw_out(struct thread *td, int cpu)
 {
+	struct pmu_group_cpu_state *pgcs;
+	pmu_group_t *pg;
+
+	KASSERT(cpu >= 0 && cpu < MAXCPU,
+	    ("[pmu] invalid csw-out CPU %d", cpu));
+	if (cpu < 0 || cpu >= MAXCPU)
+		return;
+
+	LIST_FOREACH(pgcs, &pmu_group_cpu_active[cpu], pgcs_next) {
+		if (pgcs->pgcs_td != td)
+			continue;
+		pg = pgcs->pgcs_group;
+		pmu_group_transition_lock(pg);
+		mtx_pool_lock_spin(pmc_mtxpool, pg);
+		if (pgcs->pgcs_counted && pgcs->pgcs_td == td &&
+		    !pgcs->pgcs_transitioning)
+			pgcs->pgcs_transitioning = true;
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+		mtx_unlock_spin(&pg->pg_snapshot_lock);
+	}
+}
+
+void
+pmu_group_csw_out_complete(struct thread *td, int cpu)
+{
 	struct pmu_group_cpu_state *pgcs, *next;
 	pmu_group_t *pg;
 	uint64_t now;
 
 	KASSERT(cpu >= 0 && cpu < MAXCPU,
-	    ("[pmu] invalid csw-out CPU %d", cpu));
+	    ("[pmu] invalid csw-out completion CPU %d", cpu));
 	if (cpu < 0 || cpu >= MAXCPU)
 		return;
 
@@ -934,9 +1015,11 @@ pmu_group_csw_out(struct thread *td, int cpu)
 		if (pgcs->pgcs_td != td)
 			continue;
 		pg = pgcs->pgcs_group;
+		mtx_lock_spin(&pg->pg_snapshot_lock);
 		mtx_pool_lock_spin(pmc_mtxpool, pg);
 		if (!pgcs->pgcs_counted || pgcs->pgcs_td != td) {
 			mtx_pool_unlock_spin(pmc_mtxpool, pg);
+			mtx_unlock_spin(&pg->pg_snapshot_lock);
 			continue;
 		}
 		pmu_group_time_update_locked(pg, now);
@@ -953,7 +1036,9 @@ pmu_group_csw_out(struct thread *td, int cpu)
 		pgcs->pgcs_td = NULL;
 		pgcs->pgcs_counted = false;
 		pgcs->pgcs_placed = false;
+		pgcs->pgcs_transitioning = false;
 		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+		mtx_unlock_spin(&pg->pg_snapshot_lock);
 	}
 }
 

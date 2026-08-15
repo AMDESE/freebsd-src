@@ -800,6 +800,7 @@ struct pmc_target {
  *
  */
 struct pmc_pcpu_state {
+	pmc_value_t pps_read_delta;	/* delta flushed by group reads */
 	uint32_t pps_overflowcnt;	/* count overflow interrupts */
 	uint8_t pps_stalled;
 	uint8_t pps_cpustate;

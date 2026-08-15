@@ -15,6 +15,7 @@
 #ifndef _DEV_HWPMC_PMU_H_
 #define	_DEV_HWPMC_PMU_H_
 
+#include <sys/mutex.h>
 #include <sys/pmc.h>
 #include <sys/queue.h>
 
@@ -80,6 +81,7 @@ struct pmu_group_cpu_state {
 	struct thread			*pgcs_td;
 	bool				pgcs_counted;
 	bool				pgcs_placed;
+	bool				pgcs_transitioning;
 };
 
 struct pmu_group_time_snapshot {
@@ -125,12 +127,15 @@ struct pmu_group {
 	uint64_t			pg_wall_ticks;
 	uint64_t			pg_timestamp_ticks;
 	uint64_t			pg_tickrate;
+	struct mtx			pg_snapshot_lock;
 	u_int				pg_oncpu_threads;
 	u_int				pg_running_threads;
 	struct pmu_group_cpu_state	*pg_cpu_state;
 	u_int				pg_ncpu;
 	bool				pg_account_blocked;
 	bool				pg_account_placement_admit;
+	bool				pg_snapshot_pending;
+	bool				pg_snapshot_active;
 	/*
 	 * System-wide (PMC_MODE_SC) group state.  Process-mode groups
 	 * hang off a pmc_process (pg_pp) and rotate in a per-pp kthread;
@@ -213,6 +218,8 @@ void pmu_group_accounting_initialize(void);
 void pmu_group_accounting_finalize(void);
 void pmu_group_time_snapshot(pmu_group_t *pg,
     struct pmu_group_time_snapshot *snapshot);
+void pmu_group_time_snapshot_locked(pmu_group_t *pg,
+    struct pmu_group_time_snapshot *snapshot, uint64_t now);
 void pmu_event_destroy(pmu_event_t *pe);
 pmu_event_t *pmu_event_from_pmc(struct pmc *pm);
 
@@ -222,8 +229,10 @@ int pmu_group_on_start(struct pmc *pm);
 void pmu_group_on_stop(struct pmc *pm);
 void pmu_group_on_release(struct pmc *pm);
 void pmu_group_csw_in(struct thread *td, struct pmc_process *pp);
+void pmu_group_csw_in_complete(struct thread *td, int cpu);
 bool pmu_group_csw_can_start(struct pmc *pm, struct thread *td, int cpu);
 void pmu_group_csw_out(struct thread *td, int cpu);
+void pmu_group_csw_out_complete(struct thread *td, int cpu);
 int pmu_group_read_value(struct pmc *pm, pmc_value_t *value);
 
 /*
