@@ -250,6 +250,20 @@ rot_thread_visible(void)
 }
 
 /*
+ * Size for three same-size groups that oversubscribe 'core' counters,
+ * or -1 when the machine cannot host that layout.
+ */
+static int
+mux_group_size(int core)
+{
+	int s = core / 2;
+
+	if (s < 1 || s > MAX_PER_GROUP || 3 * s <= core)
+		return (-1);
+	return (s);
+}
+
+/*
  * Sub-test 1 (spec 7.2/7.4): three identical-size MUX groups over
  * capacity.  Delta running/enabled ratios measured across a 3 s busy
  * window must sit within 1.25x of one another.
@@ -260,12 +274,12 @@ test_fairness(int core)
 	struct grp g[3];
 	uint64_t en1[3], ru1[3], en2[3], ru2[3];
 	double ratio[3], lo, hi;
-	int cursor = 0, i, rc = 1;
+	int cursor = 0, i, rc = 1, s;
 
-	int s = core / 2;
-	if (s < 1 || s > MAX_PER_GROUP || 3 * s <= core) {
-		printf("SKIP fairness: cannot oversubscribe 3 x %d on %d\n",
-		    s, core);
+	s = mux_group_size(core);
+	if (s < 0) {
+		printf("SKIP fairness: cannot oversubscribe on %d counters\n",
+		    core);
 		return (77);
 	}
 
@@ -339,10 +353,10 @@ test_pinned(int core)
 	struct grp p, m1, m2;
 	uint64_t pen1, pru1, pen2, pru2, en, ru1a, ru2a, ru1b, ru2b;
 	double pinned_ratio;
-	int cursor = 0, rc = 1;
+	int cursor = 0, rc = 1, s;
 
-	int s = core / 2;
-	if (s < 1 || s > MAX_PER_GROUP || 3 * s <= core) {
+	s = mux_group_size(core);
+	if (s < 0) {
 		printf("SKIP pinned: cannot oversubscribe on %d counters\n",
 		    core);
 		return (77);
@@ -414,10 +428,10 @@ test_escalation(int core)
 {
 	struct grp a, b, c;
 	uint64_t en, ru;
-	int cursor = 0, rc = 1, i;
+	int cursor = 0, rc = 1, i, sa, sc;
 
-	int sa = core / 2;
-	int sc = core - sa + 1;
+	sa = core / 2;
+	sc = core - sa + 1;
 	if (sa < 1 || sc > MAX_PER_GROUP || sc > core || sa + sa > core) {
 		printf("SKIP escalation: no valid sizes on %d counters\n",
 		    core);
@@ -474,9 +488,9 @@ test_selfstop_rekick(int core)
 {
 	struct grp m1, m2, m3;
 	uint64_t en, ru_a, ru_b, ru;
-	int cursor = 0, rc = 1, vis, i;
+	int cursor = 0, rc = 1, vis, i, s;
 
-	int s = core / 2 + 1;
+	s = core / 2 + 1;
 	if (s > MAX_PER_GROUP || 2 * s <= core || s > core) {
 		printf("SKIP self-stop: no valid sizes on %d counters\n",
 		    core);
