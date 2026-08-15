@@ -145,10 +145,10 @@ pmcstat_free_event_group(char **events, size_t n)
  * per-event setup so brace-list expansion can reuse it without
  * duplicating the inline body of pmcstat's getopt switch.  Only the
  * minimum subset of fields needed to drive pmc_allocate_group is
- * filled in here; the rest is set by pmcstat itself before the
- * allocation loop runs.
+ * filled in here; the entry is returned so the caller can apply the
+ * per-event modifiers (-n/-C/-c, callchain flags) it tracks.
  */
-void
+struct pmcstat_ev *
 pmcstat_add_one_event(int option, const char *spec, struct pmcstat_args *pa,
     int groupid, int is_leader)
 {
@@ -191,4 +191,5 @@ pmcstat_add_one_event(int option, const char *spec, struct pmcstat_args *pa,
 	ev->ev_flags = 0;
 
 	STAILQ_INSERT_TAIL(&pa->pa_events, ev, ev_next);
+	return (ev);
 }

@@ -667,11 +667,49 @@ main(int argc, char **argv)
 					    "ERROR: Bad group spec \"%s\"",
 					    optarg);
 				if (rv == 0) {
+					if (option == 'P' || option == 'p')
+						args.pa_required |=
+						    (FLAG_HAS_COMMANDLINE |
+						    FLAG_HAS_TARGET);
+					if (option == 'P' || option == 'S')
+						args.pa_required |=
+						    (FLAG_HAS_PIPE |
+						    FLAG_HAS_OUTPUT_LOGFILE);
 					gid = next_syntactic_gid++;
-					for (si = 0; si < nsib; si++)
-						pmcstat_add_one_event(option,
-						    siblings[si], &args, gid,
-						    si == 0);
+					for (si = 0; si < nsib; si++) {
+						ev = pmcstat_add_one_event(
+						    option, siblings[si],
+						    &args, gid, si == 0);
+						if (option == 'S' ||
+						    option == 'P')
+							ev->ev_count =
+							    current_sampling_count ?
+							    current_sampling_count :
+							    pmc_pmu_sample_rate_get(
+							    ev->ev_spec);
+						if (option == 'S' ||
+						    option == 's')
+							ev->ev_cpu =
+							    CPU_FFS(&cpumask) - 1;
+						if (do_callchain) {
+							ev->ev_flags |=
+							    PMC_F_CALLCHAIN;
+							if (do_userspace)
+								ev->ev_flags |=
+								    PMC_F_USERCALLCHAIN;
+						}
+						if (do_descendants)
+							ev->ev_flags |=
+							    PMC_F_DESCENDANTS;
+						if (do_logprocexit)
+							ev->ev_flags |=
+							    PMC_F_LOG_PROCEXIT;
+						if (do_logproccsw)
+							ev->ev_flags |=
+							    PMC_F_LOG_PROCCSW;
+						ev->ev_cumulative =
+						    use_cumulative_counts;
+					}
 					pmcstat_free_event_group(siblings,
 					    nsib);
 					break;

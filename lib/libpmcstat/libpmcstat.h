@@ -394,7 +394,7 @@ int pmcstat_close_log(struct pmcstat_args *args);
 int pmcstat_parse_event_group(const char *spec, char ***out_events,
     size_t *n_out);
 void pmcstat_free_event_group(char **events, size_t n);
-void pmcstat_add_one_event(int option, const char *spec,
+struct pmcstat_ev *pmcstat_add_one_event(int option, const char *spec,
     struct pmcstat_args *pa, int groupid, int is_leader);
 
 __END_DECLS
