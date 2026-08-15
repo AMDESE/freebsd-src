@@ -3169,6 +3169,13 @@ pmc_allocate_deferred_handle(struct pmc_owner *po, uint32_t cpu,
 			continue;
 		generation = pdh->pdh_generation[index];
 		row = PMC_HANDLE_DEFERRED_ROW(index, generation);
+		if (!PMC_ROW_IS_DEFERRED_HANDLE(row)) {
+			/* Index 31 generation 3 encodes PMC_ROW_UNASSIGNED. */
+			generation = (generation + 1) &
+			    PMC_HANDLE_DEFERRED_GENERATION_MASK;
+			pdh->pdh_generation[index] = generation;
+			row = PMC_HANDLE_DEFERRED_ROW(index, generation);
+		}
 		KASSERT(PMC_ROW_IS_DEFERRED_HANDLE(row),
 		    ("[pmc,%d] invalid deferred handle row %#x", __LINE__, row));
 		pdh->pdh_used |= 1u << index;
