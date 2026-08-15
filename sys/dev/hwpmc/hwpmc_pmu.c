@@ -1435,6 +1435,50 @@ pmu_pp_release_all(struct pmc_process *pp)
 	}
 }
 
+void
+pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp)
+{
+	pmu_event_t *pe;
+	pmu_group_t *other;
+
+	hwpmc_pmu_sx_assert_xlocked();
+	KASSERT(pg != NULL && pp != NULL && pg->pg_pp == pp,
+	    ("[pmu] invalid group target detach"));
+	KASSERT(!pg->pg_releasing,
+	    ("[pmu] group %u detach already active", pg->pg_id));
+
+	pg->pg_releasing = true;
+	mtx_lock_spin(&pp->pp_pmu_lock);
+	pmu_group_accounting_block(pg);
+	mtx_unlock_spin(&pp->pp_pmu_lock);
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
+	pmu_group_accounting_drain(pg, false);
+	pmu_pp_stop_rotate(pp, "muxdetach");
+	if (pg->pg_assigned)
+		pmu_pp_schedule_out(pp, pg, false);
+
+	mtx_lock_spin(&pp->pp_pmu_lock);
+	if (pp->pp_pmu_rot_cursor == pg)
+		pp->pp_pmu_rot_cursor = LIST_NEXT(pg, pg_proc_next);
+	LIST_REMOVE(pg, pg_proc_next);
+	pg->pg_pp = NULL;
+	pg->pg_attach_proc = NULL;
+	mtx_unlock_spin(&pp->pp_pmu_lock);
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		pe->pe_pmc->pm_flags &= ~(PMC_F_ATTACH_DONE |
+		    PMC_F_ATTACHED_TO_OWNER | PMC_F_NEEDS_LOGFILE);
+	}
+	pg->pg_releasing = false;
+	wakeup(&pg->pg_releasing);
+
+	LIST_FOREACH(other, &pp->pp_pmu_groups, pg_proc_next) {
+		if (other->pg_running && !other->pg_assigned)
+			(void)pmu_pp_schedule_in(pp, other);
+	}
+	pmu_pp_kick_rotate(pp);
+}
+
 /*
  * Spawn the per-pp rotation kthread the first time multiple groups
  * are attached to one pp, OR if a deferred group is sitting on the
@@ -1479,6 +1523,14 @@ pmu_pp_kick_rotate(struct pmc_process *pp)
 		PMCDBG1(PMC, OPS, 1,
 		    "pp_kick_rotate: kthread_add err=%d", error);
 	}
+}
+
+void
+pmu_pp_kick_after_exec(struct pmc_process *pp)
+{
+
+	hwpmc_pmu_sx_assert_xlocked();
+	pmu_pp_kick_rotate(pp);
 }
 
 /*

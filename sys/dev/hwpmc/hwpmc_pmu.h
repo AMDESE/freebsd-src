@@ -263,6 +263,8 @@ void pmu_sys_group_pre_release(struct pmc *pm);
  * must hold pmc_sx exclusive.
  */
 void pmu_pp_release_all(struct pmc_process *pp);
+void pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp);
+void pmu_pp_kick_after_exec(struct pmc_process *pp);
 
 /* Tick-accounting and rotation hooks. */
 void pmu_event_account_in(pmu_event_t *pe, uint64_t now);

@@ -872,8 +872,14 @@ pmc_remove_owner(struct pmc_owner *po)
 	LIST_REMOVE(po, po_next);
 
 	/* release groups before any remaining standalone PMCs */
-	while ((pg = LIST_FIRST(&po->po_groups)) != NULL)
+	while ((pg = LIST_FIRST(&po->po_groups)) != NULL) {
+		if (pg->pg_releasing) {
+			(void)sx_sleep(&pg->pg_releasing, &pmc_sx, 0,
+			    "pmugrp", 1);
+			continue;
+		}
 		pmc_release_pmu_group(pg);
+	}
 
 	/* release all remaining owned PMC descriptors */
 	LIST_FOREACH_SAFE(pm, &po->po_pmcs, pm_next, tmp) {
@@ -1701,6 +1707,8 @@ done:
 static void
 pmc_process_exec(struct thread *td, struct pmckern_procexec *pk)
 {
+	pmu_event_t *pe;
+	pmu_group_t *pg;
 	struct pmc *pm;
 	struct pmc_owner *po;
 	struct pmc_process *pp;
@@ -1769,6 +1777,19 @@ pmc_process_exec(struct thread *td, struct pmckern_procexec *pk)
 			    pk->pm_baseaddr, pk->pm_dynaddr, fullpath);
 		}
 	}
+	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
+		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+			pm = pe->pe_pmc;
+			if (!PMC_ROW_IS_UNASSIGNED(pm))
+				continue;
+			po = pm->pm_owner;
+			if (po->po_sscount == 0 &&
+			    (po->po_flags & PMC_PO_OWNS_LOGFILE) != 0)
+				pmclog_process_procexec(po, pm->pm_handle,
+				    p->p_pid, pk->pm_baseaddr, pk->pm_dynaddr,
+				    fullpath);
+		}
+	}
 
 	if (freepath != NULL)
 		free(freepath, M_TEMP);
@@ -1776,22 +1797,36 @@ pmc_process_exec(struct thread *td, struct pmckern_procexec *pk)
 	PMCDBG4(PRC,EXC,1, "exec proc=%p (%d, %s) cred-changed=%d",
 	    p, p->p_pid, p->p_comm, pk->pm_credentialschanged);
 
-	if (pk->pm_credentialschanged == 0) /* no change */
+	if (pk->pm_credentialschanged == 0) { /* no change */
+		pmu_pp_kick_after_exec(pp);
 		return;
+	}
 
 	/*
 	 * If the newly exec()'ed process has a different credential
 	 * than before, allow it to be the target of a PMC only if
 	 * the PMC's owner has sufficient privilege.
 	 */
-	for (ri = 0; ri < md->pmd_npmc; ri++) {
-		if ((pm = pp->pp_pmcs[ri].pp_pmc) != NULL) {
-			if (pmc_can_attach(pm, td->td_proc)) {
-				pmc_detach_one_process(td->td_proc, pm,
-				    PMC_FLAG_NONE);
-			}
+	for (;;) {
+		LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
+			if (pg->pg_releasing)
+				continue;
+			if (!pmc_can_attach(pg->pg_leader->pe_pmc,
+			    td->td_proc))
+				break;
 		}
+		if (pg == NULL)
+			break;
+		pmu_group_detach_target(pg, pp);
 	}
+	for (ri = 0; ri < md->pmd_npmc; ri++) {
+		pm = pp->pp_pmcs[ri].pp_pmc;
+		if (pm == NULL || pmu_event_from_pmc(pm) != NULL)
+			continue;
+		if (!pmc_can_attach(pm, td->td_proc))
+			pmc_detach_one_process(td->td_proc, pm, PMC_FLAG_NONE);
+	}
+	pmu_pp_kick_after_exec(pp);
 
 	KASSERT(pp->pp_refcnt >= 0 && pp->pp_refcnt <= md->pmd_npmc,
 	    ("[pmc,%d] Illegal ref count %u on pp %p", __LINE__,
@@ -1803,8 +1838,12 @@ pmc_process_exec(struct thread *td, struct pmckern_procexec *pk)
 	 * up space.
 	 */
 	if (pp->pp_refcnt == 0 && LIST_EMPTY(&pp->pp_pmu_groups)) {
-		pmc_remove_process_descriptor(pp);
+		if (!pp->pp_pmu_unhashed)
+			pmc_remove_process_descriptor(pp);
 		pmc_destroy_process_descriptor(pp);
+		PROC_LOCK(p);
+		p->p_flag &= ~P_HWPMC;
+		PROC_UNLOCK(p);
 	}
 }
 
