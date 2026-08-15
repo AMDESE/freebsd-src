@@ -151,13 +151,11 @@ void hwpmc_unmark_row_standalone(int ri);
 
 /*
  * Program / unprogram one system-wide PMC row's hardware on its bound
- * CPU.  Both helpers do the pmc_select_cpu() bind dance internally and
- * use pm->pm_gv.pm_savedvalue as the cumulative running total: start_row
- * preloads the HW counter with the saved total before enabling it, and
- * stop_row reads the HW counter back into the saved total before
- * disabling it.  This keeps counts continuous across multiplex windows
- * without going through the per-process csw machinery (system PMCs are
- * never context switched).
+ * CPU.  Both helpers do the pmc_select_cpu() bind dance internally.
+ * start_row zeroes the hardware window and stop_row folds that window
+ * into the 64-bit pm_gv.pm_savedvalue software total.  This keeps counts
+ * continuous across multiplex windows without narrowing the cumulative
+ * value to the hardware width.
  */
 void hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm);
 void hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm);

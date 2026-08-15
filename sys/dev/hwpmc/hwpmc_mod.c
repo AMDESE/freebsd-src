@@ -3654,9 +3654,8 @@ hwpmc_unmark_row_standalone(int ri)
  * Program and start one system-wide PMC's hardware on its bound CPU.
  * Used by the PMU grouping layer's per-CPU multiplex rotation (see
  * hwpmc_pmu.c).  pm->pm_gv.pm_savedvalue carries the cumulative count
- * across rotation windows: it is preloaded into the HW counter here so
- * that a subsequent read returns the running total, and read back out in
- * hwpmc_pmu_sys_stop_row() when the group is evicted.
+ * across rotation windows.  Each window starts from zero and its delta is
+ * folded into that software total by hwpmc_pmu_sys_stop_row().
  */
 void
 hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
@@ -3673,7 +3672,7 @@ hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
 	pmc_save_cpu_binding(&pb);
 	pmc_select_cpu(cpu);
 	critical_enter();
-	(void)pcd->pcd_write_pmc(cpu, adjri, pm, pm->pm_gv.pm_savedvalue);
+	(void)pcd->pcd_write_pmc(cpu, adjri, pm, 0);
 	pm->pm_pcpu_state[cpu].pps_cpustate = 1;
 	(void)pcd->pcd_start_pmc(cpu, adjri, pm);
 	pmu_group_sys_row_started(pm);
@@ -3704,9 +3703,12 @@ hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm)
 	critical_enter();
 	pm->pm_pcpu_state[cpu].pps_cpustate = 0;
 	(void)pcd->pcd_stop_pmc(cpu, adjri, pm);
-	v = pm->pm_gv.pm_savedvalue;
-	if (pcd->pcd_read_pmc(cpu, adjri, pm, &v) == 0)
-		pm->pm_gv.pm_savedvalue = v;
+	v = 0;
+	if (pcd->pcd_read_pmc(cpu, adjri, pm, &v) == 0) {
+		mtx_pool_lock_spin(pmc_mtxpool, pm);
+		pm->pm_gv.pm_savedvalue += v;
+		mtx_pool_unlock_spin(pmc_mtxpool, pm);
+	}
 	pmu_group_sys_row_stopped(pm);
 	critical_exit();
 	pmc_restore_cpu_binding(&pb);
@@ -4741,10 +4743,9 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 		 * right now (ri == 255), so the pcd_read path below would
 		 * dereference row 255 and panic.  pm_gv.pm_savedvalue is the
 		 * cumulative count maintained by hwpmc_pmu_sys_stop_row()
-		 * across rotation windows; return it directly.  A sibling
-		 * that is currently scheduled in has its running total
-		 * preloaded into the HW counter, so the normal read below
-		 * returns the right value with no special-casing.
+		 * across rotation windows; return it directly.  A resident
+		 * sibling counts the current window from zero; the group read
+		 * helper adds that live value to the saved software total.
 		 */
 		if (pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL &&
 		    PMC_ROW_IS_UNASSIGNED(pm)) {

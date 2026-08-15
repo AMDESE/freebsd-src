@@ -870,13 +870,24 @@ pmu_group_csw_out(struct thread *td, int cpu)
 }
 
 int
-pmu_group_read_value(struct pmc *pm, pmc_value_t *value __unused)
+pmu_group_read_value(struct pmc *pm, pmc_value_t *value)
 {
 	pmu_event_t *pe;
+	pmu_group_t *pg;
 
+	if (value == NULL)
+		return (EINVAL);
 	pe = pmu_event_from_pmc(pm);
 	if (pe == NULL || pe->pe_group == NULL)
 		return (ENOENT);
+	pg = pe->pe_group;
+
+	mtx_pool_lock_spin(pmc_mtxpool, pm);
+	if (PMC_ROW_IS_UNASSIGNED(pm))
+		*value = pm->pm_gv.pm_savedvalue;
+	else if (pg->pg_system)
+		*value += pm->pm_gv.pm_savedvalue;
+	mtx_pool_unlock_spin(pmc_mtxpool, pm);
 	return (0);
 }
 
