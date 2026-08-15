@@ -934,10 +934,11 @@ pmu_group_on_stop(struct pmc *pm)
 	pmu_group_t *pg;
 	struct pmc_process *pp;
 
-	sx_assert(&pmc_sx, SX_XLOCKED);
 	pe = pmu_event_from_pmc(pm);
 	if (pe == NULL || pe->pe_group == NULL)
 		return;
+	/* PMCSTOP downgrades pmc_sx for ungrouped PMCs; assert after the gate. */
+	sx_assert(&pmc_sx, SX_XLOCKED);
 	pg = pe->pe_group;
 	pp = pg->pg_pp;
 	if (pp != NULL)
