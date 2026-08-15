@@ -5117,12 +5117,6 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 			if ((prw->pm_flags & PMC_F_NEWVALUE) != 0)
 				pm->pm_gv.pm_savedvalue = prw->pm_value;
 			mtx_pool_unlock_spin(pmc_mtxpool, pm);
-			if ((prw->pm_flags & PMC_F_OLDVALUE) != 0 &&
-			    pmu_group_from_pmc(pm) != NULL) {
-				error = pmu_group_read_value(pm, valp);
-				if (error != 0)
-					return (error);
-			}
 			return (0);
 		}
 
@@ -5153,8 +5147,8 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 		 * dereference row 255 and panic.  pm_gv.pm_savedvalue is the
 		 * cumulative count maintained by hwpmc_pmu_sys_stop_row()
 		 * across rotation windows; return it directly.  A resident
-		 * sibling counts the current window from zero; the group read
-		 * helper adds that live value to the saved software total.
+		 * sibling counts the current window from zero; the read below
+		 * adds the unflushed window delta to that software total.
 		 */
 		if (pmu_group_from_pmc(pm) != NULL &&
 		    PMC_ROW_IS_UNASSIGNED(pm)) {
@@ -5182,8 +5176,15 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 		critical_enter();
 
 		/* Save old value. */
-		if ((prw->pm_flags & PMC_F_OLDVALUE) != 0)
+		if ((prw->pm_flags & PMC_F_OLDVALUE) != 0) {
 			error = (*pcd->pcd_read_pmc)(cpu, adjri, pm, valp);
+			if (error == 0 && pmu_group_from_pmc(pm) != NULL) {
+				mtx_pool_lock_spin(pmc_mtxpool, pm);
+				*valp = pm->pm_gv.pm_savedvalue + pmc_delta(pcd,
+				    *valp, PMC_PCPU_SAVED(cpu, ri));
+				mtx_pool_unlock_spin(pmc_mtxpool, pm);
+			}
+		}
 
 		/* Write out new value. */
 		if (error == 0 && (prw->pm_flags & PMC_F_NEWVALUE) != 0)
@@ -5195,10 +5196,6 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 		if (error != 0)
 			return (error);
 	}
-
-	if (error == 0 && (prw->pm_flags & PMC_F_OLDVALUE) != 0 &&
-	    pmu_group_from_pmc(pm) != NULL)
-		error = pmu_group_read_value(pm, valp);
 
 #ifdef HWPMC_DEBUG
 	if ((prw->pm_flags & PMC_F_NEWVALUE) != 0)

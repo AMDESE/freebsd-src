@@ -221,7 +221,6 @@ void pmu_group_csw_in_complete(struct thread *td, int cpu);
 bool pmu_group_csw_can_start(struct pmc *pm, struct thread *td, int cpu);
 void pmu_group_csw_out(struct thread *td, int cpu);
 void pmu_group_csw_out_complete(struct thread *td, int cpu);
-int pmu_group_read_value(struct pmc *pm, pmc_value_t *value);
 
 /*
  * System-wide (PMC_MODE_SC) group lifecycle.  The process-mode hooks
