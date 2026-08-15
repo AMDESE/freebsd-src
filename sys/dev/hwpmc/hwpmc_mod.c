@@ -82,8 +82,6 @@
 CTASSERT(sizeof(struct pmc_group_member) == 16);
 CTASSERT(sizeof(struct pmc_op_pmcgroupread) == 48);
 
-int (*hwpmc_pmu_attach_p)(struct proc *p, struct pmc *pm);
-
 #define PMC_EPOCH_ENTER()						\
     struct epoch_tracker pmc_et;					\
     epoch_enter_preempt(global_epoch_preempt, &pmc_et)
@@ -993,15 +991,6 @@ pmc_link_target_process(struct pmc *pm, struct pmc_process *pp)
 #endif
 }
 
-/*
- * Removes the association between a target process and a PMC.
- */
-void
-pmc_unlink_target_process_pmu(struct pmc *pm, struct pmc_process *pp)
-{
-	pmc_unlink_target_process(pm, pp);
-}
-
 void
 hwpmc_pmu_sx_xlock(void)
 {
@@ -1040,32 +1029,6 @@ hwpmc_pmu_sx_sleep(void *chan, int timo, const char *wmesg)
 {
 
 	return (sx_sleep(chan, &pmc_sx, 0, wmesg, timo));
-}
-
-pmc_value_t
-hwpmc_pmc_read_delta(int cpu, int ri, struct pmc *pm)
-{
-	struct pmc_classdep *pcd;
-	pmc_value_t newvalue, tmp;
-	int adjri;
-
-	pcd = pmc_ri_to_classdep(md, ri, &adjri);
-	(void)pcd->pcd_read_pmc(cpu, adjri, pm, &newvalue);
-	tmp = newvalue - PMC_PCPU_SAVED(cpu, ri);
-	return (tmp);
-}
-
-void
-hwpmc_pmu_accumulate_remove(int cpu, int ri, struct pmc *pm,
-    struct pmc_process *pp)
-{
-	pmc_value_t val;
-
-	val = hwpmc_pmc_read_delta(cpu, ri, pm);
-	mtx_pool_lock_spin(pmc_mtxpool, pm);
-	pm->pm_gv.pm_savedvalue += val;
-	pp->pp_pmcs[ri].pp_pmcval += val;
-	mtx_pool_unlock_spin(pmc_mtxpool, pm);
 }
 
 static void
@@ -3491,12 +3454,6 @@ pmc_find_process_descriptor_pmu(struct proc *p, uint32_t mode)
 	return (pmc_find_process_descriptor(p, mode));
 }
 
-struct pmc_owner *
-pmc_find_owner_descriptor_pmu(struct proc *p)
-{
-	return (pmc_find_owner_descriptor(p));
-}
-
 static struct pmc_process *
 pmc_find_process_descriptor(struct proc *p, uint32_t mode)
 {
@@ -4083,12 +4040,6 @@ void
 hwpmc_unmark_row_thread(int ri)
 {
 	PMC_UNMARK_ROW_THREAD(ri);
-}
-
-void
-hwpmc_mark_row_free(int ri)
-{
-	PMC_MARK_ROW_FREE(ri);
 }
 
 void
@@ -7588,7 +7539,6 @@ pmc_initialize(void)
 	pmc_intr = md->pmd_intr;
 	wmb();
 	pmc_hook = pmc_hook_handler;
-	hwpmc_pmu_attach_p = pmc_attach_process;
 
 	if (error == 0) {
 		printf(PMC_MODULE_NAME ":");

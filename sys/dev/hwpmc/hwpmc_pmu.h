@@ -52,7 +52,6 @@ enum pmu_event_state {
  * for this class on this CPU"), not a raw MSR/RDPMC number.
  */
 #define	PMC_SC_F_FIXED		0x0001	/* must use pc_fixed_row */
-#define	PMC_SC_F_EXCLUSIVE	0x0002	/* needs the whole PMU exclusively */
 #define	PMC_SC_F_SHARED		0x0004	/* tolerates sharing siblings */
 
 struct pmc_sched_constraint {
@@ -119,7 +118,6 @@ struct pmu_group {
 	struct pmc_process		*pg_pp;	/* TARGET pp we hung off
 						 * pp_pmu_groups; cleared on
 						 * release. */
-	uint32_t			pg_used_rows_mask;
 	/* Virtual enabled/running are thread-ticks; wall fields stay wall-ticks. */
 	uint64_t			pg_time_enabled_ticks;
 	uint64_t			pg_time_running_ticks;
@@ -160,7 +158,6 @@ bool hwpmc_can_allocate_row(int ri, enum pmc_mode mode);
 bool hwpmc_can_allocate_rowindex(struct proc *p, unsigned int ri, int cpu);
 void hwpmc_mark_row_thread(int ri);
 void hwpmc_unmark_row_thread(int ri);
-void hwpmc_mark_row_free(int ri);
 void hwpmc_mark_row_standalone(int ri);
 void hwpmc_unmark_row_standalone(int ri);
 
@@ -222,8 +219,6 @@ u_int pmu_group_prepare_release(pmu_group_t *pg, struct pmc **members,
 void pmu_group_release(pmu_group_t *pg);
 void pmu_group_accounting_initialize(void);
 void pmu_group_accounting_finalize(void);
-void pmu_group_time_snapshot(pmu_group_t *pg,
-    struct pmu_group_time_snapshot *snapshot);
 void pmu_group_time_snapshot_locked(pmu_group_t *pg,
     struct pmu_group_time_snapshot *snapshot, uint64_t now);
 void pmu_event_destroy(pmu_event_t *pe);
@@ -269,28 +264,18 @@ void pmu_pp_release_all(struct pmc_process *pp);
 void pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp);
 void pmu_pp_kick_after_exec(struct pmc_process *pp);
 
-/* Tick-accounting and rotation hooks. */
-void pmu_event_account_in(pmu_event_t *pe, uint64_t now);
-void pmu_event_account_out(pmu_event_t *pe, uint64_t now);
-void pmu_rotate_groups(int cpu);
-
 /*
- * Hooks exported into hwpmc_mod.c so the PMU layer can find/unlink a
+ * Hook exported into hwpmc_mod.c so the PMU layer can find a
  * pmc_process descriptor without reaching into mod.c internals.
  */
 struct pmc_process *pmc_find_process_descriptor_pmu(struct proc *p,
     uint32_t mode);
-struct pmc_owner *pmc_find_owner_descriptor_pmu(struct proc *p);
-void pmc_unlink_target_process_pmu(struct pmc *pm, struct pmc_process *pp);
 
 void hwpmc_pmu_sx_xlock(void);
 void hwpmc_pmu_sx_xunlock(void);
 int hwpmc_pmu_sx_sleep(void *chan, int timo, const char *wmesg);
 void hwpmc_pmu_sx_assert_xlocked(void);
 void hwpmc_pmu_force_context_switch(void);
-pmc_value_t hwpmc_pmc_read_delta(int cpu, int ri, struct pmc *pm);
-void hwpmc_pmu_accumulate_remove(int cpu, int ri, struct pmc *pm,
-    struct pmc_process *pp);
 
 /*
  * Rotation helpers (hwpmc_mod.c).  These manipulate pp_pmcs[ri]
@@ -306,9 +291,6 @@ void hwpmc_pmu_accumulate_remove(int cpu, int ri, struct pmc *pm,
 void pmc_rotation_drain(struct pmc *pm);
 void pmc_rotation_detach(struct pmc *pm, struct pmc_process *pp);
 void pmc_rotation_attach(struct pmc *pm, struct pmc_process *pp);
-
-/* Set by hwpmc_mod.c at pmc_initialize() time. */
-extern int (*hwpmc_pmu_attach_p)(struct proc *p, struct pmc *pm);
 
 #endif /* _KERNEL */
 

@@ -257,7 +257,6 @@ pmu_unassign_group(pmu_group_t *pg, int cpu)
 		pe->pe_state = PMU_EVENT_STATE_INACTIVE;
 		pe->pe_assigned_row = -1;
 	}
-	pg->pg_used_rows_mask = 0;
 	pg->pg_assigned = false;
 }
 
@@ -393,7 +392,6 @@ pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu)
 		return (error);
 	}
 
-	pg->pg_used_rows_mask = used_mask;
 	pg->pg_assigned = true;
 	return (0);
 }
