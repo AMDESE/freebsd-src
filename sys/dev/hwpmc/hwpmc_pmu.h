@@ -191,6 +191,7 @@ void pmu_event_destroy(pmu_event_t *pe);
 pmu_event_t *pmu_event_from_pmc(struct pmc *pm);
 
 int pmu_group_on_allocate(struct pmc *pm, const struct pmc_op_pmcallocate *pa);
+int pmu_group_on_attach(struct pmc *pm, struct proc *p);
 int pmu_group_on_start(struct pmc *pm);
 void pmu_group_on_stop(struct pmc *pm);
 void pmu_group_on_release(struct pmc *pm);

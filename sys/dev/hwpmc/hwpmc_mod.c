@@ -1320,36 +1320,22 @@ pmc_attach_one_process(struct proc *p, struct pmc *pm)
 	 * path is wrong: the per-proc rows are already occupied by the
 	 * previously-committed groups, so the placement would always
 	 * fail with EBUSY/ENOSPC and abort pmc_attach.  Instead we
-	 * silently mark the deferred sibling attached; pmu_group_on_start
-	 * will register the whole group on pp->pp_pmu_groups and either
-	 * pmu_pp_schedule_in (if rows are free now) or the per-pp
-	 * rotation kthread (later) atomically binds every sibling at
+	 * mark the deferred sibling attached and register the whole group
+	 * on pp->pp_pmu_groups; pmu_group_on_start either schedules it in
+	 * (if rows are free now) or the per-pp rotation kthread later
+	 * atomically binds every sibling at
 	 * once.  Walking pp_pmcs[ri] here would also be unsafe because
 	 * pp_pmcs[] is a flexible array sized to md->pmd_npmc, so
 	 * indexing it at PMC_ROW_UNASSIGNED (255) is an OOB read+write.
 	 */
 	if (PMC_ROW_IS_UNASSIGNED(pm)) {
+		error = pmu_group_on_attach(pm, p);
+		if (error != 0)
+			return (error);
 		pm->pm_flags |= PMC_F_ATTACH_DONE;
-		/*
-		 * Even though we cannot bind a row right now, we MUST
-		 * make the target proc visible to hwpmc and remember
-		 * the target on the group: pmu_group_on_start /
-		 * pmu_pp_schedule_in / the rotation kthread all need
-		 * the TARGET's pmc_process (not the owner's) so that
-		 * pp_pmu_groups, pp_pmcs[] and the eventual
-		 * pmc_rotation_attach all live on the same pp the
-		 * scheduler will hit at csw_in/out time.
-		 */
 		PROC_LOCK(p);
 		p->p_flag |= P_HWPMC;
 		PROC_UNLOCK(p);
-		(void)pmc_find_process_descriptor(p, PMC_FLAG_ALLOCATE);
-		if (pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL) {
-			pmu_group_t *pg = pm->pm_pmu->pe_group;
-
-			if (pg->pg_attach_proc == NULL)
-				pg->pg_attach_proc = p;
-		}
 		PMCDBG3(PRC, ATT, 2,
 		    "attach-deferred pm=%p proc=%p (%d)", pm, p, p->p_pid);
 		return (0);
@@ -1357,18 +1343,6 @@ pmc_attach_one_process(struct proc *p, struct pmc *pm)
 
 	PMCDBG5(PRC,ATT,2, "attach-one pm=%p ri=%d proc=%p (%d, %s)", pm,
 	    PMC_TO_ROWINDEX(pm), p, p->p_pid, p->p_comm);
-
-	/*
-	 * Same as above for the regular (committed-bound) path: stash
-	 * the target proc on the group so the PMU layer never has to
-	 * fall back to the owner.
-	 */
-	if (pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL) {
-		pmu_group_t *pg = pm->pm_pmu->pe_group;
-
-		if (pg->pg_attach_proc == NULL)
-			pg->pg_attach_proc = p;
-	}
 
 	/*
 	 * Locate the process descriptor corresponding to process 'p',
@@ -1402,6 +1376,9 @@ pmc_attach_one_process(struct proc *p, struct pmc *pm)
 		goto fail;
 	}
 
+	error = pmu_group_on_attach(pm, p);
+	if (error != 0)
+		goto fail;
 	pmc_link_target_process(pm, pp);
 
 	if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)) &&
@@ -1556,7 +1533,7 @@ pmc_detach_one_process(struct proc *p, struct pmc *pm, int flags)
 	    ("[pmc,%d] Illegal refcnt %d for process struct %p",
 		__LINE__, pp->pp_refcnt, pp));
 
-	if (pp->pp_refcnt != 0)	/* still a target of some PMC */
+	if (pp->pp_refcnt != 0 || !LIST_EMPTY(&pp->pp_pmu_groups))
 		return (0);
 
 	/*
@@ -1746,7 +1723,7 @@ pmc_process_exec(struct thread *td, struct pmckern_procexec *pk)
 	 * PMCs, we can remove the process entry and free
 	 * up space.
 	 */
-	if (pp->pp_refcnt == 0) {
+	if (pp->pp_refcnt == 0 && LIST_EMPTY(&pp->pp_pmu_groups)) {
 		pmc_remove_process_descriptor(pp);
 		pmc_destroy_process_descriptor(pp);
 	}
@@ -3380,7 +3357,8 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 			 * If the target process record shows that no PMCs are
 			 * attached to it, reclaim its space.
 			 */
-			if (pp->pp_refcnt == 0) {
+			if (pp->pp_refcnt == 0 &&
+			    LIST_EMPTY(&pp->pp_pmu_groups)) {
 				pmc_remove_process_descriptor(pp);
 				pmc_destroy_process_descriptor(pp);
 			}
@@ -4132,6 +4110,13 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 		return (EXTERROR(EINVAL, "Invalid PMC flags %#jx",
 		    (uintmax_t)flags));
 
+	if ((flags & PMC_F_GROUP_DEFER) != 0) {
+		if ((flags & PMC_F_DESCENDANTS) != 0)
+			return (EOPNOTSUPP);
+		if (!PMC_IS_SAMPLING_MODE(mode) && pa->pm_count != 0)
+			return (EINVAL);
+	}
+
 	/* PMC_F_USERCALLCHAIN is only valid with PMC_F_CALLCHAIN. */
 	if ((flags & (PMC_F_CALLCHAIN | PMC_F_USERCALLCHAIN)) ==
 	    PMC_F_USERCALLCHAIN)
@@ -4421,6 +4406,8 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 static int
 pmc_do_op_pmcattach(struct thread *td, struct pmc_op_pmcattach a)
 {
+	pmu_event_t *pe;
+	pmu_group_t *pg;
 	struct pmc *pm;
 	struct proc *p;
 	int error;
@@ -4438,9 +4425,21 @@ pmc_do_op_pmcattach(struct thread *td, struct pmc_op_pmcattach a)
 	if (error != 0)
 		return (error);
 
+	pe = pmu_event_from_pmc(pm);
+	pg = pe != NULL ? pe->pe_group : NULL;
+	if (pg != NULL && pg->pg_committed && pg->pg_leader != pe)
+		return (ENOTTY);
+
 	if (PMC_IS_SYSTEM_MODE(PMC_TO_MODE(pm)))
 		return (EXTERROR(EINVAL,
 		    "Cannot attach a system-mode PMC to a process"));
+
+	if (pe != NULL) {
+		if (pg == NULL || !pg->pg_committed)
+			return (EINVAL);
+		if (pg->pg_attach_proc != NULL)
+			return (EBUSY);
+	}
 
 	/* PMCs may be (re)attached only when allocated or stopped */
 	if (pm->pm_state == PMC_STATE_RUNNING) {
@@ -5349,16 +5348,24 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 
 	case PMC_OP_PMCSETCOUNT:
 	{
+		pmu_event_t *pe;
 		struct pmc *pm;
 		struct pmc_op_pmcsetcount sc;
-
-		PMC_DOWNGRADE_SX();
 
 		if ((error = copyin(arg, &sc, sizeof(sc))) != 0)
 			break;
 
 		if ((error = pmc_find_pmc(sc.pm_pmcid, &pm)) != 0)
 			break;
+
+		pe = pmu_event_from_pmc(pm);
+		if (pe != NULL && pe->pe_group != NULL &&
+		    pe->pe_group->pg_committed) {
+			error = EBUSY;
+			break;
+		}
+
+		PMC_DOWNGRADE_SX();
 
 		if (pm->pm_state == PMC_STATE_RUNNING) {
 			error = EBUSY;
@@ -5389,6 +5396,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 
 	case PMC_OP_PMCSTART:
 	{
+		pmu_event_t *pe;
 		pmc_id_t pmcid;
 		struct pmc *pm;
 		struct pmc_op_simple sp;
@@ -5413,6 +5421,14 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		    ("[pmc,%d] pmcid %x != handle %x", __LINE__,
 			pm->pm_handle, pmcid));
 
+		pe = pmu_event_from_pmc(pm);
+		if (pe != NULL && pe->pe_group != NULL &&
+		    pe->pe_group->pg_committed &&
+		    pe->pe_group->pg_leader != pe) {
+			error = ENOTTY;
+			break;
+		}
+
 		if (pm->pm_state == PMC_STATE_RUNNING) /* already running */
 			break;
 		else if (pm->pm_state != PMC_STATE_STOPPED &&
@@ -5432,11 +5448,10 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 
 	case PMC_OP_PMCSTOP:
 	{
+		pmu_event_t *pe;
 		pmc_id_t pmcid;
 		struct pmc *pm;
 		struct pmc_op_simple sp;
-
-		PMC_DOWNGRADE_SX();
 
 		if ((error = copyin(arg, &sp, sizeof(sp))) != 0)
 			break;
@@ -5455,6 +5470,16 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		KASSERT(pmcid == pm->pm_handle,
 		    ("[pmc,%d] pmcid %x != handle %x", __LINE__,
 			pm->pm_handle, pmcid));
+
+		pe = pmu_event_from_pmc(pm);
+		if (pe != NULL && pe->pe_group != NULL &&
+		    pe->pe_group->pg_committed &&
+		    pe->pe_group->pg_leader != pe) {
+			error = ENOTTY;
+			break;
+		}
+
+		PMC_DOWNGRADE_SX();
 
 		if (pm->pm_state == PMC_STATE_STOPPED) /* already stopped */
 			break;

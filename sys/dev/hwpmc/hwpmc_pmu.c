@@ -360,6 +360,33 @@ pmu_group_on_allocate(struct pmc *pm, const struct pmc_op_pmcallocate *pa)
 	return (0);
 }
 
+int
+pmu_group_on_attach(struct pmc *pm, struct proc *p)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	struct pmc_process *pp;
+
+	hwpmc_pmu_sx_assert_xlocked();
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || pe->pe_group == NULL)
+		return (0);
+	pg = pe->pe_group;
+	if (pg->pg_attach_proc != NULL && pg->pg_attach_proc != p)
+		return (EBUSY);
+	pp = pmc_find_process_descriptor_pmu(p, PMC_FLAG_ALLOCATE);
+	if (pp == NULL)
+		return (ENOMEM);
+	if (pg->pg_pp != NULL && pg->pg_pp != pp)
+		return (EBUSY);
+	pg->pg_attach_proc = p;
+	if (pg->pg_pp == NULL) {
+		LIST_INSERT_HEAD(&pp->pp_pmu_groups, pg, pg_proc_next);
+		pg->pg_pp = pp;
+	}
+	return (0);
+}
+
 /*
  * Resolve the TARGET proc the group is being scheduled against.  All
  * pp_pmu_groups bookkeeping, pp_pmcs[] writes and rotation must hang
