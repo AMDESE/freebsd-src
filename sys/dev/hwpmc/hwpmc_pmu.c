@@ -1536,86 +1536,94 @@ pmu_pp_kick_after_exec(struct pmc_process *pp)
 }
 
 /*
- * Run one rotation window for pp.
+ * Rows currently held by pp's placed running MUX groups -- everything
+ * rotation could evict -- as the global-ri mask the satisfiability
+ * probe consumes.
+ */
+static uint64_t
+pmu_pp_evictable_rows(struct pmc_process *pp)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	uint64_t evictable;
+
+	evictable = 0;
+	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
+		if (!pg->pg_running || !pg->pg_assigned || !pg->pg_defer_ok)
+			continue;
+		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+			if (pe->pe_assigned_row >= 0 &&
+			    pe->pe_assigned_row < 64)
+				evictable |= 1ULL << pe->pe_assigned_row;
+		}
+	}
+	return (evictable);
+}
+
+/*
+ * Next placed running MUX group at or after *vpg, wrapping over
+ * pp_pmu_groups until *vseen reaches ngroups.  Pinned (non-MUX),
+ * unplaced and stopped groups are passed over without being counted
+ * as victims.  Advances the scan state so successive calls continue
+ * the same wrap (the escalation path below relies on this).
+ */
+static pmu_group_t *
+pmu_pp_next_victim(struct pmc_process *pp, pmu_group_t **vpg, u_int *vseen,
+    u_int ngroups)
+{
+	pmu_group_t *pg;
+
+	while (*vseen < ngroups) {
+		pg = *vpg;
+		if (pg == NULL)
+			pg = LIST_FIRST(&pp->pp_pmu_groups);
+		(*vseen)++;
+		*vpg = LIST_NEXT(pg, pg_proc_next);
+		if (pg->pg_assigned && pg->pg_running && pg->pg_defer_ok)
+			return (pg);
+	}
+	return (NULL);
+}
+
+/*
+ * Run one rotation tick for pp (spec §7.2).
  *
- * Algorithm (simple, fair round-robin -- no FIFO list mutation):
+ * At most one victim is evicted per tick: the first placed MUX group
+ * at or after the cursor.  Non-MUX groups are pinned -- the cursor
+ * passes over them without evicting.  Unplaced MUX groups are then
+ * placed in cursor order until the first ENOSPC, which pins the next
+ * tick's cursor and stops the walk.
  *
- *   Phase 1: schedule out EVERY currently scheduled+running group
- *            atomically.  After this every running group is deferred
- *            and the HW counter pool is empty.
+ * Progress guarantee: one victim cannot free enough rows for a group
+ * larger than itself, so while the tick has placed nothing, an ENOSPC
+ * escalates -- further MUX victims are evicted until the blocked group
+ * fits or no placed MUX group remains.
  *
- *   Phase 2: walk pp_pmu_groups starting at pp_pmu_rot_cursor (or
- *            head if cursor is stale) and try to schedule each
- *            running group in.  As soon as one returns ENOSPC, that
- *            group becomes the cursor for the NEXT tick and we stop
- *            (don't try to fit smaller groups behind it -- that
- *            would re-introduce the starvation we are trying to
- *            avoid: a small high-rate group could slot in over and
- *            over while a larger group at the cursor never gets HW).
- *
- *            If we wrap around back to the cursor without ever
- *            hitting ENOSPC, every group fits simultaneously
- *            (oversubscription went away mid-test) and we just
- *            advance the cursor by one slot for the next tick so
- *            that future ticks rotate the starting position.
- *
- * Example: 3 running groups G1=3, G2=2, G3=3 events on a 6-counter
- * core pool.  Cursor starts at G1.
- *
- *   tick 0: cursor=G1.  Schedule G1 (3/6).  Schedule G2 (5/6).  Try
- *           G3: ENOSPC.  Next cursor=G3.  Live: {G1, G2}.
- *   tick 1: cursor=G3.  Schedule G3 (3/6).  Schedule G1 (6/6).  Try
- *           G2: ENOSPC.  Next cursor=G2.  Live: {G3, G1}.
- *   tick 2: cursor=G2.  Schedule G2 (2/6).  Schedule G3 (5/6).  Try
- *           G1: ENOSPC.  Next cursor=G1.  Live: {G2, G3}.
- *   tick 3: same as tick 0.
- *
- * Each group runs in 2 of every 3 ticks; HW utilisation is 2*total/3.
+ * A group that cannot fit even with every placed MUX peer evicted is
+ * genuinely unsatisfiable: pinned groups and ungrouped PMCs hold the
+ * rows it needs permanently.  It is skipped rather than allowed to
+ * stall the cursor and keeps accruing enabled time with running == 0,
+ * which is the correct user-visible signal.  A tick whose deferred
+ * groups are all unsatisfiable evicts nothing.
  *
  * Caller holds pmc_sx exclusive.
  */
 static void
 pmu_pp_rotate_one(struct pmc_process *pp)
 {
-	pmu_group_t *pg, *cursor;
-	u_int ngroups, seen;
+	pmu_group_t *cursor, *pg, *victim, *vpg;
+	struct proc *p;
+	uint64_t evictable;
+	u_int ngroups, seen, vseen;
 	int sin_err;
-	bool found_cursor, need_rotate;
+	bool found_cursor, placed_any, satisfiable;
 
 	if (pp == NULL || LIST_EMPTY(&pp->pp_pmu_groups))
 		return;
 
 	/*
-	 * Pre-check: if no running group is currently deferred there
-	 * is nothing to rotate.  Skip the evict-and-rebind cycle
-	 * entirely so that the kthread, once awake, costs us nothing
-	 * when oversubscription has subsided (e.g., the user stopped
-	 * one of two groups).
-	 */
-	need_rotate = false;
-	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
-		if (pg->pg_running && !pg->pg_assigned) {
-			need_rotate = true;
-			break;
-		}
-	}
-	if (!need_rotate)
-		return;
-
-	/* Phase 1: evict every currently scheduled group. */
-	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
-		if (pg->pg_assigned) {
-			PMCDBG3(PMC, OPS, 4,
-			    "rotate: pp=%p evict gid=%u nevents=%u",
-			    pp, pg->pg_id, pg->pg_nevents);
-			pmu_pp_schedule_out(pp, pg, true);
-		}
-	}
-
-	/*
-	 * Phase 2 setup: validate the cursor is still in pp_pmu_groups.
-	 * A release path could have removed the cursor group between
-	 * ticks; in that case (or first tick), reset to the head.
+	 * Validate the cursor: a release path could have removed the
+	 * cursor group between ticks; reset to the head in that case.
 	 */
 	ngroups = 0;
 	cursor = pp->pp_pmu_rot_cursor;
@@ -1629,41 +1637,78 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 		cursor = LIST_FIRST(&pp->pp_pmu_groups);
 
 	/*
-	 * Phase 2: round-robin schedule_in starting at cursor, wrap
-	 * once.  First ENOSPC pins the next tick's cursor and stops
-	 * the walk.
+	 * A tick with no deferred MUX group, or whose deferred groups
+	 * are all unsatisfiable, does nothing -- evicting a victim
+	 * would only put it straight back.
 	 */
+	evictable = pmu_pp_evictable_rows(pp);
+	satisfiable = false;
+	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
+		if (!pg->pg_running || pg->pg_assigned || !pg->pg_defer_ok)
+			continue;
+		p = pmu_group_target_proc(pg);
+		if (p != NULL && pmu_group_satisfiable(pg, p, PMC_CPU_ANY,
+		    evictable) == 0) {
+			satisfiable = true;
+			break;
+		}
+	}
+	if (!satisfiable)
+		return;
+
+	/* Evict the single victim at the cursor, advance past it. */
+	vpg = cursor;
+	vseen = 0;
+	victim = pmu_pp_next_victim(pp, &vpg, &vseen, ngroups);
+	if (victim != NULL) {
+		PMCDBG3(PMC, OPS, 4, "rotate: pp=%p evict gid=%u nevents=%u",
+		    pp, victim->pg_id, victim->pg_nevents);
+		pmu_pp_schedule_out(pp, victim, true);
+		cursor = LIST_NEXT(victim, pg_proc_next);
+		if (cursor == NULL)
+			cursor = LIST_FIRST(&pp->pp_pmu_groups);
+	}
+
+	/* Place unplaced MUX groups in cursor order until first ENOSPC. */
+	placed_any = false;
 	pg = cursor;
 	seen = 0;
 	while (seen < ngroups) {
 		if (pg == NULL)
 			pg = LIST_FIRST(&pp->pp_pmu_groups);
-
-		if (pg->pg_running && !pg->pg_assigned) {
-			sin_err = pmu_pp_schedule_in(pp, pg);
-			PMCDBG4(PMC, OPS, 4,
-			    "rotate: pp=%p schedule_in gid=%u "
-			    "nevents=%u -> %d",
-			    pp, pg->pg_id, pg->pg_nevents, sin_err);
-			if (sin_err == ENOSPC) {
-				pp->pp_pmu_rot_cursor = pg;
-				return;
-			}
-			/* sin_err == 0 (success) or hard fail; advance. */
-		}
-
 		seen++;
+		if (!pg->pg_running || pg->pg_assigned || !pg->pg_defer_ok)
+			goto next;
+		p = pmu_group_target_proc(pg);
+		if (p == NULL || pmu_group_satisfiable(pg, p, PMC_CPU_ANY,
+		    evictable) != 0)
+			goto next;
+		sin_err = pmu_pp_schedule_in(pp, pg);
+		while (sin_err == ENOSPC && !placed_any) {
+			victim = pmu_pp_next_victim(pp, &vpg, &vseen,
+			    ngroups);
+			if (victim == NULL)
+				break;
+			PMCDBG2(PMC, OPS, 4,
+			    "rotate: pp=%p escalate evict gid=%u",
+			    pp, victim->pg_id);
+			pmu_pp_schedule_out(pp, victim, true);
+			sin_err = pmu_pp_schedule_in(pp, pg);
+		}
+		PMCDBG4(PMC, OPS, 4,
+		    "rotate: pp=%p schedule_in gid=%u nevents=%u -> %d",
+		    pp, pg->pg_id, pg->pg_nevents, sin_err);
+		if (sin_err == 0) {
+			placed_any = true;
+		} else if (sin_err == ENOSPC) {
+			pp->pp_pmu_rot_cursor = pg;
+			return;
+		}
+		/* Hard failure: skip the group for this tick. */
+next:
 		pg = LIST_NEXT(pg, pg_proc_next);
 	}
-
-	/*
-	 * Everything fit.  Advance cursor by one for the next tick so
-	 * we rotate the start position even when there is no
-	 * oversubscription this window.
-	 */
-	pp->pp_pmu_rot_cursor = LIST_NEXT(cursor, pg_proc_next);
-	if (pp->pp_pmu_rot_cursor == NULL)
-		pp->pp_pmu_rot_cursor = LIST_FIRST(&pp->pp_pmu_groups);
+	pp->pp_pmu_rot_cursor = cursor;
 }
 
 /*
@@ -2022,43 +2067,68 @@ pmu_syscpu_kick_rotate(int cpu)
 	}
 }
 
+/* System-mode mirror of pmu_pp_evictable_rows(), keyed on sc_groups. */
+static uint64_t
+pmu_syscpu_evictable_rows(struct pmu_syscpu *sc)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	uint64_t evictable;
+
+	evictable = 0;
+	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
+		if (!pg->pg_running || !pg->pg_assigned || !pg->pg_defer_ok)
+			continue;
+		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+			if (pe->pe_assigned_row >= 0 &&
+			    pe->pe_assigned_row < 64)
+				evictable |= 1ULL << pe->pe_assigned_row;
+		}
+	}
+	return (evictable);
+}
+
+/* System-mode mirror of pmu_pp_next_victim(), keyed on sc_groups. */
+static pmu_group_t *
+pmu_syscpu_next_victim(struct pmu_syscpu *sc, pmu_group_t **vpg,
+    u_int *vseen, u_int ngroups)
+{
+	pmu_group_t *pg;
+
+	while (*vseen < ngroups) {
+		pg = *vpg;
+		if (pg == NULL)
+			pg = LIST_FIRST(&sc->sc_groups);
+		(*vseen)++;
+		*vpg = LIST_NEXT(pg, pg_proc_next);
+		if (pg->pg_assigned && pg->pg_running && pg->pg_defer_ok)
+			return (pg);
+	}
+	return (NULL);
+}
+
 /*
- * Run one rotation window for a CPU.  Identical fair round-robin
- * algorithm as pmu_pp_rotate_one(), keyed on the per-CPU group list:
- * evict everything, then schedule groups back in starting at the cursor
- * until one no longer fits (that group pins the next tick's cursor).
- * Caller holds pmc_sx exclusive.
+ * Run one rotation tick for a CPU.  Identical policy to
+ * pmu_pp_rotate_one() -- one victim per tick, escalation while nothing
+ * has been placed, pinned groups never evicted, unsatisfiable groups
+ * skipped -- keyed on the per-CPU group list, with the owner proc
+ * standing in for the target.  Caller holds pmc_sx exclusive.
  */
 static void
 pmu_syscpu_rotate_one(int cpu)
 {
 	struct pmu_syscpu *sc;
-	pmu_group_t *pg, *cursor;
-	bool found_cursor, need_rotate;
-	u_int ngroups, seen;
+	pmu_group_t *cursor, *pg, *victim, *vpg;
+	struct proc *owner;
+	uint64_t evictable;
+	u_int ngroups, seen, vseen;
 	int sin_err;
+	bool found_cursor, placed_any, satisfiable;
 
 	sc = &pmu_syscpu[cpu];
 	if (LIST_EMPTY(&sc->sc_groups))
 		return;
 
-	need_rotate = false;
-	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
-		if (pg->pg_running && !pg->pg_assigned) {
-			need_rotate = true;
-			break;
-		}
-	}
-	if (!need_rotate)
-		return;
-
-	/* Phase 1: evict every currently scheduled group. */
-	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
-		if (pg->pg_assigned)
-			pmu_sys_schedule_out(cpu, pg);
-	}
-
-	/* Phase 2 setup: validate the cursor is still on the list. */
 	ngroups = 0;
 	cursor = sc->sc_cursor;
 	found_cursor = false;
@@ -2070,26 +2140,71 @@ pmu_syscpu_rotate_one(int cpu)
 	if (!found_cursor)
 		cursor = LIST_FIRST(&sc->sc_groups);
 
-	/* Phase 2: round-robin schedule_in from cursor, wrap once. */
+	evictable = pmu_syscpu_evictable_rows(sc);
+	satisfiable = false;
+	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
+		if (!pg->pg_running || pg->pg_assigned || !pg->pg_defer_ok)
+			continue;
+		owner = pg->pg_owner != NULL ? pg->pg_owner->po_owner : NULL;
+		if (owner != NULL && pmu_group_satisfiable(pg, owner, cpu,
+		    evictable) == 0) {
+			satisfiable = true;
+			break;
+		}
+	}
+	if (!satisfiable)
+		return;
+
+	/* Evict the single victim at the cursor, advance past it. */
+	vpg = cursor;
+	vseen = 0;
+	victim = pmu_syscpu_next_victim(sc, &vpg, &vseen, ngroups);
+	if (victim != NULL) {
+		PMCDBG3(PMC, OPS, 4, "sysrotate: cpu=%d evict gid=%u "
+		    "nevents=%u", cpu, victim->pg_id, victim->pg_nevents);
+		pmu_sys_schedule_out(cpu, victim);
+		cursor = LIST_NEXT(victim, pg_proc_next);
+		if (cursor == NULL)
+			cursor = LIST_FIRST(&sc->sc_groups);
+	}
+
+	/* Place unplaced MUX groups in cursor order until first ENOSPC. */
+	placed_any = false;
 	pg = cursor;
 	seen = 0;
 	while (seen < ngroups) {
 		if (pg == NULL)
 			pg = LIST_FIRST(&sc->sc_groups);
-		if (pg->pg_running && !pg->pg_assigned) {
-			sin_err = pmu_sys_schedule_in(cpu, pg);
-			if (sin_err == ENOSPC) {
-				sc->sc_cursor = pg;
-				return;
-			}
-		}
 		seen++;
+		if (!pg->pg_running || pg->pg_assigned || !pg->pg_defer_ok)
+			goto next;
+		owner = pg->pg_owner != NULL ? pg->pg_owner->po_owner : NULL;
+		if (owner == NULL || pmu_group_satisfiable(pg, owner, cpu,
+		    evictable) != 0)
+			goto next;
+		sin_err = pmu_sys_schedule_in(cpu, pg);
+		while (sin_err == ENOSPC && !placed_any) {
+			victim = pmu_syscpu_next_victim(sc, &vpg, &vseen,
+			    ngroups);
+			if (victim == NULL)
+				break;
+			PMCDBG2(PMC, OPS, 4,
+			    "sysrotate: cpu=%d escalate evict gid=%u",
+			    cpu, victim->pg_id);
+			pmu_sys_schedule_out(cpu, victim);
+			sin_err = pmu_sys_schedule_in(cpu, pg);
+		}
+		if (sin_err == 0) {
+			placed_any = true;
+		} else if (sin_err == ENOSPC) {
+			sc->sc_cursor = pg;
+			return;
+		}
+		/* Hard failure: skip the group for this tick. */
+next:
 		pg = LIST_NEXT(pg, pg_proc_next);
 	}
-
-	sc->sc_cursor = LIST_NEXT(cursor, pg_proc_next);
-	if (sc->sc_cursor == NULL)
-		sc->sc_cursor = LIST_FIRST(&sc->sc_groups);
+	sc->sc_cursor = cursor;
 }
 
 /*
