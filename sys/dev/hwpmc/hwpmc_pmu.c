@@ -16,6 +16,7 @@
 #include <sys/kthread.h>
 #include <sys/malloc.h>
 #include <sys/pmc.h>
+#include <sys/pmckern.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/sx.h>
@@ -113,6 +114,24 @@ pmu_group_lookup(struct pmc_owner *po, uint32_t pg_id)
 	return (NULL);
 }
 
+static void
+pmu_group_accounting_init(pmu_group_t *pg)
+{
+	u_int cpu;
+
+	if (pg->pg_tickrate != 0)
+		return;
+	pg->pg_tickrate = cpu_tickrate();
+	KASSERT(pg->pg_tickrate != 0, ("[pmu] zero CPU tick rate"));
+	if (PMC_IS_SYSTEM_MODE(pg->pg_leader->pe_alloc.pm_mode))
+		return;
+	pg->pg_ncpu = pmc_cpu_max();
+	pg->pg_cpu_state = malloc(sizeof(*pg->pg_cpu_state) * pg->pg_ncpu,
+	    M_PMU, M_WAITOK | M_ZERO);
+	for (cpu = 0; cpu < pg->pg_ncpu; cpu++)
+		pg->pg_cpu_state[cpu].pgcs_group = pg;
+}
+
 int
 pmu_group_add(pmu_group_t *pg, struct pmc *pm, bool leader)
 {
@@ -204,6 +223,7 @@ pmu_group_commit(pmu_group_t *pg)
 	error = pmu_group_can_fit(pg);
 	if (error != 0)
 		return (error);
+	pmu_group_accounting_init(pg);
 
 	po = pg->pg_owner;
 	p = po != NULL ? po->po_owner : NULL;
@@ -317,6 +337,15 @@ pmu_group_release(pmu_group_t *pg)
 		LIST_REMOVE(pg, pg_proc_next);
 		pg->pg_pp = NULL;
 	}
+	KASSERT(pg->pg_oncpu_threads == 0 && pg->pg_running_threads == 0,
+	    ("[pmu] freeing group with active accounting"));
+	for (u_int cpu = 0; cpu < pg->pg_ncpu; cpu++) {
+		KASSERT(!pg->pg_cpu_state[cpu].pgcs_counted &&
+		    !pg->pg_cpu_state[cpu].pgcs_placed &&
+		    pg->pg_cpu_state[cpu].pgcs_td == NULL,
+		    ("[pmu] freeing group with active CPU marker"));
+	}
+	free(pg->pg_cpu_state, M_PMU);
 	free(pg, M_PMU);
 }
 
@@ -513,14 +542,7 @@ pmu_group_on_stop(struct pmc *pm)
 		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
 }
 
-/*
- * Time accounting and CSW/rotation hooks.  When a group is multiplexed the
- * read path scales the raw HW count by time_running/time_enabled; when it
- * is not multiplexed these helpers degenerate to no-ops because the active
- * flag never toggles.  pmu_rotate_groups is fired by a per-CPU callout
- * driven by kern.hwpmc.mux_period_ns and walks pg_proc_next to swap the
- * active sub-group.
- */
+/* Tick accounting and context-switch hooks. */
 void pmu_event_account_in(pmu_event_t *pe __unused,
     uint64_t now __unused) { }
 void pmu_event_account_out(pmu_event_t *pe __unused,

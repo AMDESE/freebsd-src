@@ -5603,6 +5603,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 	{
 		struct pmc_op_pmcgroupcreate gc;
 		struct pmc_owner *po;
+		pmu_group_t *pg;
 
 		sx_assert(&pmc_sx, SX_XLOCKED);
 		if ((error = copyin(arg, &gc, sizeof(gc))) != 0)
@@ -5616,8 +5617,16 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		error = pmu_group_create(po, &gc.pm_groupid);
 		PMCDBG3(PMC, ALL, 1, "groupcreate: pid=%d gid=%u err=%d",
 		    td->td_proc->p_pid, gc.pm_groupid, error);
-		if (error == 0)
+		if (error == 0) {
 			error = copyout(&gc, arg, sizeof(gc));
+			if (error != 0) {
+				pg = pmu_group_lookup(po, gc.pm_groupid);
+				KASSERT(pg != NULL,
+				    ("[pmc,%d] created group missing", __LINE__));
+				pmu_group_release(pg);
+				pmc_maybe_remove_owner(po);
+			}
+		}
 	}
 	break;
 

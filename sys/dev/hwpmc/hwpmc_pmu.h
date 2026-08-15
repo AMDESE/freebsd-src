@@ -62,12 +62,7 @@ struct pmc_sched_constraint {
 };
 typedef struct pmc_sched_constraint pmc_sched_constraint_t;
 
-/*
- * pmu_event wraps a single struct pmc with grouping/multiplex state.
- * Time fields use sbintime_t units and are only updated when the parent
- * group is multiplexing (pg_mux); for plain grouped allocations they
- * stay at zero and the read path returns the raw hardware count.
- */
+/* A pmu_event wraps one PMC with immutable allocation and placement state. */
 struct pmu_event {
 	TAILQ_ENTRY(pmu_event)		pe_sibling;
 	pmu_group_t			*pe_group;
@@ -76,10 +71,15 @@ struct pmu_event {
 	bool				pe_is_leader;
 	struct pmc_op_pmcallocate	pe_alloc;
 	pmc_sched_constraint_t		pe_cons;
-	uint64_t			pe_time_enabled;
-	uint64_t			pe_time_running;
-	uint64_t			pe_count_at_in;
 	int				pe_assigned_row;
+};
+
+struct pmu_group_cpu_state {
+	LIST_ENTRY(pmu_group_cpu_state) pgcs_next;
+	pmu_group_t			*pgcs_group;
+	struct thread			*pgcs_td;
+	bool				pgcs_counted;
+	bool				pgcs_placed;
 };
 
 /*
@@ -109,6 +109,19 @@ struct pmu_group {
 						 * pp_pmu_groups; cleared on
 						 * release. */
 	uint32_t			pg_used_rows_mask;
+	/* Virtual enabled/running are thread-ticks; wall fields stay wall-ticks. */
+	uint64_t			pg_time_enabled_ticks;
+	uint64_t			pg_time_running_ticks;
+	uint64_t			pg_enabled_wall_ticks;
+	uint64_t			pg_wall_start_ticks;
+	uint64_t			pg_wall_ticks;
+	uint64_t			pg_timestamp_ticks;
+	uint64_t			pg_tickrate;
+	u_int				pg_oncpu_threads;
+	u_int				pg_running_threads;
+	struct pmu_group_cpu_state	*pg_cpu_state;
+	u_int				pg_ncpu;
+	bool				pg_account_blocked;
 	/*
 	 * System-wide (PMC_MODE_SC) group state.  Process-mode groups
 	 * hang off a pmc_process (pg_pp) and rotate in a per-pp kthread;
@@ -225,10 +238,7 @@ void pmu_sys_group_pre_release(struct pmc *pm);
  */
 void pmu_pp_release_all(struct pmc_process *pp);
 
-/*
- * Multiplex time-accounting / rotation helpers.  Active when pg_mux is
- * set; otherwise these are no-ops on the hot path.
- */
+/* Tick-accounting and rotation hooks. */
 void pmu_event_account_in(pmu_event_t *pe, uint64_t now);
 void pmu_event_account_out(pmu_event_t *pe, uint64_t now);
 void pmu_rotate_groups(int cpu);
