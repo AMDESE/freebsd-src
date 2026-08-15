@@ -354,7 +354,8 @@ enum pmc_event {
 	__PMC_OP(GETCAPS, "Get capabilities")				\
 	__PMC_OP(PMCGROUPCREATE, "Create a PMC event group")		\
 	__PMC_OP(PMCGROUPADD, "Add PMC to a group")			\
-	__PMC_OP(PMCGROUPCOMMIT, "Commit a PMC event group")
+	__PMC_OP(PMCGROUPCOMMIT, "Commit a PMC event group")		\
+	__PMC_OP(PMCGROUPREAD, "Read a PMC event group")
 
 enum pmc_ops {
 #undef	__PMC_OP
@@ -392,7 +393,7 @@ enum pmc_ops {
 					    */
 
 #define	PMC_F_GROUP_MUX		0x00000400 /* multiplex when nevents > slots */
-#define	PMC_F_SCALED		0x00000800 /* OP RW return scaled value */
+#define	PMC_F_SCALED		0x00000800 /* obsolete; permanently reserved */
 /* internal flags */
 #define	PMC_F_ATTACHED_TO_OWNER	0x00010000 /*attached to owner*/
 #define	PMC_F_NEEDS_LOGFILE	0x00020000 /*needs log file */
@@ -462,9 +463,33 @@ struct pmc_op_pmcgroupadd {
 };
 
 #define	PMC_GROUP_F_LEADER	0x00000001
+#define	PMC_GROUP_MAX_MEMBERS	32
 
 struct pmc_op_pmcgroupcommit {
 	uint32_t	pm_groupid;
+};
+
+#define	PMC_GROUP_MEMBER_F_SAMPLES	0x00000001
+
+struct pmc_group_member {
+	pmc_id_t	pm_pmcid;
+	uint32_t	pm_mflags;
+	pmc_value_t	pm_value;
+};
+
+#define	PMC_GROUP_F_TIME_THREAD_NS	0x00000001
+#define	PMC_GROUP_F_TIME_WALL_NS	0x00000002
+
+struct pmc_op_pmcgroupread {
+	pmc_id_t	pm_leader;
+	uint32_t	pm_nmembers;
+	uint32_t	pm_gflags;
+	uint32_t	pm_pad;
+	uint64_t	pm_enabled;
+	uint64_t	pm_running;
+	uint64_t	pm_enabled_wall;
+	uint64_t	pm_wall;
+	struct pmc_group_member pm_members[];
 };
 
 struct pmc_op_pmcallocate {

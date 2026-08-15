@@ -385,15 +385,14 @@ pmu_validate_group(pmu_group_t *pg)
 	pmc_sched_constraint_t cons;
 	enum pmc_mode lmode;
 	bool sys;
+	u_int nleaders;
 	int lcpu, rc;
 
 	if (pg == NULL || pg->pg_leader == NULL)
 		return (EINVAL);
-	if (pg->pg_nevents < 2) {
-		PMCDBG2(PMC, OPS, 1, "validate: gid=%u nevents=%u < 2",
-		    pg->pg_id, pg->pg_nevents);
+	if (pg->pg_nevents == 0)
 		return (EINVAL);
-	}
+	nleaders = 0;
 
 	/*
 	 * Every sibling must share the leader's world.  A group is
@@ -422,6 +421,12 @@ pmu_validate_group(pmu_group_t *pg)
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 		enum pmc_mode m = pe->pe_alloc.pm_mode;
 
+		if (pe->pe_is_leader) {
+			nleaders++;
+			if (pg->pg_leader != pe)
+				return (EINVAL);
+		} else if ((pe->pe_alloc.pm_flags & PMC_F_GROUP_MUX) != 0)
+			return (EINVAL);
 		if (pe->pe_pmc == NULL)
 			return (EINVAL);
 		if (!PMC_ROW_IS_UNASSIGNED(pe->pe_pmc)) {
@@ -462,5 +467,7 @@ pmu_validate_group(pmu_group_t *pg)
 		if (cons.pc_allowed_rows == 0)
 			return (EOPNOTSUPP);
 	}
+	if (nleaders != 1)
+		return (EINVAL);
 	return (0);
 }

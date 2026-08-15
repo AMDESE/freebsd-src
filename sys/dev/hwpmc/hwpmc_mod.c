@@ -79,6 +79,9 @@
 #include "hwpmc_soft.h"
 #include "hwpmc_pmu.h"
 
+CTASSERT(sizeof(struct pmc_group_member) == 16);
+CTASSERT(sizeof(struct pmc_op_pmcgroupread) == 48);
+
 int (*hwpmc_pmu_attach_p)(struct proc *p, struct pmc *pm);
 
 #define PMC_EPOCH_ENTER()						\
@@ -4664,6 +4667,9 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 
 	PMCDBG2(PMC,OPS,1, "rw id=%d flags=0x%x", prw->pm_pmcid, prw->pm_flags);
 
+	if ((prw->pm_flags & ~(PMC_F_OLDVALUE | PMC_F_NEWVALUE)) != 0)
+		return (EINVAL);
+
 	/* Must have at least one flag set. */
 	if ((prw->pm_flags & (PMC_F_OLDVALUE | PMC_F_NEWVALUE)) == 0)
 		return (EXTERROR(EINVAL,
@@ -5666,6 +5672,10 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		sx_assert(&pmc_sx, SX_XLOCKED);
 		if ((error = copyin(arg, &ga, sizeof(ga))) != 0)
 			break;
+		if ((ga.pm_flags & ~PMC_GROUP_F_LEADER) != 0) {
+			error = EINVAL;
+			break;
+		}
 		po = pmc_find_owner_descriptor(td->td_proc);
 		if (po == NULL) {
 			error = EINVAL;
@@ -5679,7 +5689,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		if ((error = pmc_find_pmc(ga.pm_pmcid, &pm)) != 0)
 			break;
 		if (pm->pm_owner != po) {
-			error = EPERM;
+			error = EINVAL;
 			break;
 		}
 		error = pmu_group_add(pg, pm,
@@ -5713,6 +5723,52 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		error = pmu_group_commit(pg);
 		PMCDBG2(PMC, OPS, 1, "groupcommit: gid=%u err=%d",
 		    gcom.pm_groupid, error);
+	}
+	break;
+
+	case PMC_OP_PMCGROUPREAD:
+	{
+		struct pmc_op_pmcgroupread gr;
+		struct pmc_owner *po;
+		struct pmc *pm;
+		pmu_event_t *pe;
+		pmu_group_t *pg;
+		uint32_t capacity;
+
+		sx_assert(&pmc_sx, SX_XLOCKED);
+		if ((error = copyin(arg, &gr, sizeof(gr))) != 0)
+			break;
+		capacity = gr.pm_nmembers;
+		if (capacity > PMC_GROUP_MAX_MEMBERS) {
+			error = EINVAL;
+			break;
+		}
+		po = pmc_find_owner_descriptor(td->td_proc);
+		if (po == NULL || pmc_find_pmc(gr.pm_leader, &pm) != 0 ||
+		    pm->pm_owner != po) {
+			error = EINVAL;
+			break;
+		}
+		pe = pmu_event_from_pmc(pm);
+		if (pe == NULL || pe->pe_group == NULL ||
+		    !pe->pe_group->pg_committed || pe->pe_group->pg_leader != pe) {
+			error = ENOTTY;
+			break;
+		}
+		pg = pe->pe_group;
+		KASSERT(pg->pg_nevents <= PMC_GROUP_MAX_MEMBERS,
+		    ("[pmc,%d] group %u has %u members", __LINE__, pg->pg_id,
+		    pg->pg_nevents));
+		bzero(&gr, sizeof(gr));
+		gr.pm_leader = pm->pm_handle;
+		gr.pm_nmembers = pg->pg_nevents;
+		if (capacity == 0 || capacity < pg->pg_nevents) {
+			error = copyout(&gr, arg, sizeof(gr));
+			if (error == 0 && capacity != 0)
+				error = E2BIG;
+			break;
+		}
+		error = EOPNOTSUPP;
 	}
 	break;
 

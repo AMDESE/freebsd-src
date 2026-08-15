@@ -415,13 +415,17 @@ pmu_group_add(pmu_group_t *pg, struct pmc *pm, bool leader)
 		return (EBUSY);
 	}
 	if (pe->pe_group == pg)
-		return (0);
+		return (leader ? EINVAL : 0);
 	if (pe->pe_group != NULL) {
 		PMCDBG3(PMC, OPS, 1,
 		    "group_add: pe %p in gid=%u, requested gid=%u",
 		    pe, pe->pe_group->pg_id, pg->pg_id);
 		return (EBUSY);
 	}
+	if (pg->pg_nevents >= PMC_GROUP_MAX_MEMBERS)
+		return (E2BIG);
+	if (leader && pg->pg_leader != NULL)
+		return (EINVAL);
 
 	pe->pe_group = pg;
 	pe->pe_is_leader = leader;
@@ -429,8 +433,6 @@ pmu_group_add(pmu_group_t *pg, struct pmc *pm, bool leader)
 	pg->pg_nevents++;
 
 	if (leader)
-		pg->pg_leader = pe;
-	else if (pg->pg_leader == NULL)
 		pg->pg_leader = pe;
 
 	return (0);
@@ -440,6 +442,7 @@ int
 pmu_group_commit(pmu_group_t *pg)
 {
 	pmu_event_t *pe;
+	struct pmc_mdep *mdep;
 	struct pmc_owner *po;
 	struct proc *p;
 	int error;
@@ -447,7 +450,12 @@ pmu_group_commit(pmu_group_t *pg)
 	if (pg == NULL)
 		return (EINVAL);
 	if (pg->pg_committed)
-		return (0);
+		return (EBUSY);
+	mdep = hwpmc_get_mdep();
+	if (mdep == NULL)
+		return (EOPNOTSUPP);
+	if (pg->pg_nevents > (u_int)mdep->pmd_npmc)
+		return (ENOSPC);
 
 	error = pmu_validate_group(pg);
 	if (error != 0) {
