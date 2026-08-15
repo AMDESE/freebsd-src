@@ -20,6 +20,7 @@
 #include <sys/pcpu.h>
 #include <sys/pmc.h>
 #include <sys/pmckern.h>
+#include <sys/prng.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/sx.h>
@@ -55,7 +56,7 @@ SYSCTL_PROC(_kern_hwpmc, OID_AUTO, group_time,
 static int pmu_mux_period_ms = 50;
 SYSCTL_INT(_kern_hwpmc, OID_AUTO, mux_period_ms, CTLFLAG_RWTUN,
     &pmu_mux_period_ms, 0,
-    "PMU multiplex rotation period in milliseconds");
+    "PMU multiplex rotation period floor in milliseconds");
 
 static void pmu_pp_rotate_thread(void *arg);
 static int pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg);
@@ -1739,6 +1740,8 @@ pmu_pp_rotate_thread(void *arg)
 		period_ticks = (pmu_mux_period_ms * hz) / 1000;
 		if (period_ticks < 1)
 			period_ticks = 1;
+		/* §7.4: jitter breaks phase-lock with periodic loads. */
+		period_ticks += prng32_bounded(period_ticks / 4 + 1);
 		(void)hwpmc_pmu_sx_sleep(&pp->pp_pmu_rot_needed,
 		    period_ticks, "muxrot");
 		if (!pp->pp_pmu_rot_running)
@@ -2255,6 +2258,8 @@ pmu_syscpu_rotate_thread(void *arg)
 		period_ticks = (pmu_mux_period_ms * hz) / 1000;
 		if (period_ticks < 1)
 			period_ticks = 1;
+		/* §7.4: jitter breaks phase-lock with periodic loads. */
+		period_ticks += prng32_bounded(period_ticks / 4 + 1);
 		(void)hwpmc_pmu_sx_sleep(&sc->sc_needed, period_ticks,
 		    "muxsys");
 		if (!sc->sc_running)
