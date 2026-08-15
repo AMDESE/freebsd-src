@@ -3982,6 +3982,12 @@ hwpmc_unmark_row_standalone(int ri)
 	PMC_UNMARK_ROW_STANDALONE(ri);
 }
 
+bool
+hwpmc_row_is_unallocated(int cpu, int ri)
+{
+	return (pmc_pcpu[cpu]->pc_hwpmcs[ri]->phw_pmc == NULL);
+}
+
 /*
  * Program and start one system-wide PMC's hardware on its bound CPU.
  * Used by the PMU grouping layer's per-CPU multiplex rotation (see
@@ -4004,6 +4010,8 @@ hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
 	pmc_save_cpu_binding(&pb);
 	pmc_select_cpu(cpu);
 	critical_enter();
+	/* Publish row occupancy so other allocators skip this counter. */
+	(void)pcd->pcd_config_pmc(cpu, adjri, pm);
 	(void)pcd->pcd_write_pmc(cpu, adjri, pm, 0);
 	mtx_pool_lock_spin(pmc_mtxpool, pm);
 	PMC_PCPU_SAVED(cpu, ri) = 0;
@@ -4045,6 +4053,7 @@ hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm)
 		PMC_PCPU_SAVED(cpu, ri) = v;
 		mtx_pool_unlock_spin(pmc_mtxpool, pm);
 	}
+	(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
 	critical_exit();
 	pmc_restore_cpu_binding(&pb);
 }

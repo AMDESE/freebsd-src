@@ -147,6 +147,7 @@ void hwpmc_mark_row_thread(int ri);
 void hwpmc_unmark_row_thread(int ri);
 void hwpmc_mark_row_standalone(int ri);
 void hwpmc_unmark_row_standalone(int ri);
+bool hwpmc_row_is_unallocated(int cpu, int ri);
 
 /*
  * Program / unprogram one system-wide PMC row's hardware on its bound

@@ -170,6 +170,10 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 		    !hwpmc_can_allocate_rowindex(p, n, idcpu)) &&
 		    (n >= 64 || (evictable_rows & (1ULL << n)) == 0))
 			goto skip;
+		/* System rows publish occupancy via phw_pmc (spec §5.4). */
+		if (sys && p != NULL && !hwpmc_row_is_unallocated(cpu, n) &&
+		    (n >= 64 || (evictable_rows & (1ULL << n)) == 0))
+			goto skip;
 		if (pmu_can_assign_pmc(pcd, adjri, pm, &pe->pe_alloc) != 0)
 			goto skip;
 		if (!dry_run &&
