@@ -14,7 +14,10 @@
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/kthread.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
+#include <sys/mutex.h>
+#include <sys/pcpu.h>
 #include <sys/pmc.h>
 #include <sys/pmckern.h>
 #include <sys/proc.h>
@@ -27,6 +30,11 @@
 static MALLOC_DEFINE(M_PMU, "pmu", "hwpmc PMU grouping");
 
 static uint32_t pmu_next_group_id = 1;
+
+extern struct mtx_pool *pmc_mtxpool;
+
+LIST_HEAD(pmu_group_cpu_list, pmu_group_cpu_state);
+static struct pmu_group_cpu_list pmu_group_cpu_active[MAXCPU];
 
 SYSCTL_DECL(_kern_hwpmc);
 
@@ -70,6 +78,141 @@ static int pmu_sys_schedule_in(int cpu, pmu_group_t *pg);
 static void pmu_sys_schedule_out(int cpu, pmu_group_t *pg);
 static void pmu_syscpu_kick_rotate(int cpu);
 static void pmu_syscpu_rotate_one(int cpu);
+
+void
+pmu_group_accounting_initialize(void)
+{
+	u_int cpu;
+
+	for (cpu = 0; cpu < MAXCPU; cpu++)
+		LIST_INIT(&pmu_group_cpu_active[cpu]);
+}
+
+void
+pmu_group_accounting_finalize(void)
+{
+	u_int cpu;
+
+	for (cpu = 0; cpu < MAXCPU; cpu++)
+		KASSERT(LIST_EMPTY(&pmu_group_cpu_active[cpu]),
+		    ("[pmu] active accounting markers on CPU %u", cpu));
+}
+
+static void
+pmu_group_time_update_locked(pmu_group_t *pg, uint64_t now)
+{
+	uint64_t delta;
+
+	if (pg->pg_timestamp_ticks == 0) {
+		pg->pg_timestamp_ticks = now;
+		return;
+	}
+	if (now <= pg->pg_timestamp_ticks)
+		return;
+
+	delta = now - pg->pg_timestamp_ticks;
+	if (pg->pg_running) {
+		pg->pg_time_enabled_ticks +=
+		    (uint64_t)pg->pg_oncpu_threads * delta;
+		pg->pg_time_running_ticks +=
+		    (uint64_t)pg->pg_running_threads * delta;
+		if (pg->pg_oncpu_threads != 0)
+			pg->pg_enabled_wall_ticks += delta;
+	}
+	pg->pg_timestamp_ticks = now;
+}
+
+static void
+pmu_group_accounting_block(pmu_group_t *pg)
+{
+	uint64_t now;
+
+	now = cpu_ticks();
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_time_update_locked(pg, now);
+	pg->pg_account_blocked = true;
+	pg->pg_account_placement_admit = false;
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+}
+
+static void
+pmu_group_accounting_drain(pmu_group_t *pg, bool release)
+{
+	struct pmc_binding pb;
+	u_int cpu;
+#ifdef INVARIANTS
+	int maxloop;
+
+	maxloop = 100 * MAX(1, pg->pg_ncpu);
+#endif
+
+	hwpmc_pmu_sx_assert_xlocked();
+	KASSERT(pg->pg_account_blocked,
+	    ("[pmu] draining unblocked group %u", pg->pg_id));
+
+	if (pg->pg_ncpu != 0)
+		pmc_save_cpu_binding(&pb);
+	for (;;) {
+		mtx_pool_lock_spin(pmc_mtxpool, pg);
+		if (pg->pg_oncpu_threads == 0) {
+			mtx_pool_unlock_spin(pmc_mtxpool, pg);
+			break;
+		}
+		for (cpu = 0; cpu < pg->pg_ncpu; cpu++) {
+			if (pg->pg_cpu_state[cpu].pgcs_counted)
+				break;
+		}
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+
+		KASSERT(cpu < pg->pg_ncpu,
+		    ("[pmu] group %u has count without marker", pg->pg_id));
+		if (cpu >= pg->pg_ncpu)
+			continue;
+#ifdef INVARIANTS
+		KASSERT(maxloop-- > 0,
+		    ("[pmu] group %u accounting drain stuck", pg->pg_id));
+#endif
+		KASSERT(pmc_cpu_is_active(cpu),
+		    ("[pmu] group %u marker on inactive CPU %u", pg->pg_id,
+		    cpu));
+		if (!pmc_cpu_is_active(cpu))
+			continue;
+		pmc_select_cpu(cpu);
+		hwpmc_pmu_force_context_switch();
+	}
+	if (pg->pg_ncpu != 0)
+		pmc_restore_cpu_binding(&pb);
+
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_time_update_locked(pg, cpu_ticks());
+	pg->pg_running = false;
+	if (!release)
+		pg->pg_account_blocked = false;
+	KASSERT(pg->pg_running_threads == 0,
+	    ("[pmu] group %u has running accounting threads", pg->pg_id));
+	for (cpu = 0; cpu < pg->pg_ncpu; cpu++) {
+		KASSERT(!pg->pg_cpu_state[cpu].pgcs_counted &&
+		    !pg->pg_cpu_state[cpu].pgcs_placed &&
+		    pg->pg_cpu_state[cpu].pgcs_td == NULL,
+		    ("[pmu] group %u has active CPU %u marker", pg->pg_id,
+		    cpu));
+	}
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+}
+
+static void
+pmu_group_accounting_prepare_release(pmu_group_t *pg)
+{
+	struct pmc_process *pp;
+
+	pp = pg->pg_pp;
+	if (pp != NULL)
+		mtx_lock_spin(&pp->pp_pmu_lock);
+	pmu_group_accounting_block(pg);
+	if (pp != NULL)
+		mtx_unlock_spin(&pp->pp_pmu_lock);
+	pmu_group_accounting_drain(pg, true);
+}
 
 pmu_event_t *
 pmu_event_from_pmc(struct pmc *pm)
@@ -300,9 +443,12 @@ void
 pmu_group_release(pmu_group_t *pg)
 {
 	pmu_event_t *pe;
+	struct pmc_process *pp;
 
 	if (pg == NULL)
 		return;
+
+	pmu_group_accounting_prepare_release(pg);
 
 	/*
 	 * The per-pp rotation kthread is torn down by pmu_group_on_release
@@ -331,12 +477,16 @@ pmu_group_release(pmu_group_t *pg)
 	 * skips the second LIST_REMOVE.
 	 */
 	if (pg->pg_pp != NULL) {
-		if (pg->pg_pp->pp_pmu_rot_cursor == pg)
-			pg->pg_pp->pp_pmu_rot_cursor = LIST_NEXT(pg,
-			    pg_proc_next);
+		pp = pg->pg_pp;
+		mtx_lock_spin(&pp->pp_pmu_lock);
+		if (pp->pp_pmu_rot_cursor == pg)
+			pp->pp_pmu_rot_cursor = LIST_NEXT(pg, pg_proc_next);
 		LIST_REMOVE(pg, pg_proc_next);
 		pg->pg_pp = NULL;
+		mtx_unlock_spin(&pp->pp_pmu_lock);
 	}
+	KASSERT(pg->pg_account_blocked,
+	    ("[pmu] freeing group with accounting enabled"));
 	KASSERT(pg->pg_oncpu_threads == 0 && pg->pg_running_threads == 0,
 	    ("[pmu] freeing group with active accounting"));
 	for (u_int cpu = 0; cpu < pg->pg_ncpu; cpu++) {
@@ -384,8 +534,10 @@ pmu_group_on_attach(struct pmc *pm, struct proc *p)
 		return (EBUSY);
 	pg->pg_attach_proc = p;
 	if (pg->pg_pp == NULL) {
+		mtx_lock_spin(&pp->pp_pmu_lock);
 		LIST_INSERT_HEAD(&pp->pp_pmu_groups, pg, pg_proc_next);
 		pg->pg_pp = pp;
+		mtx_unlock_spin(&pp->pp_pmu_lock);
 	}
 	return (0);
 }
@@ -467,11 +619,23 @@ pmu_group_on_start(struct pmc *pm)
 		pg->pg_attach_proc = p;
 
 	if (pg->pg_pp == NULL) {
+		mtx_lock_spin(&pp->pp_pmu_lock);
 		LIST_INSERT_HEAD(&pp->pp_pmu_groups, pg, pg_proc_next);
 		pg->pg_pp = pp;
+		mtx_unlock_spin(&pp->pp_pmu_lock);
 	}
 
-	pg->pg_running = true;
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	if (pg->pg_account_blocked) {
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+		return (EBUSY);
+	}
+	pmu_group_time_update_locked(pg, cpu_ticks());
+	if (!pg->pg_running) {
+		pg->pg_running = true;
+		pg->pg_account_placement_admit = false;
+	}
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 
 	if (pg->pg_assigned) {
 		PMCDBG3(PMC, OPS, 2,
@@ -498,6 +662,10 @@ pmu_group_on_start(struct pmc *pm)
 		    pg->pg_id, pe->pe_pmc, PMC_TO_ROWINDEX(pe->pe_pmc));
 	}
 
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pg->pg_account_placement_admit = pg->pg_assigned;
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+
 	pmu_pp_kick_rotate(pp);
 	return (0);
 }
@@ -506,11 +674,8 @@ pmu_group_on_start(struct pmc *pm)
  * Mark the group stopped.  We deliberately do NOT release HW rows
  * here:
  *
- *   1. The user-facing PMC_OP_PMCSTOP path runs with pmc_sx
- *      DOWNGRADED to a shared lock (see PMC_DOWNGRADE_SX in
- *      pmc_syscall_handler).  pmc_rotation_detach asserts
- *      sx_assert(&pmc_sx, SX_XLOCKED), so calling schedule-out
- *      from here would panic.
+ *   1. Group PMCSTOP retains pmc_sx exclusively while active CPU
+ *      markers are drained, but keeps the assigned rows reserved.
  *
  *   2. Stop semantics in the framework only freeze the HW counter,
  *      they do not unbind the row from the target proc -- so
@@ -528,18 +693,31 @@ pmu_group_on_stop(struct pmc *pm)
 {
 	pmu_event_t *pe;
 	pmu_group_t *pg;
+	struct pmc_process *pp;
 
+	hwpmc_pmu_sx_assert_xlocked();
 	pe = pmu_event_from_pmc(pm);
 	if (pe == NULL || pe->pe_group == NULL)
 		return;
 	pg = pe->pe_group;
-	if (!pg->pg_running)
+	pp = pg->pg_pp;
+	if (pp != NULL)
+		mtx_lock_spin(&pp->pp_pmu_lock);
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	if (!pg->pg_running) {
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+		if (pp != NULL)
+			mtx_unlock_spin(&pp->pp_pmu_lock);
 		return;
-
-	pg->pg_running = false;
+	}
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+	pmu_group_accounting_block(pg);
+	if (pp != NULL)
+		mtx_unlock_spin(&pp->pp_pmu_lock);
 
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
 		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
+	pmu_group_accounting_drain(pg, false);
 }
 
 /* Tick accounting and context-switch hooks. */
@@ -550,13 +728,115 @@ void pmu_event_account_out(pmu_event_t *pe __unused,
 void pmu_rotate_groups(int cpu __unused) { }
 
 void
-pmu_group_csw_in(struct thread *td __unused, struct pmc_process *pp __unused)
+pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
 {
+	struct pmu_group_cpu_state *pgcs;
+	pmu_group_t *pg;
+	uint64_t now;
+	int cpu;
+
+	cpu = PCPU_GET(cpuid);
+	now = cpu_ticks();
+	mtx_lock_spin(&pp->pp_pmu_lock);
+	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
+		if (pg->pg_system || cpu < 0 || (u_int)cpu >= pg->pg_ncpu)
+			continue;
+		pgcs = &pg->pg_cpu_state[cpu];
+		mtx_pool_lock_spin(pmc_mtxpool, pg);
+		if (!pg->pg_committed || !pg->pg_running ||
+		    pg->pg_account_blocked) {
+			mtx_pool_unlock_spin(pmc_mtxpool, pg);
+			continue;
+		}
+		KASSERT(!pgcs->pgcs_counted,
+		    ("[pmu] duplicate CPU %d marker for group %u", cpu,
+		    pg->pg_id));
+		if (pgcs->pgcs_counted) {
+			mtx_pool_unlock_spin(pmc_mtxpool, pg);
+			continue;
+		}
+		pmu_group_time_update_locked(pg, now);
+		pgcs->pgcs_td = td;
+		pgcs->pgcs_counted = true;
+		pgcs->pgcs_placed = false;
+		pg->pg_oncpu_threads++;
+		LIST_INSERT_HEAD(&pmu_group_cpu_active[cpu], pgcs, pgcs_next);
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+	}
+	mtx_unlock_spin(&pp->pp_pmu_lock);
+}
+
+bool
+pmu_group_csw_can_start(struct pmc *pm, struct thread *td, int cpu)
+{
+	struct pmu_group_cpu_state *pgcs;
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	bool can_start;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || pe->pe_group == NULL)
+		return (true);
+	pg = pe->pe_group;
+	if (pg->pg_system || cpu < 0 || (u_int)cpu >= pg->pg_ncpu)
+		return (false);
+
+	pgcs = &pg->pg_cpu_state[cpu];
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	can_start = pg->pg_committed && pg->pg_running &&
+	    !pg->pg_account_blocked && pg->pg_account_placement_admit &&
+	    pgcs->pgcs_counted && pgcs->pgcs_td == td;
+	if (can_start && !pgcs->pgcs_placed) {
+		pmu_group_time_update_locked(pg, cpu_ticks());
+		pgcs->pgcs_placed = true;
+		pg->pg_running_threads++;
+		KASSERT(pg->pg_running_threads <= pg->pg_oncpu_threads,
+		    ("[pmu] group %u running threads exceed on-CPU threads",
+		    pg->pg_id));
+	}
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+	return (can_start);
 }
 
 void
-pmu_group_csw_out(struct thread *td __unused, int cpu __unused)
+pmu_group_csw_out(struct thread *td, int cpu)
 {
+	struct pmu_group_cpu_state *pgcs, *next;
+	pmu_group_t *pg;
+	uint64_t now;
+
+	KASSERT(cpu >= 0 && cpu < MAXCPU,
+	    ("[pmu] invalid csw-out CPU %d", cpu));
+	if (cpu < 0 || cpu >= MAXCPU)
+		return;
+
+	now = cpu_ticks();
+	LIST_FOREACH_SAFE(pgcs, &pmu_group_cpu_active[cpu], pgcs_next,
+	    next) {
+		if (pgcs->pgcs_td != td)
+			continue;
+		pg = pgcs->pgcs_group;
+		mtx_pool_lock_spin(pmc_mtxpool, pg);
+		if (!pgcs->pgcs_counted || pgcs->pgcs_td != td) {
+			mtx_pool_unlock_spin(pmc_mtxpool, pg);
+			continue;
+		}
+		pmu_group_time_update_locked(pg, now);
+		KASSERT(pg->pg_oncpu_threads > 0,
+		    ("[pmu] group %u on-CPU thread underflow", pg->pg_id));
+		pg->pg_oncpu_threads--;
+		if (pgcs->pgcs_placed) {
+			KASSERT(pg->pg_running_threads > 0,
+			    ("[pmu] group %u running thread underflow",
+			    pg->pg_id));
+			pg->pg_running_threads--;
+		}
+		LIST_REMOVE(pgcs, pgcs_next);
+		pgcs->pgcs_td = NULL;
+		pgcs->pgcs_counted = false;
+		pgcs->pgcs_placed = false;
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+	}
 }
 
 int
@@ -585,6 +865,8 @@ pmu_group_on_release(struct pmc *pm)
 	pg = pe->pe_group;
 	if (pg == NULL)
 		goto destroy;
+
+	pmu_group_accounting_prepare_release(pg);
 
 	/*
 	 * System-wide group.  All HW teardown and rotation-kthread
@@ -630,10 +912,13 @@ pmu_group_on_release(struct pmc *pm)
 	 * other groups still want rotation.
 	 */
 	was_first_release = (pg->pg_pp != NULL);
-	if (was_first_release && pp != NULL &&
-	    LIST_FIRST(&pp->pp_pmu_groups) == pg &&
-	    LIST_NEXT(pg, pg_proc_next) == NULL &&
-	    pp->pp_pmu_rot_running) {
+	if (was_first_release && pp != NULL) {
+		mtx_lock_spin(&pp->pp_pmu_lock);
+		was_first_release = LIST_FIRST(&pp->pp_pmu_groups) == pg &&
+		    LIST_NEXT(pg, pg_proc_next) == NULL;
+		mtx_unlock_spin(&pp->pp_pmu_lock);
+	}
+	if (was_first_release && pp != NULL && pp->pp_pmu_rot_running) {
 		pp->pp_pmu_rot_running = false;
 		wakeup(pp);
 		while (pp->pp_pmu_rot_td != NULL)
@@ -679,16 +964,19 @@ pmu_group_on_release(struct pmc *pm)
 	 * NULL and skip this branch (and pmu_group_release below
 	 * also short-circuits on pg_pp == NULL).
 	 */
-	if (was_first_release) {
+	if (pg->pg_pp != NULL) {
 		PMCDBG3(PMC, OPS, 3,
 		    "release: unlinking pg=%p from pp=%p (cursor=%p)",
 		    pg, pp,
 		    pp != NULL ? pp->pp_pmu_rot_cursor : NULL);
-		if (pp != NULL && pp->pp_pmu_rot_cursor == pg)
+		KASSERT(pp != NULL, ("[pmu] linked group without pp"));
+		mtx_lock_spin(&pp->pp_pmu_lock);
+		if (pp->pp_pmu_rot_cursor == pg)
 			pp->pp_pmu_rot_cursor = LIST_NEXT(pg, pg_proc_next);
 		LIST_REMOVE(pg, pg_proc_next);
 		pg->pg_pp = NULL;
 		pg->pg_attach_proc = NULL;
+		mtx_unlock_spin(&pp->pp_pmu_lock);
 	}
 
 	if (pg->pg_nevents == 0) {
@@ -799,6 +1087,9 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 	}
 
 	(void)pmu_group_attach_siblings(pg, pp);
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pg->pg_account_placement_admit = true;
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 	return (0);
 }
 
@@ -815,6 +1106,11 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg)
 
 	if (pg == NULL || !pg->pg_assigned)
 		return;
+
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_time_update_locked(pg, cpu_ticks());
+	pg->pg_account_placement_admit = false;
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 
 	/* Phase 1: stop every sibling so csw_in/csw_out skip them. */
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
@@ -863,12 +1159,17 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg)
 void
 pmu_pp_release_all(struct pmc_process *pp)
 {
-	pmu_group_t *pg, *next;
+	pmu_group_t *pg;
 
 	hwpmc_pmu_sx_assert_xlocked();
 
 	if (pp == NULL)
 		return;
+
+	mtx_lock_spin(&pp->pp_pmu_lock);
+	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next)
+		pmu_group_accounting_block(pg);
+	mtx_unlock_spin(&pp->pp_pmu_lock);
 
 	/*
 	 * Tear down the rotation kthread first.  It holds pp as its
@@ -890,19 +1191,24 @@ pmu_pp_release_all(struct pmc_process *pp)
 	 * Schedule out every group that is currently bound to pp, then
 	 * unhook every pg from pp->pp_pmu_groups regardless of state.
 	 * pg_pp gets cleared so a later pmu_group_on_release for any
-	 * surviving sibling sees was_first_release == false and skips
-	 * the now-stale LIST_REMOVE.
+	 * surviving sibling skips the now-stale LIST_REMOVE.
 	 */
 	pp->pp_pmu_rot_cursor = NULL;
-	LIST_FOREACH_SAFE(pg, &pp->pp_pmu_groups, pg_proc_next, next) {
+	for (;;) {
+		mtx_lock_spin(&pp->pp_pmu_lock);
+		pg = LIST_FIRST(&pp->pp_pmu_groups);
+		mtx_unlock_spin(&pp->pp_pmu_lock);
+		if (pg == NULL)
+			break;
+		pmu_group_accounting_drain(pg, true);
 		if (pg->pg_assigned)
 			pmu_pp_schedule_out(pp, pg);
+		mtx_lock_spin(&pp->pp_pmu_lock);
 		LIST_REMOVE(pg, pg_proc_next);
 		pg->pg_pp = NULL;
 		pg->pg_attach_proc = NULL;
-		pg->pg_running = false;
+		mtx_unlock_spin(&pp->pp_pmu_lock);
 	}
-	LIST_INIT(&pp->pp_pmu_groups);
 }
 
 /*

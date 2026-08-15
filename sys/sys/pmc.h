@@ -40,6 +40,7 @@
 #include <machine/profile.h>
 #ifdef _KERNEL
 #include <sys/epoch.h>
+#include <sys/mutex.h>
 #include <ck_queue.h>
 #endif
 
@@ -938,6 +939,7 @@ struct pmc_process {
 	struct proc	*pp_proc;		/* target process */
 #ifdef _KERNEL
 	LIST_HEAD(, pmu_group) pp_pmu_groups;	/* attached PMU groups (FIFO) */
+	struct mtx	pp_pmu_lock;		/* protects pp_pmu_groups */
 	/*
 	 * Inter-group multiplex rotation.  When the union of events
 	 * across pp_pmu_groups exceeds the available HW counters, the

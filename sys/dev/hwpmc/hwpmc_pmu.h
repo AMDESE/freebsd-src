@@ -122,6 +122,7 @@ struct pmu_group {
 	struct pmu_group_cpu_state	*pg_cpu_state;
 	u_int				pg_ncpu;
 	bool				pg_account_blocked;
+	bool				pg_account_placement_admit;
 	/*
 	 * System-wide (PMC_MODE_SC) group state.  Process-mode groups
 	 * hang off a pmc_process (pg_pp) and rotate in a per-pp kthread;
@@ -200,6 +201,8 @@ int pmu_group_add(pmu_group_t *pg, struct pmc *pm, bool leader);
 int pmu_group_commit(pmu_group_t *pg);
 pmu_group_t *pmu_group_lookup(struct pmc_owner *po, uint32_t pg_id);
 void pmu_group_release(pmu_group_t *pg);
+void pmu_group_accounting_initialize(void);
+void pmu_group_accounting_finalize(void);
 void pmu_event_destroy(pmu_event_t *pe);
 pmu_event_t *pmu_event_from_pmc(struct pmc *pm);
 
@@ -209,6 +212,7 @@ int pmu_group_on_start(struct pmc *pm);
 void pmu_group_on_stop(struct pmc *pm);
 void pmu_group_on_release(struct pmc *pm);
 void pmu_group_csw_in(struct thread *td, struct pmc_process *pp);
+bool pmu_group_csw_can_start(struct pmc *pm, struct thread *td, int cpu);
 void pmu_group_csw_out(struct thread *td, int cpu);
 int pmu_group_read_value(struct pmc *pm, pmc_value_t *value);
 
@@ -255,6 +259,7 @@ void hwpmc_pmu_sx_xlock(void);
 void hwpmc_pmu_sx_xunlock(void);
 int hwpmc_pmu_sx_sleep(void *chan, int timo, const char *wmesg);
 void hwpmc_pmu_sx_assert_xlocked(void);
+void hwpmc_pmu_force_context_switch(void);
 pmc_value_t hwpmc_pmc_read_delta(int cpu, int ri, struct pmc *pm);
 void hwpmc_pmu_accumulate_remove(int cpu, int ri, struct pmc *pm,
     struct pmc_process *pp);

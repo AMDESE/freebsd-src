@@ -820,6 +820,13 @@ pmc_force_context_switch(void)
 	pause("pmcctx", 1);
 }
 
+void
+hwpmc_pmu_force_context_switch(void)
+{
+
+	pmc_force_context_switch();
+}
+
 uint64_t
 pmc_rdtsc(void)
 {
@@ -1853,6 +1860,8 @@ pmc_process_csw_in(struct thread *td)
 		 * be placed on hardware.
 		 */
 		if (pm->pm_state != PMC_STATE_RUNNING)
+			continue;
+		if (!pmu_group_csw_can_start(pm, td, cpu))
 			continue;
 
 		KASSERT(counter_u64_fetch(pm->pm_runcount) >= 0,
@@ -3063,9 +3072,12 @@ pmc_find_process_descriptor(struct proc *p, uint32_t mode)
 	 * Pre-allocate memory in the PMC_FLAG_ALLOCATE case since we
 	 * cannot call malloc(9) once we hold a spin lock.
 	 */
-	if ((mode & PMC_FLAG_ALLOCATE) != 0)
+	if ((mode & PMC_FLAG_ALLOCATE) != 0) {
 		ppnew = malloc(sizeof(struct pmc_process) + md->pmd_npmc *
 		    sizeof(struct pmc_targetstate), M_PMC, M_WAITOK | M_ZERO);
+		mtx_init(&ppnew->pp_pmu_lock, "pmc-pmu-groups", "pmc-pmu",
+		    MTX_SPIN);
+	}
 
 	mtx_lock_spin(&pmc_processhash_mtx);
 	LIST_FOREACH(pp, pph, pp_next) {
@@ -3091,8 +3103,10 @@ pmc_find_process_descriptor(struct proc *p, uint32_t mode)
 	} else
 		mtx_unlock_spin(&pmc_processhash_mtx);
 
-	if (ppnew != NULL)
+	if (ppnew != NULL) {
+		mtx_destroy(&ppnew->pp_pmu_lock);
 		free(ppnew, M_PMC);
+	}
 	return (pp);
 }
 
@@ -3133,6 +3147,7 @@ pmc_destroy_process_descriptor(struct pmc_process *pp)
 		LIST_REMOVE(pmc_td, pt_next);
 		pmc_thread_descriptor_pool_free(pmc_td);
 	}
+	mtx_destroy(&pp->pp_pmu_lock);
 	free(pp, M_PMC);
 }
 
@@ -5553,7 +5568,9 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 			break;
 		}
 
-		PMC_DOWNGRADE_SX();
+		if (pe == NULL || pe->pe_group == NULL ||
+		    !pe->pe_group->pg_committed)
+			PMC_DOWNGRADE_SX();
 
 		if (pm->pm_state == PMC_STATE_STOPPED) /* already stopped */
 			break;
@@ -6322,6 +6339,7 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 	PMCDBG2(PRC,EXT,2, "process-exit proc=%p pmc-process=%p", p, pp);
 
 	/* pseudo context switch out; close shared class gates too */
+	pmu_group_csw_out(curthread, cpu);
 	pmc_process_csw_stop_all(cpu);
 
 	/*
@@ -6421,6 +6439,7 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 	    "process_exit: pid=%d pp=%p draining pmu groups",
 	    p->p_pid, pp);
 	pmu_pp_release_all(pp);
+	mtx_destroy(&pp->pp_pmu_lock);
 	free(pp, M_PMC);
 
 out:
@@ -6930,6 +6949,7 @@ pmc_initialize(void)
 	/* allocate a pool of spin mutexes */
 	pmc_mtxpool = mtx_pool_create("pmc-leaf", pmc_mtxpool_size,
 	    MTX_SPIN);
+	pmu_group_accounting_initialize();
 
 	PMCDBG4(MOD,INI,1, "pmc_ownerhash=%p, mask=0x%lx "
 	    "targethash=%p mask=0x%lx", pmc_ownerhash, pmc_ownerhashmask,
@@ -7044,6 +7064,7 @@ pmc_cleanup(void)
 	mtx_destroy(&pmc_threadfreelist_mtx);
 	pmc_thread_descriptor_pool_drain();
 
+	pmu_group_accounting_finalize();
 	if (pmc_mtxpool != NULL)
 		mtx_pool_destroy(&pmc_mtxpool);
 
