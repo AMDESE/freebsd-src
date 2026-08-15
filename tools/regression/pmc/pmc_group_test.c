@@ -327,9 +327,8 @@ test_oversubscription_rejected(void)
 		    "core_pool=%d)\n", allocated, core);
 		return (1);
 	}
-	if (errno != ENOSPC && errno != EOPNOTSUPP) {
-		fprintf(stderr,
-		    "FAIL: expected ENOSPC/EOPNOTSUPP got errno=%d\n", errno);
+	if (errno != ENOSPC) {
+		fprintf(stderr, "FAIL: expected ENOSPC got errno=%d\n", errno);
 		return (1);
 	}
 	printf("oversubscription rejected (allocated=%d core_pool=%d "

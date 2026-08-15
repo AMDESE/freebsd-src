@@ -127,15 +127,15 @@ main(void)
 	for (i = 0; i < target; i++) {
 		uint32_t flags = 0;
 
-		if (i == 0)
+		if (allocated == 0)
 			flags |= PMC_F_GROUP_MUX;
 		if (pmc_allocate_group(events[i], PMC_MODE_TC, flags,
-		    PMC_CPU_ANY, &ids[i], 0) < 0) {
+		    PMC_CPU_ANY, &ids[allocated], 0) < 0) {
 			/* Some events may not be supported on this CPU. */
 			continue;
 		}
-		if (pmc_group_add(gid, ids[i], allocated == 0) < 0) {
-			(void)pmc_release(ids[i]);
+		if (pmc_group_add(gid, ids[allocated], allocated == 0) < 0) {
+			(void)pmc_release(ids[allocated]);
 			continue;
 		}
 		allocated++;
@@ -167,10 +167,10 @@ main(void)
 		    "split (within-group atomicity)\n", allocated, core);
 		return (1);
 	}
-	if (errno != ENOSPC && errno != EOPNOTSUPP) {
+	if (errno != ENOSPC) {
 		fprintf(stderr,
-		    "FAIL: expected ENOSPC/EOPNOTSUPP from oversubscribed "
-		    "commit, got errno=%d (%s)\n", errno, strerror(errno));
+		    "FAIL: expected ENOSPC from oversubscribed commit, "
+		    "got errno=%d (%s)\n", errno, strerror(errno));
 		return (1);
 	}
 
