@@ -863,8 +863,23 @@ struct pmc {
  */
 #define	PMC_HANDLE_DEFERRED_BASE	0x80
 #define	PMC_HANDLE_DEFERRED_MAX		0xFE
+#define	PMC_HANDLE_DEFERRED_INDEX_MASK	0x1F
+#define	PMC_HANDLE_DEFERRED_GENERATION_MASK	0x03
+#define	PMC_HANDLE_DEFERRED_GENERATION_SHIFT	5
+#define	PMC_HANDLE_DEFERRED_SLOTS	31
+#define	PMC_HANDLE_DEFERRED_INDEX(R)	\
+	((R) & PMC_HANDLE_DEFERRED_INDEX_MASK)
+#define	PMC_HANDLE_DEFERRED_GENERATION(R)	\
+	(((R) >> PMC_HANDLE_DEFERRED_GENERATION_SHIFT) & \
+	    PMC_HANDLE_DEFERRED_GENERATION_MASK)
+#define	PMC_HANDLE_DEFERRED_ROW(I, G)	\
+	(PMC_HANDLE_DEFERRED_BASE | \
+	    (((G) & PMC_HANDLE_DEFERRED_GENERATION_MASK) << \
+	    PMC_HANDLE_DEFERRED_GENERATION_SHIFT) | \
+	    ((I) & PMC_HANDLE_DEFERRED_INDEX_MASK))
 #define	PMC_ROW_IS_DEFERRED_HANDLE(R)	\
-	((R) >= PMC_HANDLE_DEFERRED_BASE && (R) <= PMC_HANDLE_DEFERRED_MAX)
+	((R) >= PMC_HANDLE_DEFERRED_BASE && (R) <= PMC_HANDLE_DEFERRED_MAX && \
+	    PMC_HANDLE_DEFERRED_INDEX(R) < PMC_HANDLE_DEFERRED_SLOTS)
 
 /*
  * Accessor macros for 'struct pmc'
@@ -962,13 +977,22 @@ struct pmc_process {
  *
  */
 
+#ifdef _KERNEL
+struct pmc_deferred_handle_pool {
+	LIST_ENTRY(pmc_deferred_handle_pool) pdh_next;
+	uint32_t	pdh_cpu;
+	uint32_t	pdh_used;
+	uint8_t		pdh_generation[PMC_HANDLE_DEFERRED_SLOTS];
+};
+#endif
+
 struct pmc_owner  {
 	LIST_ENTRY(pmc_owner)	po_next;	/* hash chain */
 	CK_LIST_ENTRY(pmc_owner)	po_ssnext;	/* (g/p) list of SS PMC owners */
 	LIST_HEAD(, pmc)	po_pmcs;	/* owned PMC list */
 #ifdef _KERNEL
 	LIST_HEAD(, pmu_group)	po_groups;	/* PMU event groups */
-	uint8_t			po_next_deferred_serial; /* 0x80..0xFE */
+	LIST_HEAD(, pmc_deferred_handle_pool) po_deferred_handles;
 #endif
 	TAILQ_HEAD(, pmclog_buffer) po_logbuffers; /* (o) logbuffer list */
 	struct mtx		po_mtx;		/* spin lock for (o) */

@@ -891,9 +891,11 @@ pmc_maybe_remove_owner(struct pmc_owner *po)
 	/*
 	 * Remove owner record if
 	 * - this process does not own any PMCs
+	 * - this process has no deferred-handle generation state
 	 * - this process has not allocated a system-wide sampling buffer
 	 */
 	if (LIST_EMPTY(&po->po_pmcs) &&
+	    LIST_EMPTY(&po->po_deferred_handles) &&
 	    ((po->po_flags & PMC_PO_OWNS_LOGFILE) == 0)) {
 		pmc_remove_owner(po);
 		pmc_destroy_owner_descriptor(po);
@@ -2745,7 +2747,7 @@ pmc_allocate_owner_descriptor(struct proc *p)
 
 	TAILQ_INIT(&po->po_logbuffers);
 	LIST_INIT(&po->po_groups);
-	po->po_next_deferred_serial = PMC_HANDLE_DEFERRED_BASE;
+	LIST_INIT(&po->po_deferred_handles);
 	mtx_init(&po->po_mtx, "pmc-owner-mtx", "pmc-per-proc", MTX_SPIN);
 
 	PMCDBG4(OWN,ALL,1, "allocate-owner proc=%p (%d, %s) pmc-owner=%p",
@@ -2757,12 +2759,87 @@ pmc_allocate_owner_descriptor(struct proc *p)
 static void
 pmc_destroy_owner_descriptor(struct pmc_owner *po)
 {
+	struct pmc_deferred_handle_pool *pdh, *tmp;
 
 	PMCDBG4(OWN,REL,1, "destroy-owner po=%p proc=%p (%d, %s)",
 	    po, po->po_owner, po->po_owner->p_pid, po->po_owner->p_comm);
 
+	LIST_FOREACH_SAFE(pdh, &po->po_deferred_handles, pdh_next, tmp) {
+		KASSERT(pdh->pdh_used == 0,
+		    ("[pmc,%d] deferred handles still allocated", __LINE__));
+		LIST_REMOVE(pdh, pdh_next);
+		free(pdh, M_PMC);
+	}
 	mtx_destroy(&po->po_mtx);
 	free(po, M_PMC);
+}
+
+static struct pmc_deferred_handle_pool *
+pmc_find_deferred_handle_pool(struct pmc_owner *po, uint32_t cpu)
+{
+	struct pmc_deferred_handle_pool *pdh;
+
+	LIST_FOREACH(pdh, &po->po_deferred_handles, pdh_next) {
+		if (pdh->pdh_cpu == cpu)
+			return (pdh);
+	}
+	return (NULL);
+}
+
+static int
+pmc_allocate_deferred_handle(struct pmc_owner *po, uint32_t cpu,
+    enum pmc_mode mode, enum pmc_class class, pmc_id_t *pmcid)
+{
+	struct pmc_deferred_handle_pool *pdh;
+	u_int generation, index, row;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	pdh = pmc_find_deferred_handle_pool(po, cpu);
+	if (pdh == NULL) {
+		pdh = malloc(sizeof(*pdh), M_PMC, M_WAITOK | M_ZERO);
+		pdh->pdh_cpu = cpu;
+		LIST_INSERT_HEAD(&po->po_deferred_handles, pdh, pdh_next);
+	}
+	for (index = 0; index < PMC_HANDLE_DEFERRED_SLOTS; index++) {
+		if ((pdh->pdh_used & (1u << index)) != 0)
+			continue;
+		generation = pdh->pdh_generation[index];
+		row = PMC_HANDLE_DEFERRED_ROW(index, generation);
+		KASSERT(PMC_ROW_IS_DEFERRED_HANDLE(row),
+		    ("[pmc,%d] invalid deferred handle row %#x", __LINE__, row));
+		pdh->pdh_used |= 1u << index;
+		*pmcid = PMC_ID_MAKE_ID(cpu, mode, class, row);
+		return (0);
+	}
+	return (EMFILE);
+}
+
+static void
+pmc_free_deferred_handle(struct pmc_owner *po, pmc_id_t pmcid)
+{
+	struct pmc_deferred_handle_pool *pdh;
+	u_int generation, index, row;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	row = PMC_ID_TO_ROWINDEX(pmcid);
+	if (!PMC_ROW_IS_DEFERRED_HANDLE(row))
+		return;
+	KASSERT(po != NULL,
+	    ("[pmc,%d] deferred handle without owner", __LINE__));
+	if (po == NULL)
+		return;
+	index = PMC_HANDLE_DEFERRED_INDEX(row);
+	generation = PMC_HANDLE_DEFERRED_GENERATION(row);
+	pdh = pmc_find_deferred_handle_pool(po, PMC_ID_TO_CPU(pmcid));
+	KASSERT(pdh != NULL && (pdh->pdh_used & (1u << index)) != 0 &&
+	    pdh->pdh_generation[index] == generation,
+	    ("[pmc,%d] invalid deferred handle release %#x", __LINE__, pmcid));
+	if (pdh == NULL || (pdh->pdh_used & (1u << index)) == 0 ||
+	    pdh->pdh_generation[index] != generation)
+		return;
+	pdh->pdh_used &= ~(1u << index);
+	pdh->pdh_generation[index] = (generation + 1) &
+	    PMC_HANDLE_DEFERRED_GENERATION_MASK;
 }
 
 /*
@@ -3237,6 +3314,8 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 		 * owner list.
 		 */
 		pm->pm_state = PMC_STATE_DELETED;
+		pmc_free_deferred_handle(pm->pm_owner, pm->pm_handle);
+		pm->pm_handle = PMC_ID_INVALID;
 		if (pm->pm_pmu != NULL)
 			pmu_group_on_release(pm);
 		if (pm->pm_owner != NULL) {
@@ -3382,6 +3461,8 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 
 	/* Unlink from the owner's list. */
 	if (pm->pm_owner != NULL) {
+		pmc_free_deferred_handle(pm->pm_owner, pm->pm_handle);
+		pm->pm_handle = PMC_ID_INVALID;
 		LIST_REMOVE(pm, pm_next);
 		pm->pm_owner = NULL;
 	}
@@ -4035,6 +4116,7 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 {
 	struct proc *p;
 	struct pmc *pmc;
+	struct pmc_owner *po;
 	struct pmc_binding pb;
 	struct pmc_classdep *pcd;
 	struct pmc_hw *phw;
@@ -4200,6 +4282,7 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 		defcpu = PMC_IS_SYSTEM_MODE(mode) ? cpu : PMC_CPU_ANY;
 		pmc->pm_id = PMC_ID_MAKE_ID(defcpu, mode, class,
 		    PMC_ROW_UNASSIGNED);
+		defcpu = PMC_TO_CPU(pmc);
 		if (PMC_IS_SAMPLING_MODE(mode)) {
 			if (pa->pm_count < MAX(1, pmc_mincount))
 				pmc->pm_sc.pm_reloadcount = MAX(MAX(1,
@@ -4214,40 +4297,31 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 			pmc_destroy_pmc_descriptor(pmc);
 			return (error);
 		}
-		pmc->pm_state = PMC_STATE_ALLOCATED;
-		pmc->pm_class = class;
-		error = pmc_register_owner(p, pmc);
+		po = pmc_find_owner_descriptor(p);
+		if (po == NULL)
+			po = pmc_allocate_owner_descriptor(p);
+		if (po == NULL) {
+			pmu_group_on_release(pmc);
+			pmc_destroy_pmc_descriptor(pmc);
+			return (ENOMEM);
+		}
+		error = pmc_allocate_deferred_handle(po, defcpu, mode, class,
+		    &pmc->pm_handle);
 		if (error != 0) {
 			pmu_group_on_release(pmc);
 			pmc_destroy_pmc_descriptor(pmc);
 			return (error);
 		}
-		/*
-		 * Deferred PMCs all carry ROW_UNASSIGNED in pm_id (and a
-		 * shared CPU field -- CPU_ANY for virtual, the bound CPU
-		 * for system), so pm_id is not unique per PMC and cannot
-		 * serve as the user-facing handle.  Allocate a unique
-		 * value in the row-index byte so pmc_find_pmc() can
-		 * distinguish individual deferred PMCs and so userland
-		 * receives a distinct id from each pmc_allocate_group().
-		 */
-		{
-			struct pmc_owner *po2 = pmc->pm_owner;
-			uint8_t serial;
-
-			if (po2->po_next_deferred_serial <
-			    PMC_HANDLE_DEFERRED_BASE)
-				po2->po_next_deferred_serial =
-				    PMC_HANDLE_DEFERRED_BASE;
-			if (po2->po_next_deferred_serial >
-			    PMC_HANDLE_DEFERRED_MAX) {
-				pmu_group_on_release(pmc);
-				pmc_destroy_pmc_descriptor(pmc);
-				return (ENOSPC);
-			}
-			serial = po2->po_next_deferred_serial++;
-			pmc->pm_handle = PMC_ID_MAKE_ID(defcpu, mode,
-			    class, serial);
+		pmc->pm_state = PMC_STATE_ALLOCATED;
+		pmc->pm_class = class;
+		error = pmc_register_owner(p, pmc);
+		if (error != 0) {
+			pmc_free_deferred_handle(po, pmc->pm_handle);
+			pmc->pm_handle = PMC_ID_INVALID;
+			pmu_group_on_release(pmc);
+			pmc->pm_state = PMC_STATE_DELETED;
+			pmc_destroy_pmc_descriptor(pmc);
+			return (error);
 		}
 		pa->pm_pmcid = pmc->pm_handle;
 		return (0);
