@@ -208,6 +208,7 @@ void pmu_group_time_snapshot_locked(pmu_group_t *pg,
     struct pmu_group_time_snapshot *snapshot, uint64_t now);
 void pmu_event_destroy(pmu_event_t *pe);
 pmu_event_t *pmu_event_from_pmc(struct pmc *pm);
+pmu_group_t *pmu_group_from_pmc(struct pmc *pm);
 
 int pmu_group_on_allocate(struct pmc *pm, const struct pmc_op_pmcallocate *pa);
 int pmu_group_on_attach(struct pmc *pm, struct proc *p);

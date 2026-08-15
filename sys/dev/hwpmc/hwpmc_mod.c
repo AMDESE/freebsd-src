@@ -1059,11 +1059,11 @@ pmc_rotation_drain(struct pmc *pm)
 #endif
 		visited = false;
 		for (cpu = 0; cpu < pmc_cpu_max(); cpu++) {
-			if (counter_u64_fetch(pm->pm_runcount) == 0)
-				break;
 			if (!pmc_cpu_is_active(cpu) ||
 			    pm->pm_pcpu_state[cpu].pps_cpustate == 0)
 				continue;
+			if (counter_u64_fetch(pm->pm_runcount) == 0)
+				break;
 			pmc_drain_pmc_cpu(pm, cpu);
 			visited = true;
 		}
@@ -1315,15 +1315,13 @@ pmc_group_log_attach(pmu_group_t *pg, struct proc *p)
 static int
 pmc_attach_one_process(struct proc *p, struct pmc *pm)
 {
-	pmu_event_t *pe;
 	pmu_group_t *pg;
 	int ri, error;
 	char *fullpath, *freepath;
 	struct pmc_process	*pp;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
-	pe = pmu_event_from_pmc(pm);
-	pg = pe != NULL ? pe->pe_group : NULL;
+	pg = pmu_group_from_pmc(pm);
 
 	/*
 	 * Deferred grouped sibling: under the new all-or-none scheduling
@@ -1806,17 +1804,6 @@ pmc_process_csw_stop_all(int cpu)
 {
 	struct pmc_classdep *pcd;
 	u_int class;
-	bool found;
-
-	found = false;
-	for (class = 0; class < md->pmd_nclass; class++) {
-		if (md->pmd_classdep[class].pcd_stop_all != NULL) {
-			found = true;
-			break;
-		}
-	}
-	if (!found)
-		return;
 
 	pmc_process_csw_out_prepare(cpu);
 
@@ -1836,18 +1823,21 @@ pmc_process_csw_out_prepare(int cpu)
 {
 	struct pmc *pm;
 	struct pmc_classdep *pcd;
+	u_int class;
 	int adjri;
-	u_int ri;
 
-	for (ri = 0; ri < md->pmd_npmc; ri++) {
-		pcd = pmc_ri_to_classdep(md, ri, &adjri);
+	for (class = 0; class < md->pmd_nclass; class++) {
+		pcd = &md->pmd_classdep[class];
 		if (pcd->pcd_stop_all == NULL)
 			continue;
-		pm = NULL;
-		(void)pcd->pcd_get_config(cpu, adjri, &pm);
-		if (pm == NULL || !PMC_IS_VIRTUAL_MODE(PMC_TO_MODE(pm)))
-			continue;
-		pm->pm_pcpu_state[cpu].pps_cpustate = 0;
+		for (adjri = 0; adjri < pcd->pcd_num; adjri++) {
+			pm = NULL;
+			(void)pcd->pcd_get_config(cpu, adjri, &pm);
+			if (pm == NULL ||
+			    !PMC_IS_VIRTUAL_MODE(PMC_TO_MODE(pm)))
+				continue;
+			pm->pm_pcpu_state[cpu].pps_cpustate = 0;
+		}
 	}
 }
 
@@ -1907,7 +1897,7 @@ pmc_process_csw_in(struct thread *td)
 		 */
 		if (pm->pm_state != PMC_STATE_RUNNING)
 			continue;
-		if (!pmu_group_csw_can_start(pm, td, cpu))
+		if (pm->pm_pmu != NULL && !pmu_group_csw_can_start(pm, td, cpu))
 			continue;
 
 		KASSERT(counter_u64_fetch(pm->pm_runcount) >= 0,
@@ -2567,6 +2557,10 @@ pmc_log_group_mapping(struct pmc_process *pp, pid_t pid, uintfptr_t start,
 	pmu_group_t *pg, *other;
 	struct pmc_owner *po;
 	u_int i, nowners;
+
+	/* Unlocked peek: a racing insert catches up on its own csw_in. */
+	if (LIST_EMPTY(&pp->pp_pmu_groups))
+		return;
 
 	nowners = 0;
 	mtx_lock_spin(&pp->pp_pmu_lock);
@@ -3572,7 +3566,7 @@ static void
 pmc_wait_for_pmc_idle(struct pmc *pm)
 {
 	struct pmc_binding pb;
-	bool active_drain;
+	bool active_drain, visited;
 	int cpu;
 #ifdef INVARIANTS
 	volatile int maxloop;
@@ -3582,35 +3576,18 @@ pmc_wait_for_pmc_idle(struct pmc *pm)
 
 	/*
 	 * A virtual-mode PMC (including a process mux-group sibling) can
-	 * still be loaded on the hardware of any CPU that is running one
-	 * of its target threads.  pm_runcount only drops when those CPUs
-	 * run csw_out, so passively pause()ing here is unsafe: a
-	 * counting-mode target that is the only runnable thread on its
-	 * core is never involuntarily preempted, never csw_out's, and
-	 * this loop would spin until the INVARIANTS cap panics (or stall
-	 * for a long time under pmc_sx on a production kernel).  This is
-	 * the same failure the multiplex rotation drain hits, and the
-	 * virtual mux release path reaches it here (pm_state was just set
-	 * DELETED) before pmu_group_on_release runs.  Actively migrate
-	 * onto every loaded CPU to force its resident target off; see
-	 * pmc_rotation_drain for the full rationale.  System-mode PMCs
-	 * have already been de-configured off hardware by the caller, so
-	 * only their sample-queue references remain -- the pmclog_flush
-	 * path below handles those and no migration is needed.
+	 * still be loaded on the hardware of any CPU running one of its
+	 * targets, and passively pause()ing for its csw_out can stall
+	 * forever (a lone runnable counting-mode target never switches
+	 * out).  Actively migrate onto each CPU whose pps_cpustate still
+	 * advertises the counter instead; see pmc_rotation_drain() for
+	 * the full rationale.  System-mode PMCs are already off hardware,
+	 * so only forced switches to flush sample-queue references remain.
 	 */
 	active_drain = PMC_IS_VIRTUAL_MODE(PMC_TO_MODE(pm));
-	if (active_drain) {
+	if (active_drain)
 		pmc_save_cpu_binding(&pb);
-		for (cpu = 0; cpu < pmc_cpu_max(); cpu++) {
-			if (pmc_cpu_is_active(cpu))
-				pmc_drain_pmc_cpu(pm, cpu);
-		}
-	}
 
-	/*
-	 * Loop (with a forced context switch) till the PMC's runcount
-	 * comes down to zero.
-	 */
 	pmclog_flush(pm->pm_owner, 1);
 	while (counter_u64_fetch(pm->pm_runcount) > 0) {
 		pmclog_flush(pm->pm_owner, 1);
@@ -3621,16 +3598,22 @@ pmc_wait_for_pmc_idle(struct pmc *pm)
 		     "pmc to be free", __LINE__, PMC_TO_ROWINDEX(pm),
 		     (uintmax_t)counter_u64_fetch(pm->pm_runcount)));
 #endif
-		if (active_drain) {
-			for (cpu = 0; cpu < pmc_cpu_max(); cpu++) {
-				if (counter_u64_fetch(pm->pm_runcount) == 0)
-					break;
-				if (!pmc_cpu_is_active(cpu))
-					continue;
-				pmc_drain_pmc_cpu(pm, cpu);
-			}
-		} else
+		if (!active_drain) {
 			pmc_force_context_switch();
+			continue;
+		}
+		visited = false;
+		for (cpu = 0; cpu < pmc_cpu_max(); cpu++) {
+			if (!pmc_cpu_is_active(cpu) ||
+			    pm->pm_pcpu_state[cpu].pps_cpustate == 0)
+				continue;
+			if (counter_u64_fetch(pm->pm_runcount) == 0)
+				break;
+			pmc_drain_pmc_cpu(pm, cpu);
+			visited = true;
+		}
+		if (!visited && counter_u64_fetch(pm->pm_runcount) > 0)
+			pause("pmcidl", 1);
 	}
 	if (active_drain)
 		pmc_restore_cpu_binding(&pb);
@@ -3669,10 +3652,9 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 	 * UNASSIGNED, so it falls into the deferred-release path that does
 	 * no HW work (the rows were already freed here), which is exactly
 	 * what avoids a double release of a row the rotation layer owns.
+	 * The callee filters out everything but system-wide group members.
 	 */
-	if (pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL &&
-	    pm->pm_pmu->pe_group->pg_system)
-		pmu_sys_group_pre_release(pm);
+	pmu_sys_group_pre_release(pm);
 
 	ri = PMC_TO_ROWINDEX(pm);
 	mode = PMC_TO_MODE(pm);
@@ -4189,7 +4171,7 @@ pmc_find_pmc(pmc_id_t pmcid, struct pmc **pmc)
 static int
 pmc_start(struct pmc *pm)
 {
-	pmu_event_t *member, *pe;
+	pmu_event_t *member;
 	pmu_group_t *pg;
 	struct pmc_binding pb;
 	struct pmc_classdep *pcd;
@@ -4213,8 +4195,7 @@ pmc_start(struct pmc *pm)
 	 * not, and both have to funnel through the group layer rather than
 	 * the normal per-CPU system start path.
 	 */
-	if (!PMC_IS_VIRTUAL_MODE(mode) && pm->pm_pmu != NULL &&
-	    pm->pm_pmu->pe_group != NULL) {
+	if (!PMC_IS_VIRTUAL_MODE(mode) && pmu_group_from_pmc(pm) != NULL) {
 		error = pmu_sys_group_on_start(pm);
 		if (error == 0)
 			pm->pm_state = PMC_STATE_RUNNING;
@@ -4222,8 +4203,7 @@ pmc_start(struct pmc *pm)
 	}
 
 	po = pm->pm_owner;
-	pe = pmu_event_from_pmc(pm);
-	pg = pe != NULL ? pe->pe_group : NULL;
+	pg = pmu_group_from_pmc(pm);
 	sampling_pm = NULL;
 	if (pg != NULL) {
 		TAILQ_FOREACH(member, &pg->pg_events, pe_sibling) {
@@ -4275,7 +4255,7 @@ pmc_start(struct pmc *pm)
 		error = pmu_group_on_start(pm);
 		if (error != 0)
 			return (error);
-		if (pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL) {
+		if (pg != NULL) {
 			if ((pm->pm_flags & PMC_F_ATTACHED_TO_OWNER) != 0)
 				pmc_force_context_switch();
 			return (0);
@@ -4404,7 +4384,7 @@ pmc_stop(struct pmc *pm)
 	 * through to the normal per-CPU stop below, which would dereference
 	 * row 255 for a currently-evicted multiplex sibling.
 	 */
-	if (pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL) {
+	if (pmu_group_from_pmc(pm) != NULL) {
 		pmu_sys_group_on_stop(pm);
 		return (0);
 	}
@@ -4669,14 +4649,10 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 		pmc->pm_id = PMC_ID_MAKE_ID(defcpu, mode, class,
 		    PMC_ROW_UNASSIGNED);
 		defcpu = PMC_TO_CPU(pmc);
-		if (PMC_IS_SAMPLING_MODE(mode)) {
-			if (pa->pm_count < MAX(1, pmc_mincount))
-				pmc->pm_sc.pm_reloadcount = MAX(MAX(1,
-				    pmc_mincount), pa->pm_count);
-			else
-				pmc->pm_sc.pm_reloadcount = MAX(MAX(1,
-				    pmc_mincount), pa->pm_count);
-		} else
+		if (PMC_IS_SAMPLING_MODE(mode))
+			pmc->pm_sc.pm_reloadcount = MAX(MAX(1, pmc_mincount),
+			    pa->pm_count);
+		else
 			pmc->pm_sc.pm_initial = pa->pm_count;
 		error = pmu_group_on_allocate(pmc, pa);
 		if (error != 0) {
@@ -4858,12 +4834,32 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 }
 
 /*
+ * Grouped PMCs accept start/stop/attach control via the leader only;
+ * a group mid-release accepts none.  Ungrouped PMCs pass.
+ */
+static int
+pmc_group_leader_gate(struct pmc *pm)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+
+	pe = pmu_event_from_pmc(pm);
+	pg = pe != NULL ? pe->pe_group : NULL;
+	if (pg == NULL)
+		return (0);
+	if (pg->pg_releasing)
+		return (EBUSY);
+	if (pg->pg_committed && pg->pg_leader != pe)
+		return (ENOTTY);
+	return (0);
+}
+
+/*
  * Main body of PMC_OP_PMCATTACH.
  */
 static int
 pmc_do_op_pmcattach(struct thread *td, struct pmc_op_pmcattach a)
 {
-	pmu_event_t *pe;
 	pmu_group_t *pg;
 	struct pmc *pm;
 	struct proc *p;
@@ -4882,18 +4878,16 @@ pmc_do_op_pmcattach(struct thread *td, struct pmc_op_pmcattach a)
 	if (error != 0)
 		return (error);
 
-	pe = pmu_event_from_pmc(pm);
-	pg = pe != NULL ? pe->pe_group : NULL;
-	if (pg != NULL && pg->pg_releasing)
-		return (EBUSY);
-	if (pg != NULL && pg->pg_committed && pg->pg_leader != pe)
-		return (ENOTTY);
+	error = pmc_group_leader_gate(pm);
+	if (error != 0)
+		return (error);
+	pg = pmu_group_from_pmc(pm);
 
 	if (PMC_IS_SYSTEM_MODE(PMC_TO_MODE(pm)))
 		return (EXTERROR(EINVAL,
 		    "Cannot attach a system-mode PMC to a process"));
 
-	if (pe != NULL) {
+	if (pm->pm_pmu != NULL) {
 		if (pg == NULL || !pg->pg_committed)
 			return (EINVAL);
 		if (pg->pg_attach_proc != NULL)
@@ -4942,7 +4936,7 @@ pmc_do_op_pmcattach(struct thread *td, struct pmc_op_pmcattach a)
 static int
 pmc_do_op_pmcdetach(struct thread *td, struct pmc_op_pmcattach a)
 {
-	pmu_event_t *pe;
+	pmu_group_t *pg;
 	struct pmc *pm;
 	struct proc *p;
 	int error;
@@ -4956,9 +4950,8 @@ pmc_do_op_pmcdetach(struct thread *td, struct pmc_op_pmcattach a)
 	error = pmc_find_pmc(a.pm_pmc, &pm);
 	if (error != 0)
 		return (error);
-	pe = pmu_event_from_pmc(pm);
-	if (pe != NULL && pe->pe_group != NULL &&
-	    pe->pe_group->pg_committed)
+	pg = pmu_group_from_pmc(pm);
+	if (pg != NULL && pg->pg_committed)
 		return (EBUSY);
 
 	if ((p = pfind(a.pm_pid)) == NULL)
@@ -5116,7 +5109,7 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 				pm->pm_gv.pm_savedvalue = prw->pm_value;
 			mtx_pool_unlock_spin(pmc_mtxpool, pm);
 			if ((prw->pm_flags & PMC_F_OLDVALUE) != 0 &&
-			    pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL) {
+			    pmu_group_from_pmc(pm) != NULL) {
 				error = pmu_group_read_value(pm, valp);
 				if (error != 0)
 					return (error);
@@ -5154,7 +5147,7 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 		 * sibling counts the current window from zero; the group read
 		 * helper adds that live value to the saved software total.
 		 */
-		if (pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL &&
+		if (pmu_group_from_pmc(pm) != NULL &&
 		    PMC_ROW_IS_UNASSIGNED(pm)) {
 			mtx_pool_lock_spin(pmc_mtxpool, pm);
 			if ((prw->pm_flags & PMC_F_OLDVALUE) != 0)
@@ -5195,7 +5188,7 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 	}
 
 	if (error == 0 && (prw->pm_flags & PMC_F_OLDVALUE) != 0 &&
-	    pm->pm_pmu != NULL && pm->pm_pmu->pe_group != NULL)
+	    pmu_group_from_pmc(pm) != NULL)
 		error = pmu_group_read_value(pm, valp);
 
 #ifdef HWPMC_DEBUG
@@ -5847,7 +5840,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 
 	case PMC_OP_PMCSETCOUNT:
 	{
-		pmu_event_t *pe;
+		pmu_group_t *pg;
 		struct pmc *pm;
 		struct pmc_op_pmcsetcount sc;
 
@@ -5857,9 +5850,8 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		if ((error = pmc_find_pmc(sc.pm_pmcid, &pm)) != 0)
 			break;
 
-		pe = pmu_event_from_pmc(pm);
-		if (pe != NULL && pe->pe_group != NULL &&
-		    pe->pe_group->pg_committed) {
+		pg = pmu_group_from_pmc(pm);
+		if (pg != NULL && pg->pg_committed) {
 			error = EBUSY;
 			break;
 		}
@@ -5895,7 +5887,6 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 
 	case PMC_OP_PMCSTART:
 	{
-		pmu_event_t *pe;
 		pmc_id_t pmcid;
 		struct pmc *pm;
 		struct pmc_op_simple sp;
@@ -5920,18 +5911,8 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		    ("[pmc,%d] pmcid %x != handle %x", __LINE__,
 			pm->pm_handle, pmcid));
 
-		pe = pmu_event_from_pmc(pm);
-		if (pe != NULL && pe->pe_group != NULL &&
-		    pe->pe_group->pg_releasing) {
-			error = EBUSY;
+		if ((error = pmc_group_leader_gate(pm)) != 0)
 			break;
-		}
-		if (pe != NULL && pe->pe_group != NULL &&
-		    pe->pe_group->pg_committed &&
-		    pe->pe_group->pg_leader != pe) {
-			error = ENOTTY;
-			break;
-		}
 
 		if (pm->pm_state == PMC_STATE_RUNNING) /* already running */
 			break;
@@ -5952,7 +5933,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 
 	case PMC_OP_PMCSTOP:
 	{
-		pmu_event_t *pe;
+		pmu_group_t *pg;
 		pmc_id_t pmcid;
 		struct pmc *pm;
 		struct pmc_op_simple sp;
@@ -5975,21 +5956,11 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		    ("[pmc,%d] pmcid %x != handle %x", __LINE__,
 			pm->pm_handle, pmcid));
 
-		pe = pmu_event_from_pmc(pm);
-		if (pe != NULL && pe->pe_group != NULL &&
-		    pe->pe_group->pg_releasing) {
-			error = EBUSY;
+		if ((error = pmc_group_leader_gate(pm)) != 0)
 			break;
-		}
-		if (pe != NULL && pe->pe_group != NULL &&
-		    pe->pe_group->pg_committed &&
-		    pe->pe_group->pg_leader != pe) {
-			error = ENOTTY;
-			break;
-		}
 
-		if (pe == NULL || pe->pe_group == NULL ||
-		    !pe->pe_group->pg_committed)
+		pg = pmu_group_from_pmc(pm);
+		if (pg == NULL || !pg->pg_committed)
 			PMC_DOWNGRADE_SX();
 
 		if (pm->pm_state == PMC_STATE_STOPPED) /* already stopped */

@@ -394,6 +394,16 @@ pmu_event_from_pmc(struct pmc *pm)
 	return (pm != NULL ? pm->pm_pmu : NULL);
 }
 
+/* Group pm belongs to, or NULL for an ungrouped PMC. */
+pmu_group_t *
+pmu_group_from_pmc(struct pmc *pm)
+{
+	pmu_event_t *pe;
+
+	pe = pmu_event_from_pmc(pm);
+	return (pe != NULL ? pe->pe_group : NULL);
+}
+
 void
 pmu_event_destroy(pmu_event_t *pe)
 {
