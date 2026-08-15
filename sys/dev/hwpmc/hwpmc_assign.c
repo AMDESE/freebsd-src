@@ -402,11 +402,13 @@ pmu_validate_group(pmu_group_t *pg)
 	 * single bound CPU -- all-or-none placement is per-CPU, so
 	 * siblings on different CPUs could never be co-scheduled.
 	 *
-	 * System-wide SAMPLING (PMC_MODE_SS) groups are NOT supported by
-	 * this layer yet: multiplex rotation of sampling counters needs
-	 * sample-routing / po_sscount handling that is deliberately out of
-	 * scope here.  Reject them cleanly so userland falls back instead
-	 * of silently mis-sampling.
+	 * A system-wide group must also be COUNTING (PMC_MODE_SC).  Every
+	 * other system-wide mode -- PMC_MODE_SS today -- is rejected: those
+	 * PMCs are published in per-CPU hardware and fanned out to a row on
+	 * every CPU, and their owners carry po_sscount accounting, none of
+	 * which this layer's single-bound-CPU, all-or-none placement models.
+	 * Reject them cleanly so userland falls back instead of silently
+	 * mis-sampling.
 	 */
 	lmode = pg->pg_leader->pe_alloc.pm_mode;
 	sys = PMC_IS_SYSTEM_MODE(lmode);

@@ -4695,11 +4695,13 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 		/*
 		 * Deferred grouping/multiplex supports per-process virtual
 		 * groups (TC/TS) and system-wide COUNTING groups (SC).
-		 * System-wide SAMPLING (SS) multiplex needs sample-routing
-		 * and po_sscount handling the PMU grouping layer does not
-		 * implement yet (see pmu_validate_group()), so reject it
-		 * cleanly here rather than allocate a row that could never
-		 * be scheduled in.
+		 * Every other system-wide mode -- PMC_MODE_SS today -- is
+		 * rejected: those PMCs are published in per-CPU hardware and
+		 * fanned out to a row on every CPU, and their owners carry
+		 * po_sscount accounting, none of which the PMU grouping layer
+		 * models (see pmu_validate_group()).  Reject it cleanly here
+		 * rather than allocate a row that could never be scheduled
+		 * in.
 		 */
 		if (!PMC_IS_VIRTUAL_MODE(mode) && mode != PMC_MODE_SC) {
 			pmc_destroy_pmc_descriptor(pmc);
