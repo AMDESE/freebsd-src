@@ -991,46 +991,6 @@ pmc_link_target_process(struct pmc *pm, struct pmc_process *pp)
 #endif
 }
 
-void
-hwpmc_pmu_sx_xlock(void)
-{
-
-	sx_xlock(&pmc_sx);
-}
-
-void
-hwpmc_pmu_sx_xunlock(void)
-{
-
-	sx_xunlock(&pmc_sx);
-}
-
-/*
- * Cross-translation-unit shim so hwpmc_pmu.c can KASSERT on the global
- * SX lock without seeing the (file-static-by-convention) pmc_sx symbol.
- * Compiles to the usual sx_assert under WITNESS / INVARIANTS and to
- * nothing in production kernels.
- */
-void
-hwpmc_pmu_sx_assert_xlocked(void)
-{
-
-	sx_assert(&pmc_sx, SX_XLOCKED);
-}
-
-/*
- * Sleep on 'chan' while the caller holds pmc_sx.  Releases pmc_sx for
- * the duration of the sleep and reacquires it on wakeup; lets the
- * multiplex rotation kthread wait between windows while still being
- * promptly woken up by the rotation kick and stop paths.
- */
-int
-hwpmc_pmu_sx_sleep(void *chan, int timo, const char *wmesg)
-{
-
-	return (sx_sleep(chan, &pmc_sx, 0, wmesg, timo));
-}
-
 static void
 pmc_drain_pmc_cpu(struct pmc *pm, int cpu)
 {

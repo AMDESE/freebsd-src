@@ -258,10 +258,6 @@ void pmu_pp_kick_after_exec(struct pmc_process *pp);
 struct pmc_process *pmc_find_process_descriptor_pmu(struct proc *p,
     uint32_t mode);
 
-void hwpmc_pmu_sx_xlock(void);
-void hwpmc_pmu_sx_xunlock(void);
-int hwpmc_pmu_sx_sleep(void *chan, int timo, const char *wmesg);
-void hwpmc_pmu_sx_assert_xlocked(void);
 void hwpmc_pmu_force_context_switch(void);
 
 /*

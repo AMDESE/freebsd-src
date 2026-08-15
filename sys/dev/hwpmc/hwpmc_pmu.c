@@ -224,7 +224,7 @@ pmu_group_accounting_drain(pmu_group_t *pg, bool release)
 	maxloop = 100 * MAX(1, pg->pg_ncpu);
 #endif
 
-	hwpmc_pmu_sx_assert_xlocked();
+	sx_assert(&pmc_sx, SX_XLOCKED);
 	KASSERT(pg->pg_account_blocked,
 	    ("[pmu] draining unblocked group %u", pg->pg_id));
 
@@ -323,7 +323,7 @@ pmu_pp_stop_rotate(struct pmc_process *pp, const char *wmesg)
 	mtx_unlock_spin(&pp->pp_pmu_lock);
 	wakeup(&pp->pp_pmu_rot_needed);
 	while (pp->pp_pmu_rot_td != NULL)
-		(void)hwpmc_pmu_sx_sleep(&pp->pp_pmu_rot_td, 1, wmesg);
+		(void)sx_sleep(&pp->pp_pmu_rot_td, &pmc_sx, 0, wmesg, 1);
 	mtx_lock_spin(&pp->pp_pmu_lock);
 	KASSERT(pp->pp_pmu_rot_quiesce > 0,
 	    ("[pmu] rotation quiesce underflow"));
@@ -576,7 +576,7 @@ pmu_group_prepare_release(pmu_group_t *pg, struct pmc **members,
 	bool pp_unhashed;
 	u_int n;
 
-	hwpmc_pmu_sx_assert_xlocked();
+	sx_assert(&pmc_sx, SX_XLOCKED);
 	KASSERT(pg != NULL && members != NULL,
 	    ("[pmu] invalid group release preparation"));
 	KASSERT(capacity >= pg->pg_nevents,
@@ -674,7 +674,7 @@ pmu_group_release(pmu_group_t *pg)
 	if (pg == NULL)
 		return;
 
-	hwpmc_pmu_sx_assert_xlocked();
+	sx_assert(&pmc_sx, SX_XLOCKED);
 	KASSERT(TAILQ_EMPTY(&pg->pg_events) && pg->pg_nevents == 0 &&
 	    pg->pg_leader == NULL,
 	    ("[pmu] freeing non-empty group %u", pg->pg_id));
@@ -721,7 +721,7 @@ pmu_group_on_attach(struct pmc *pm, struct proc *p)
 	pmu_group_t *pg;
 	struct pmc_process *pp;
 
-	hwpmc_pmu_sx_assert_xlocked();
+	sx_assert(&pmc_sx, SX_XLOCKED);
 	pe = pmu_event_from_pmc(pm);
 	if (pe == NULL || pe->pe_group == NULL)
 		return (0);
@@ -898,7 +898,7 @@ pmu_group_on_stop(struct pmc *pm)
 	pmu_group_t *pg;
 	struct pmc_process *pp;
 
-	hwpmc_pmu_sx_assert_xlocked();
+	sx_assert(&pmc_sx, SX_XLOCKED);
 	pe = pmu_event_from_pmc(pm);
 	if (pe == NULL || pe->pe_group == NULL)
 		return;
@@ -1328,7 +1328,7 @@ pmu_pp_release_all(struct pmc_process *pp)
 {
 	pmu_group_t *pg;
 
-	hwpmc_pmu_sx_assert_xlocked();
+	sx_assert(&pmc_sx, SX_XLOCKED);
 
 	if (pp == NULL)
 		return;
@@ -1348,8 +1348,7 @@ pmu_pp_release_all(struct pmc_process *pp)
 	 */
 	pmu_pp_stop_rotate(pp, "muxpurge");
 	while (pp->pp_pmu_refs != 0)
-		(void)hwpmc_pmu_sx_sleep(&pp->pp_pmu_refs, 1,
-		    "muxrefs");
+		(void)sx_sleep(&pp->pp_pmu_refs, &pmc_sx, 0, "muxrefs", 1);
 
 	/*
 	 * Schedule out every group that is currently bound to pp, then
@@ -1381,7 +1380,7 @@ pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp)
 	pmu_event_t *pe;
 	pmu_group_t *other;
 
-	hwpmc_pmu_sx_assert_xlocked();
+	sx_assert(&pmc_sx, SX_XLOCKED);
 	KASSERT(pg != NULL && pp != NULL && pg->pg_pp == pp,
 	    ("[pmu] invalid group target detach"));
 	KASSERT(!pg->pg_releasing,
@@ -1470,7 +1469,7 @@ void
 pmu_pp_kick_after_exec(struct pmc_process *pp)
 {
 
-	hwpmc_pmu_sx_assert_xlocked();
+	sx_assert(&pmc_sx, SX_XLOCKED);
 	pmu_pp_kick_rotate(pp);
 }
 
@@ -1671,15 +1670,15 @@ pmu_pp_rotate_thread(void *arg)
 	struct pmc_process *pp = arg;
 	int period_ticks;
 
-	hwpmc_pmu_sx_xlock();
+	sx_xlock(&pmc_sx);
 	while (pp->pp_pmu_rot_running) {
 		period_ticks = (pmu_mux_period_ms * hz) / 1000;
 		if (period_ticks < 1)
 			period_ticks = 1;
 		/* §7.4: jitter breaks phase-lock with periodic loads. */
 		period_ticks += prng32_bounded(period_ticks / 4 + 1);
-		(void)hwpmc_pmu_sx_sleep(&pp->pp_pmu_rot_needed,
-		    period_ticks, "muxrot");
+		(void)sx_sleep(&pp->pp_pmu_rot_needed, &pmc_sx, 0, "muxrot",
+		    period_ticks);
 		if (!pp->pp_pmu_rot_running)
 			break;
 		pmu_pp_rotate_one(pp);
@@ -1689,7 +1688,7 @@ pmu_pp_rotate_thread(void *arg)
 	pp->pp_pmu_rot_running = false;
 	pp->pp_pmu_rot_td = NULL;
 	wakeup(&pp->pp_pmu_rot_td);
-	hwpmc_pmu_sx_xunlock();
+	sx_xunlock(&pmc_sx);
 	kthread_exit();
 }
 
@@ -1919,7 +1918,7 @@ pmu_syscpu_stop_rotate(struct pmu_syscpu *sc, const char *wmesg)
 	sc->sc_needed = false;
 	wakeup(&sc->sc_needed);
 	while (sc->sc_td != NULL)
-		(void)hwpmc_pmu_sx_sleep(&sc->sc_td, 1, wmesg);
+		(void)sx_sleep(&sc->sc_td, &pmc_sx, 0, wmesg, 1);
 	KASSERT(sc->sc_quiesce > 0,
 	    ("[pmu] system rotation quiesce underflow"));
 	sc->sc_quiesce--;
@@ -2186,15 +2185,15 @@ pmu_syscpu_rotate_thread(void *arg)
 	struct pmu_syscpu *sc = &pmu_syscpu[cpu];
 	int period_ticks;
 
-	hwpmc_pmu_sx_xlock();
+	sx_xlock(&pmc_sx);
 	while (sc->sc_running) {
 		period_ticks = (pmu_mux_period_ms * hz) / 1000;
 		if (period_ticks < 1)
 			period_ticks = 1;
 		/* §7.4: jitter breaks phase-lock with periodic loads. */
 		period_ticks += prng32_bounded(period_ticks / 4 + 1);
-		(void)hwpmc_pmu_sx_sleep(&sc->sc_needed, period_ticks,
-		    "muxsys");
+		(void)sx_sleep(&sc->sc_needed, &pmc_sx, 0, "muxsys",
+		    period_ticks);
 		if (!sc->sc_running)
 			break;
 		pmu_syscpu_rotate_one(cpu);
@@ -2204,6 +2203,6 @@ pmu_syscpu_rotate_thread(void *arg)
 	sc->sc_running = false;
 	sc->sc_td = NULL;
 	wakeup(&sc->sc_td);
-	hwpmc_pmu_sx_xunlock();
+	sx_xunlock(&pmc_sx);
 	kthread_exit();
 }
