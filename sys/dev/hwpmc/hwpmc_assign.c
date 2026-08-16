@@ -239,8 +239,24 @@ pmu_unassign_group(pmu_group_t *pg, int cpu)
 		n = PMC_TO_ROWINDEX(pm);
 		mode = PMC_TO_MODE(pm);
 		pcd = hwpmc_ri_to_classdep(n, &adjri);
-		if (pcd != NULL)
+		if (pcd != NULL) {
+			/*
+			 * Unconfigure before releasing: pcd_config_pmc is
+			 * what clears the row's phw_pmc back-pointer, and
+			 * pcd_release_pmc asserts that it is already NULL.
+			 *
+			 * A system row is only ever configured on its bound
+			 * CPU.  A virtual row is configured by csw_in on
+			 * whichever CPU ran the target, and rotation can
+			 * reclaim it before that thread switches out again,
+			 * so sweep every CPU still pointing at this PMC.
+			 */
+			if (sys)
+				(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
+			else
+				hwpmc_unconfigure_row_all_cpus(pm, n);
 			(void)pcd->pcd_release_pmc(cpu, adjri, pm);
+		}
 		pm->pm_id = PMC_ID_MAKE_ID(PMC_CPU_ANY, mode,
 		    pe->pe_alloc.pm_class, PMC_ROW_UNASSIGNED);
 		/* Undo the disposition we took in pmu_assign_one(). */
