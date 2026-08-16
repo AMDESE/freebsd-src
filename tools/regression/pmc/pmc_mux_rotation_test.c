@@ -60,6 +60,24 @@ static const char *event_pool[] = {
 	"ls_mab_alloc.all",
 	"ls_int_taken",
 	"ls_stlf",
+	/*
+	 * Native Zen names.  The generic aliases above are not all mapped on
+	 * every model, and these tests need enough distinct events to fill
+	 * several oversubscribed groups at once.  Unsupported names are
+	 * skipped by the allocation loops, so listing extras is harmless.
+	 */
+	"ex_ret_brn",
+	"ex_ret_brn_misp",
+	"ex_ret_brn_tkn",
+	"ex_ret_near_ret",
+	"ex_ret_cond",
+	"ex_ret_ind_brch_instr",
+	"bp_l2_btb_correct",
+	"bp_dyn_ind_pred",
+	"bp_de_redirect",
+	"ls_mab_alloc.load_store_allocations",
+	"ls_dmnd_fills_from_sys.local_l2",
+	"ls_any_fills_from_sys.local_l2",
 };
 #define	POOL_SIZE	(int)(sizeof(event_pool) / sizeof(event_pool[0]))
 

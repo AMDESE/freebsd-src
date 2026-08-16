@@ -124,7 +124,7 @@ main(void)
 		err(1, "pmc_group_create");
 
 	allocated = 0;
-	for (i = 0; i < target; i++) {
+	for (i = 0; i < MAX_EVENTS && allocated < target; i++) {
 		uint32_t flags = 0;
 
 		if (allocated == 0)

@@ -68,7 +68,7 @@ require_amd() {
 t_basic_group() {
 	out="${LOGDIR}/basic.out"
 	${PMCSTAT} -b \
-	    -p '{instructions,unhalted-cycles,ls_dispatch.all}' \
+	    -p '{instructions,unhalted-cycles,ls_dispatch.ld_st_dispatch}' \
 	    -- sh -c /usr/bin/true \
 	    >"${out}" 2>&1
 	rc=$?
@@ -88,7 +88,7 @@ t_two_groups() {
 	out="${LOGDIR}/two.out"
 	${PMCSTAT} -b  \
 	    -p '{instructions,unhalted-cycles}' \
-	    -p '{ls_alloc_mab_count, ls_not_halted_cyc, ls_dispatch.all}' \
+	    -p '{ls_alloc_mab_count, ls_not_halted_cyc, ls_dispatch.ld_st_dispatch}' \
 	    -- sh -c /usr/bin/true \
 	    >"${out}" 2>&1
 	rc=$?
@@ -104,7 +104,7 @@ t_two_groups() {
 t_oversubscribe() {
 	out="${LOGDIR}/mux.out"
 	${PMCSTAT} -b -O /dev/null \
-	    -p '{instructions,unhalted-cycles,ls_alloc_mab_count, ls_not_halted_cyc, ls_dispatch.all,ls_stlf, ls_int_taken}' \
+	    -p '{instructions,unhalted-cycles,ls_alloc_mab_count, ls_not_halted_cyc, ls_dispatch.ld_st_dispatch,ls_stlf, ls_int_taken}' \
 	    -- sh -c /usr/bin/true \
 	    >"${out}" 2>&1
 	rc=$?
@@ -139,8 +139,9 @@ t_sampling_group() {
 	log="${LOGDIR}/samples.log"
 	out="${LOGDIR}/sampling.out"
 	${PMCSTAT} -b \
-	    -P '{instructions,unhalted-cycles,ls_dispatch.all}' \
-	    -- sh -c /usr/bin/true \
+	    -P '{instructions,unhalted-cycles,ls_dispatch.ld_st_dispatch}' \
+	    -O "${log}" \
+	    -- sh -c 'i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done' \
 	    >"${out}" 2>&1
 	rc=$?
 	if [ "${rc}" -ne 0 ]; then
@@ -234,7 +235,7 @@ t_mixed() {
 	out="${LOGDIR}/mixed.out"
 	${PMCSTAT} -b \
 	    -p '{instructions,unhalted-cycles}' \
-	    -p ls_dispatch.all \
+	    -p ls_dispatch.ld_st_dispatch \
 	    -- sh -c /usr/bin/true \
 	    >"${out}" 2>&1
 	rc=$?

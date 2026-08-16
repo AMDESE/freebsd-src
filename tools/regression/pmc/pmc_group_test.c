@@ -19,7 +19,13 @@
 #include <string.h>
 #include <unistd.h>
 
-#define	TEST_DEFERRED_HANDLE_SLOTS	31
+/*
+ * Must match PMC_HANDLE_DEFERRED_SLOTS in <sys/pmc.h>, which is only
+ * visible under _KERNEL and so cannot be included here.  A group may hold
+ * PMC_GROUP_MAX_MEMBERS (32) members, so the pool has to supply that many
+ * concurrent deferred handles per (owner, CPU).
+ */
+#define	TEST_DEFERRED_HANDLE_SLOTS	32
 
 static int
 is_amd(void)
