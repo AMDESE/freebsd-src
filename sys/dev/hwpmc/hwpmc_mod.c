@@ -4000,6 +4000,34 @@ hwpmc_row_is_unallocated(int cpu, int ri)
 }
 
 /*
+ * Unconfigure row 'ri' on every CPU whose hardware still points at 'pm'.
+ *
+ * A virtual-mode PMC is configured by csw_in on whichever CPU runs the
+ * target and normally unconfigured by the matching csw_out.  Group
+ * rotation can reclaim the row before that happens, so it has to clear
+ * the stale back-pointers itself; pcd_release_pmc asserts they are gone.
+ */
+void
+hwpmc_unconfigure_row_all_cpus(struct pmc *pm, int ri)
+{
+	struct pmc_classdep *pcd;
+	struct pmc_hw *phw;
+	int adjri, cpu;
+
+	pcd = pmc_ri_to_classdep(md, ri, &adjri);
+	if (pcd == NULL)
+		return;
+	for (cpu = 0; cpu < pmc_cpu_max(); cpu++) {
+		if (!pmc_cpu_is_active(cpu) || pmc_pcpu[cpu] == NULL)
+			continue;
+		phw = pmc_pcpu[cpu]->pc_hwpmcs[ri];
+		if (phw == NULL || phw->phw_pmc != pm)
+			continue;
+		(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
+	}
+}
+
+/*
  * Program and start one system-wide PMC's hardware on its bound CPU.
  * Used by the PMU grouping layer's per-CPU multiplex rotation (see
  * hwpmc_pmu.c).  pm->pm_gv.pm_savedvalue carries the cumulative count
@@ -6172,6 +6200,27 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		gr.pm_leader = pm->pm_handle;
 		gr.pm_nmembers = pg->pg_nevents;
 		if (capacity == 0 || capacity < pg->pg_nevents) {
+			/*
+			 * A size query reports the group's times too: they
+			 * do not depend on the member array, and a caller
+			 * that only wants enabled/running has no reason to
+			 * supply one.  A short buffer still fails E2BIG.
+			 */
+			if (capacity == 0) {
+				struct pmu_group_time_snapshot times;
+
+				mtx_pool_lock_spin(pmc_mtxpool, pg);
+				pmu_group_time_snapshot_locked(pg, &times,
+				    cpu_ticks());
+				mtx_pool_unlock_spin(pmc_mtxpool, pg);
+				gr.pm_gflags = times.pgts_system ?
+				    PMC_GROUP_F_TIME_WALL_NS :
+				    PMC_GROUP_F_TIME_THREAD_NS;
+				gr.pm_enabled = times.pgts_enabled;
+				gr.pm_running = times.pgts_running;
+				gr.pm_enabled_wall = times.pgts_enabled_wall;
+				gr.pm_wall = times.pgts_wall;
+			}
 			error = copyout(&gr, arg, sizeof(gr));
 			if (error == 0 && capacity != 0)
 				error = E2BIG;

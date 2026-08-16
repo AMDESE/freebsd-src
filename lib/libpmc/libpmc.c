@@ -1431,14 +1431,17 @@ pmc_group_read(pmc_id_t leader, uint32_t *nmembers,
 		if (capacity != 0) {
 			memcpy(members, snapshot->pm_members,
 			    snapshot->pm_nmembers * sizeof(members[0]));
-			if (times != NULL) {
-				times->pgt_enabled = snapshot->pm_enabled;
-				times->pgt_running = snapshot->pm_running;
-				times->pgt_enabled_wall =
-				    snapshot->pm_enabled_wall;
-				times->pgt_wall = snapshot->pm_wall;
-				times->pgt_flags = snapshot->pm_gflags;
-			}
+		}
+		/*
+		 * The times do not depend on the member array: a size
+		 * query (capacity 0, members NULL) still reports them.
+		 */
+		if (times != NULL) {
+			times->pgt_enabled = snapshot->pm_enabled;
+			times->pgt_running = snapshot->pm_running;
+			times->pgt_enabled_wall = snapshot->pm_enabled_wall;
+			times->pgt_wall = snapshot->pm_wall;
+			times->pgt_flags = snapshot->pm_gflags;
 		}
 	} else if (errno == E2BIG) {
 		*nmembers = snapshot->pm_nmembers;

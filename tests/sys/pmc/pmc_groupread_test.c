@@ -384,6 +384,66 @@ ATF_TC_BODY(sampling_live, tc)
 	ATF_REQUIRE(fclose(logfile) == 0);
 }
 
+/*
+ * A size query (*nmembers == 0, members == NULL) must still report the
+ * group's times.  Callers that only want enabled/running have no reason
+ * to supply a member array.
+ */
+ATF_TC_WITHOUT_HEAD(times_without_members);
+ATF_TC_BODY(times_without_members, tc)
+{
+	struct pmc_group_member member;
+	struct pmc_group_times query_times, member_times;
+	struct test_group group;
+	uint32_t n;
+
+	require_hwpmc();
+	ATF_REQUIRE_MSG(setup_group(&group, 1, 0) == 0,
+	    "setup_group failed: %s", strerror(errno));
+	if (pmc_attach(group.tg_ids[0], getpid()) != 0) {
+		ATF_CHECK_MSG(false, "pmc_attach failed: %s", strerror(errno));
+		cleanup_group(&group);
+		return;
+	}
+	if (pmc_start(group.tg_ids[0]) != 0) {
+		ATF_CHECK_MSG(false, "pmc_start failed: %s", strerror(errno));
+		cleanup_group(&group);
+		return;
+	}
+	group.tg_started = true;
+
+	spin();
+	memset(&query_times, 0, sizeof(query_times));
+	n = 0;
+	if (pmc_group_read(group.tg_ids[0], &n, NULL, &query_times) != 0) {
+		ATF_CHECK_MSG(false, "size query failed: %s", strerror(errno));
+		cleanup_group(&group);
+		return;
+	}
+	ATF_CHECK_EQ(n, group.tg_nmembers);
+	ATF_CHECK(query_times.pgt_enabled > 0);
+	ATF_CHECK(query_times.pgt_running > 0);
+	ATF_CHECK(query_times.pgt_enabled_wall > 0);
+	ATF_CHECK(query_times.pgt_wall > 0);
+	ATF_CHECK(query_times.pgt_running <= query_times.pgt_enabled);
+	ATF_CHECK_EQ(query_times.pgt_flags, PMC_GROUP_F_TIME_THREAD_NS);
+
+	/* The same times must come back when members are requested too. */
+	memset(&member_times, 0, sizeof(member_times));
+	n = 1;
+	if (pmc_group_read(group.tg_ids[0], &n, &member, &member_times) != 0) {
+		ATF_CHECK_MSG(false, "member read failed: %s",
+		    strerror(errno));
+		cleanup_group(&group);
+		return;
+	}
+	ATF_CHECK(member_times.pgt_enabled >= query_times.pgt_enabled);
+	ATF_CHECK(member_times.pgt_running >= query_times.pgt_running);
+	ATF_CHECK_EQ(member_times.pgt_flags, query_times.pgt_flags);
+
+	cleanup_group(&group);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 
@@ -391,5 +451,6 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, live_snapshot);
 	ATF_TP_ADD_TC(tp, sampling_member);
 	ATF_TP_ADD_TC(tp, sampling_live);
+	ATF_TP_ADD_TC(tp, times_without_members);
 	return (atf_no_error());
 }
