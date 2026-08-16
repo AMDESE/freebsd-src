@@ -175,15 +175,41 @@ pmu_group_running_stop_locked(pmu_group_t *pg, uint64_t now)
 static uint64_t
 pmu_group_ticks_to_ns(uint64_t ticks, uint64_t tickrate)
 {
-	__uint128_t ns;
+	uint64_t frac, quot, rem, secs;
 
 	if (tickrate == 0)
 		return (0);
-	ns = (__uint128_t)ticks * 1000000000;
-	ns /= tickrate;
-	if (ns > UINT64_MAX)
+
+	/*
+	 * Scale without a 128-bit intermediate, as __uint128_t is not
+	 * available on all platforms and its division needs a compiler
+	 * runtime helper the kernel does not link against:
+	 *
+	 *	ticks * 1e9 / tickrate == (ticks / tickrate) * 1e9 +
+	 *				  (ticks % tickrate) * 1e9 / tickrate
+	 *
+	 * This is the decomposition used by __utime64_scale32_floor().
+	 */
+	quot = ticks / tickrate;
+	rem = ticks % tickrate;
+
+	if (quot > UINT64_MAX / 1000000000)
 		return (UINT64_MAX);
-	return ((uint64_t)ns);
+	secs = quot * 1000000000;
+
+	/*
+	 * rem is below tickrate, so the multiplication below is exact for
+	 * every tick rate under ~18GHz.  Scale down first above that, which
+	 * costs at most a nanosecond of precision.
+	 */
+	if (rem <= UINT64_MAX / 1000000000)
+		frac = rem * 1000000000 / tickrate;
+	else
+		frac = rem / (tickrate / 1000000000);
+
+	if (secs > UINT64_MAX - frac)
+		return (UINT64_MAX);
+	return (secs + frac);
 }
 
 void
