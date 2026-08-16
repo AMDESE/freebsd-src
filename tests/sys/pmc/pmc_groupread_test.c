@@ -129,13 +129,25 @@ ATF_TC_BODY(capacity_and_order, tc)
 	ATF_REQUIRE_MSG(setup_group(&group, 2, 1) == 0,
 	    "setup_group failed: %s", strerror(errno));
 
+	/*
+	 * A size query reports the member count, and fills in the times if
+	 * the caller asked for them: 'members' and 'times' are independent
+	 * arguments, and a caller that wants neither passes NULL for both.
+	 */
 	memset(&times, 0xa5, sizeof(times));
 	memcpy(&times_before, &times, sizeof(times));
 	n = 0;
 	ATF_CHECK_EQ(pmc_group_read(group.tg_ids[group.tg_leader], &n, NULL,
 	    &times), 0);
 	ATF_CHECK_EQ(n, 2);
-	ATF_CHECK(memcmp(&times, &times_before, sizeof(times)) == 0);
+	ATF_CHECK(memcmp(&times, &times_before, sizeof(times)) != 0);
+	ATF_CHECK(times.pgt_running <= times.pgt_enabled);
+
+	/* A size query with no times argument must still work. */
+	n = 0;
+	ATF_CHECK_EQ(pmc_group_read(group.tg_ids[group.tg_leader], &n, NULL,
+	    NULL), 0);
+	ATF_CHECK_EQ(n, 2);
 
 	memset(members, 0xa5, sizeof(members));
 	memcpy(members_before, members, sizeof(members));
