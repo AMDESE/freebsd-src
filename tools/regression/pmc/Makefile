@@ -29,7 +29,7 @@ CFLAGS+=	-O -g -Wall
 
 # Kernel ABI tests (need hwpmc(4) loaded and root to run).
 KTESTS=		pmc_group_test pmc_mux_test pmc_mux_works_test \
-		pmc_mux_drain_test pmc_mux_rotation_test
+		pmc_mux_drain_test pmc_mux_rotation_test pmc_group_fuzz
 
 # Userland-only test (parser unit test, no PMU access).
 UTESTS=		test_libpmcstat_group
@@ -57,6 +57,9 @@ pmc_mux_rotation_test: ${.CURDIR}/pmc_mux_rotation_test.c
 pmc_mux_drain_test: ${.CURDIR}/pmc_mux_drain_test.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc -lpthread
 
+pmc_group_fuzz: ${.CURDIR}/pmc_group_fuzz.c
+	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
+
 # libpmcstat is INTERNALLIB (no .so installed), so build the parser TU
 # directly into the test binary.
 test_libpmcstat_group: ${.CURDIR}/test_libpmcstat_group.c \
@@ -79,6 +82,8 @@ check-root: ${KTESTS}
 	./pmc_mux_rotation_test
 	@echo "==> pmc_mux_drain_test"
 	./pmc_mux_drain_test
+	@echo "==> pmc_group_fuzz"
+	./pmc_group_fuzz 20000
 	@if [ -r ${.CURDIR}/pmcstat_test.sh ]; then \
 		echo "==> pmcstat(8) shell tests"; \
 		sh ${.CURDIR}/pmcstat_test.sh; \
