@@ -606,6 +606,16 @@ pmu_group_commit(pmu_group_t *pg)
 		pg->pg_system = true;
 		pg->pg_cpu = pg->pg_leader->pe_alloc.pm_cpu;
 
+		/*
+		 * Only the questions that cannot change later are asked
+		 * here.  pmu_group_can_fit() above has already proved the
+		 * group fits the PMU at all; whether the rows happen to be
+		 * free is a property of this instant, and by the time the
+		 * caller reaches pmc_start it may have changed either way.
+		 * pmu_sys_group_on_start() makes that call and fails
+		 * ENOSPC for a group that cannot defer, so committing here
+		 * cannot leave a group counting nothing.
+		 */
 		error = pmu_group_can_place(pg, p, pg->pg_cpu);
 		PMCDBG5(PMC, OPS, 1,
 		    "group_commit: SYS gid=%u cpu=%d nevents=%u "
@@ -613,8 +623,6 @@ pmu_group_commit(pmu_group_t *pg)
 		    pg->pg_nevents, error, (int)pg->pg_defer_ok);
 		if (error != 0 && error != ENOSPC)
 			return (error);
-		if (error == ENOSPC && !pg->pg_defer_ok)
-			return (ENOSPC);
 
 		pg->pg_committed = true;
 		return (0);
