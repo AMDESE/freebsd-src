@@ -531,8 +531,7 @@ amd_switch_out(struct pmc_cpu *pc __pmcdbg_used,
 }
 
 /*
- * Validate whether an event can use row 'ri' (used by grouping assign).
- * Exposed to the PMU grouping layer via pcd_can_assign_pmc.
+ * Check if an event can use row index 'ri'.
  */
 static int
 amd_can_assign_pmc(int ri, struct pmc *pm, const struct pmc_op_pmcallocate *a)
@@ -598,11 +597,7 @@ amd_can_assign_pmc(int ri, struct pmc *pm, const struct pmc_op_pmcallocate *a)
 }
 
 /*
- * Build a pmc_sched_constraint for the requested allocation.  Row
- * mask is derived from the dynamically-detected
- * amd_{core,l3,df}_npmcs - the same counters init populates from
- * EXTPERFMON or the per-family defaults - so this works on every Zen
- * generation without per-uarch code paths.
+ * Return scheduling constraints for AMD PMCs.
  */
 static int
 amd_get_sched_constraint(struct pmc *pm __unused,
@@ -1619,7 +1614,7 @@ pmc_amd_initialize(void)
 	pcd->pcd_write_pmc	= amd_write_pmc;
 	pcd->pcd_get_caps	= amd_get_caps;
 
-	/* PMU event-grouping / multiplex constraint providers. */
+	/* Grouping and multiplex constraint functions. */
 	pcd->pcd_can_assign_pmc		= amd_can_assign_pmc;
 	pcd->pcd_get_sched_constraint	= amd_get_sched_constraint;
 

@@ -129,11 +129,7 @@ ATF_TC_BODY(capacity_and_order, tc)
 	ATF_REQUIRE_MSG(setup_group(&group, 2, 1) == 0,
 	    "setup_group failed: %s", strerror(errno));
 
-	/*
-	 * A size query reports the member count, and fills in the times if
-	 * the caller asked for them: 'members' and 'times' are independent
-	 * arguments, and a caller that wants neither passes NULL for both.
-	 */
+	/* Size query returns member count and times if requested. */
 	memset(&times, 0xa5, sizeof(times));
 	memcpy(&times_before, &times, sizeof(times));
 	n = 0;
@@ -143,7 +139,7 @@ ATF_TC_BODY(capacity_and_order, tc)
 	ATF_CHECK(memcmp(&times, &times_before, sizeof(times)) != 0);
 	ATF_CHECK(times.pgt_running <= times.pgt_enabled);
 
-	/* A size query with no times argument must still work. */
+	/* Size query without times must succeed. */
 	n = 0;
 	ATF_CHECK_EQ(pmc_group_read(group.tg_ids[group.tg_leader], &n, NULL,
 	    NULL), 0);
@@ -397,9 +393,7 @@ ATF_TC_BODY(sampling_live, tc)
 }
 
 /*
- * A size query (*nmembers == 0, members == NULL) must still report the
- * group's times.  Callers that only want enabled/running have no reason
- * to supply a member array.
+ * Verify that a size query returns group times.
  */
 ATF_TC_WITHOUT_HEAD(times_without_members);
 ATF_TC_BODY(times_without_members, tc)
@@ -440,7 +434,7 @@ ATF_TC_BODY(times_without_members, tc)
 	ATF_CHECK(query_times.pgt_running <= query_times.pgt_enabled);
 	ATF_CHECK_EQ(query_times.pgt_flags, PMC_GROUP_F_TIME_THREAD_NS);
 
-	/* The same times must come back when members are requested too. */
+	/* Verify times with member read. */
 	memset(&member_times, 0, sizeof(member_times));
 	n = 1;
 	if (pmc_group_read(group.tg_ids[0], &n, &member, &member_times) != 0) {

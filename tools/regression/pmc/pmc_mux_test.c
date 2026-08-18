@@ -1,15 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Regression test: a SINGLE group with more events than the class has
- * HW counters must be rejected at commit time.  Within-group placement
- * is strictly all-or-none -- there is no longer an in-group multiplex
- * mode that splits one group across rotation windows.  Inter-group
- * rotation (multiple groups whose union exceeds HW) is exercised by
- * pmc_mux_works_test.c instead.
- *
- * Build:  cc -o pmc_mux_test pmc_mux_test.c -lpmc
- * Run:    sudo ./pmc_mux_test     (requires hwpmc loaded, AMD CPU)
+ * Test rejection of single groups larger than hardware capacity.
  */
 
 #include <sys/types.h>
@@ -65,13 +57,7 @@ is_amd(void)
 	    strstr(buf, "HygonGenuine") != NULL);
 }
 
-/*
- * Probe the actual per-class core PMC capacity by allocating
- * "instructions" repeatedly.  pmc_npmc(0) sums all classes
- * (SOFT/TSC/K8/IBS) and is therefore meaningless for sizing a
- * single core-class group: on Zen5 it returns 47 even though only
- * 6 core counters are available.
- */
+/* Return count of available core hardware counters. */
 static int
 probe_core_pmcs(void)
 {
@@ -108,11 +94,7 @@ main(void)
 		return (77);
 	}
 
-	/*
-	 * Build a single group with (core + 2) events and demand that
-	 * commit reject it.  Capped at MAX_EVENTS so we don't try to
-	 * exceed our event_pool[].
-	 */
+	/* Create group with (core + 2) events. */
 	target = core + 2;
 	if (target > MAX_EVENTS) {
 		printf("SKIP: %d-counter CPU exceeds test pool (%d)\n",
@@ -131,7 +113,7 @@ main(void)
 			flags |= PMC_F_GROUP_MUX;
 		if (pmc_allocate_group(events[i], PMC_MODE_TC, flags,
 		    PMC_CPU_ANY, &ids[allocated], 0) < 0) {
-			/* Some events may not be supported on this CPU. */
+			/* Skip unsupported event. */
 			continue;
 		}
 		if (pmc_group_add(gid, ids[allocated], allocated == 0) < 0) {
@@ -159,12 +141,7 @@ main(void)
 			(void)pmc_release(ids[i]);
 	}
 
-	/*
-	 * Under the strictly-atomic group scheduler a single group
-	 * whose nevents exceeds the class total must be rejected here:
-	 * within-group placement is all-or-none and would otherwise
-	 * sacrifice that invariant the moment we tried to schedule it.
-	 */
+	/* Single group exceeding hardware capacity must fail commit with ENOSPC. */
 	if (rc == 0) {
 		fprintf(stderr,
 		    "FAIL: pmc_group_commit succeeded for %d events on "

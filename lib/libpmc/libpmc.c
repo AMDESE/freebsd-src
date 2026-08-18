@@ -1432,10 +1432,7 @@ pmc_group_read(pmc_id_t leader, uint32_t *nmembers,
 			memcpy(members, snapshot->pm_members,
 			    snapshot->pm_nmembers * sizeof(members[0]));
 		}
-		/*
-		 * The times do not depend on the member array: a size
-		 * query (capacity 0, members NULL) still reports them.
-		 */
+		/* A size query also returns group times. */
 		if (times != NULL) {
 			times->pgt_enabled = snapshot->pm_enabled;
 			times->pgt_running = snapshot->pm_running;
@@ -1454,7 +1451,7 @@ pmc_group_read(pmc_id_t leader, uint32_t *nmembers,
 }
 
 /*
- * Read one group leader value together with its enabled and running times.
+ * Read group leader value and execution times.
  */
 int
 pmc_read_pair(pmc_id_t pmc, pmc_value_t *value, uint64_t *enabled,
@@ -1763,7 +1760,7 @@ pmc_init(void)
 	if (PMC_CALL(PMC_OP_GETMODULEVERSION, &abi_version) < 0)
 		return (pmc_syscall = -1);
 
-	/* ignore the patch number for the comparison */
+	/* Ignore patch number in version check. */
 	if ((abi_version & 0xFFFF0000) != (PMC_VERSION & 0xFFFF0000)) {
 		errno  = EPROGMISMATCH;
 		return (pmc_syscall = -1);

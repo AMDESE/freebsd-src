@@ -1,24 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Regression test for the hwpmc multiplex rotation policy (spec
- * FreeBSDMultiplexingReqV1.3 sections 7.2-7.5).  Four sub-tests:
- *
- *   1. Fairness: three identical-size MUX groups over capacity get
- *      running/enabled ratios within 1.25x of one another.
- *   2. Pinned immunity: a non-MUX group coexisting with rotating MUX
- *      groups keeps running == enabled (it is never evicted).
- *   3. Escalation: groups A+B fill the counters and a larger group C
- *      cannot fit after a single eviction; C must still get hardware
- *      time within 10 seconds (multi-victim escalation).
- *   4. Idle self-stop / re-kick: while MUX groups rotate a pmu_rot_*
- *      kthread exists; once the survivors all fit it exits; starting a
- *      new unplaced MUX group brings it back within two periods.
- *
- * Build:  cc -o pmc_mux_rotation_test pmc_mux_rotation_test.c -lpmc
- * Run:    sudo ./pmc_mux_rotation_test   (requires hwpmc loaded, AMD CPU)
- *
- * Exit codes: 0 = pass, 1 = fail, 77 = skip.
+ * Test PMU multiplex rotation policy.
  */
 
 #include <sys/types.h>
@@ -60,12 +43,7 @@ static const char *event_pool[] = {
 	"ls_mab_alloc.all",
 	"ls_int_taken",
 	"ls_stlf",
-	/*
-	 * Native Zen names.  The generic aliases above are not all mapped on
-	 * every model, and these tests need enough distinct events to fill
-	 * several oversubscribed groups at once.  Unsupported names are
-	 * skipped by the allocation loops, so listing extras is harmless.
-	 */
+	/* Native Zen event names. */
 	"ex_ret_brn",
 	"ex_ret_brn_misp",
 	"ex_ret_brn_tkn",
@@ -102,7 +80,7 @@ is_amd(void)
 	    strstr(buf, "HygonGenuine") != NULL);
 }
 
-/* Count usable core-class counters; pmc_npmc() lumps in SOFT/TSC/IBS. */
+/* Return count of available core hardware counters. */
 static int
 probe_core_pmcs(void)
 {
@@ -162,10 +140,7 @@ restore_mux_period(int saved)
 }
 
 /*
- * Build one group of n events starting at *cursor in event_pool[],
- * advancing the cursor past every entry examined so groups built from
- * the same cursor never share an event.  Returns 0 or -1 (short pool /
- * unsupported events -> caller should skip).
+ * Build a group of n distinct events from the pool.
  */
 static int
 build_group(struct grp *g, int n, int *cursor, int mux)
@@ -184,7 +159,7 @@ build_group(struct grp *g, int n, int *cursor, int mux)
 			flags |= PMC_F_GROUP_MUX;
 		if (pmc_allocate_group(ev, PMC_MODE_TC, flags,
 		    PMC_CPU_ANY, &id, 0) < 0)
-			continue;	/* unsupported on this model */
+			continue;	/* Event not supported on this model. */
 		if (pmc_group_add(g->gid, id, g->nevents == 0) < 0) {
 			(void)pmc_release(id);
 			continue;
@@ -209,7 +184,7 @@ destroy_group(struct grp *g)
 	g->committed = 0;
 }
 
-/* Commit, attach to self and start; -1 on error (caller cleans up). */
+/* Commit, attach, and start group. */
 static int
 launch_group(struct grp *g, const char *tag)
 {
@@ -244,9 +219,7 @@ grp_times(struct grp *g, uint64_t *enabled, uint64_t *running)
 }
 
 /*
- * 1 if a pmu_rot_* rotation kthread shows up in ps -axH (kernel
- * threads appear as [kernel/pmu_rot_pp_<pid>]), 0 if none does, -1 if
- * ps produced no output at all (mechanism unavailable).
+ * Return 1 if rotation thread exists, 0 if not, -1 on error.
  */
 static int
 rot_thread_visible(void)
@@ -268,8 +241,7 @@ rot_thread_visible(void)
 }
 
 /*
- * Size for three same-size groups that oversubscribe 'core' counters,
- * or -1 when the machine cannot host that layout.
+ * Calculate group size for three oversubscribing groups.
  */
 static int
 mux_group_size(int core)
@@ -282,9 +254,7 @@ mux_group_size(int core)
 }
 
 /*
- * Sub-test 1 (spec 7.2/7.4): three identical-size MUX groups over
- * capacity.  Delta running/enabled ratios measured across a 3 s busy
- * window must sit within 1.25x of one another.
+ * Test 1: verify equal execution ratios across three rotating groups.
  */
 static int
 test_fairness(int core)
@@ -362,8 +332,7 @@ out:
 }
 
 /*
- * Sub-test 2 (spec 7.2): a non-MUX group must never be evicted while
- * MUX groups rotate around it -- running stays equal to enabled.
+ * Test 2: verify non-multiplex groups are never evicted.
  */
 static int
 test_pinned(int core)
@@ -437,9 +406,7 @@ out:
 }
 
 /*
- * Sub-test 3 (spec 7.2 escalation): A and B fill the counters; C is
- * bigger than what one eviction frees, so it only ever runs if the
- * rotation escalates to multiple victims.  C must run within 10 s.
+ * Test 3: verify multi-victim escalation when large groups wait.
  */
 static int
 test_escalation(int core)
@@ -497,9 +464,7 @@ out:
 }
 
 /*
- * Sub-test 4 (spec 7.3): the rotation kthread exists while MUX groups
- * rotate, exits once the survivors all fit, and is respawned when a
- * new group is left deferred.
+ * Test 4: verify rotation thread idle stop and restart on new demand.
  */
 static int
 test_selfstop_rekick(int core)
@@ -551,7 +516,7 @@ test_selfstop_rekick(int core)
 		goto out;
 	}
 
-	/* Everything fits once m1 is gone: the kthread must self-stop. */
+	/* Thread must stop when remaining groups fit. */
 	destroy_group(&m1);
 	usleep(600 * 1000);
 	vis = rot_thread_visible();
@@ -562,7 +527,7 @@ test_selfstop_rekick(int core)
 	}
 	printf("  self-stop: kthread exited after the survivors fit\n");
 
-	/* A new deferred group must bring the kthread back promptly. */
+	/* Thread must restart when a new group is deferred. */
 	if (build_group(&m3, s, &cursor, 1) < 0 ||
 	    launch_group(&m3, "ss3") < 0) {
 		printf("SKIP self-stop: could not build/launch third group\n");

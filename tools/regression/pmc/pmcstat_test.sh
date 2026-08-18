@@ -28,8 +28,7 @@ note() { printf '%s\n' "$*" | tee -a "${SUMMARY}"; }
 fail() { note "FAIL: $*"; FAIL=$((FAIL + 1)); }
 pass() { note "PASS: $*"; PASS=$((PASS + 1)); }
 
-# Run a workload that produces a few hundred million instructions so
-# every counter in the group has something to read.
+# Run a CPU-bound workload for event counting.
 busy_workload() {
 	# `yes` is CPU-bound; redirect its stdout/stderr.
 	yes >/dev/null 2>&1 &
@@ -63,8 +62,7 @@ require_amd() {
 	esac
 }
 
-# t_basic_group: three events, one group, process-counting mode.
-# Verifies -b accepts {ev1,ev2,ev3} and pmcstat exits 0 with non-empty output.
+# t_basic_group: verify group of three events in process counting mode.
 t_basic_group() {
 	out="${LOGDIR}/basic.out"
 	${PMCSTAT} -b \
@@ -83,7 +81,7 @@ t_basic_group() {
 	pass "basic_group"
 }
 
-# t_two_groups: two independent process-counting groups.
+# t_two_groups: verify two process counting groups.
 t_two_groups() {
 	out="${LOGDIR}/two.out"
 	${PMCSTAT} -b  \
@@ -99,8 +97,7 @@ t_two_groups() {
 	pass "two_groups"
 }
 
-# t_oversubscribe: 7 events on a typical 6-counter Zen forces failure.
-# Requires PMC_F_GROUP_MUX support in the kernel (commit fails otherwise).
+# t_oversubscribe: verify oversubscribed single group fails.
 t_oversubscribe() {
 	out="${LOGDIR}/mux.out"
 	${PMCSTAT} -b -O /dev/null \
@@ -119,7 +116,7 @@ t_oversubscribe() {
 	pass "oversubscribe"
 }
 
-# t_system_mode: system-wide counting, single CPU.
+# t_system_mode: verify system-wide counting group on a single CPU.
 t_system_mode() {
 	out="${LOGDIR}/sys.out"
 	${PMCSTAT} -b -c 0 \
@@ -134,7 +131,7 @@ t_system_mode() {
 	pass "system_mode"
 }
 
-# t_sampling_group: process sampling with a group leader.
+# t_sampling_group: verify process sampling group.
 t_sampling_group() {
 	log="${LOGDIR}/samples.log"
 	out="${LOGDIR}/sampling.out"
@@ -155,9 +152,7 @@ t_sampling_group() {
 	pass "sampling_group"
 }
 
-# t_compat_no_b: without -b, brace text is treated as a literal event
-# spec by pmc_allocate which should reject it; we expect non-zero
-# exit and a useful message, never a kernel panic / segfault.
+# t_compat_no_b: verify brace syntax without -b fails cleanly.
 t_compat_no_b() {
 	out="${LOGDIR}/compat_no_b.out"
 	${PMCSTAT} \
@@ -179,7 +174,7 @@ t_compat_no_b() {
 	pass "compat_no_b"
 }
 
-# t_compat_legacy: classic non-grouped pmcstat invocation must still work.
+# t_compat_legacy: verify non-grouped events operate normally.
 t_compat_legacy() {
 	out="${LOGDIR}/legacy.out"
 	${PMCSTAT} \
@@ -194,8 +189,7 @@ t_compat_legacy() {
 	pass "compat_legacy"
 }
 
-# t_single_brace: {ev} (one element) must fall through to single-event
-# behaviour without erroring.
+# t_single_brace: verify single-element group operates as single event.
 t_single_brace() {
 	out="${LOGDIR}/single.out"
 	${PMCSTAT} -b \
@@ -210,8 +204,7 @@ t_single_brace() {
 	pass "single_brace"
 }
 
-# t_malformed_brace: missing closing '}' must be rejected with EX_USAGE
-# (64), never a crash.
+# t_malformed_brace: verify missing closing brace fails cleanly.
 t_malformed_brace() {
 	out="${LOGDIR}/malformed.out"
 	${PMCSTAT} -b \
@@ -230,7 +223,7 @@ t_malformed_brace() {
 	pass "malformed_brace"
 }
 
-# t_mixed: one grouped -p and one ungrouped -p in the same invocation.
+# t_mixed: verify grouped and ungrouped events in same command.
 t_mixed() {
 	out="${LOGDIR}/mixed.out"
 	${PMCSTAT} -b \

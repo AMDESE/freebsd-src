@@ -1,47 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Regression test for the hwpmc multiplex "switch-off" drain.
- *
- * Background
- * ----------
- * Evicting a process mux-group off hardware (either during rotation via
- * pmu_pp_schedule_out -> pmc_rotation_drain, or at teardown via
- * pmc_release_pmc_descriptor -> pmc_wait_for_pmc_idle) waits until every
- * sibling PMC's pm_runcount falls to zero.  pm_runcount only drops when
- * the CPUs that currently hold the counter run csw_out.  The historical
- * drain just pause()d on the calling CPU and hoped the remote targets
- * would context-switch on their own.
- *
- * That is unsafe: a counting-mode target thread that is pinned and CPU
- * bound, and is the only runnable thread on its core, is never
- * involuntarily preempted, so it never runs csw_out.  pm_runcount then
- * never reaches zero and the drain spins until the INVARIANTS cap trips
- * and panics the machine (or, on a production kernel, stalls for a long
- * time while holding pmc_sx exclusive).
- *
- * This test manufactures exactly that condition:
- *   - spawn a handful of worker threads, each PINNED to a distinct CPU
- *     and boosted to real-time priority, spinning in a pure CPU loop;
- *   - attach two mux groups (TC counting mode) whose union oversubscribes
- *     the core PMC pool, so the rotation kthread must evict a whole group
- *     every mux period;
- *   - drive the mux period as low as the kernel allows so eviction (and
- *     therefore the drain) happens thousands of times per second;
- *   - then tear the groups down (stop + release) while the workers are
- *     STILL spinning, exercising the pmc_wait_for_pmc_idle drain with the
- *     counters still loaded on the pinned RT workers.
- *
- * On a kernel with the passive drain this reliably panics (INVARIANTS) or
- * wedges under pmc_sx.  On a kernel that actively migrates onto each
- * loaded CPU to force the resident target off (pmc_select_cpu at PRI_MIN
- * preempts even an RT worker), every eviction and the teardown complete
- * promptly and the test prints OK.
- *
- * Build:  cc -o pmc_mux_drain_test pmc_mux_drain_test.c -lpmc -lpthread
- * Run:    sudo ./pmc_mux_drain_test   (requires hwpmc loaded, AMD CPU)
- *
- * Exit codes: 0 = pass, 1 = fail, 77 = skip.
+ * Test multiplex rotation drain with pinned real-time worker threads.
  */
 
 #include <sys/types.h>
@@ -65,13 +25,7 @@
 #define	MAX_PER_GROUP	8
 #define	MAX_WORKERS	8
 
-/*
- * How long the machine is allowed to be busy before we declare the drain
- * wedged.  On the fixed kernel the whole run finishes in a couple of
- * seconds; on a production (non-INVARIANTS) kernel with the old passive
- * drain the pmc syscalls block under pmc_sx and this watchdog fires.
- * (With INVARIANTS the old kernel panics outright before we get here.)
- */
+/* Maximum run time in seconds before watchdog timeout. */
 #define	WATCHDOG_SECS	60
 #define	STRESS_SECS	3
 
@@ -109,8 +63,8 @@ struct pmu_grp {
 	const char	*names[MAX_PER_GROUP];
 };
 
-static volatile int	g_stop;		/* tell workers to exit */
-static volatile int	g_running;	/* workers that have spun up */
+static volatile int	g_stop;		/* signal workers to stop */
+static volatile int	g_running;	/* active worker count */
 
 static int
 is_amd(void)
@@ -141,12 +95,7 @@ probe_core_pmcs(void)
 	return (n);
 }
 
-/*
- * Pinned, real-time-priority, CPU-bound worker.  Nothing here ever
- * blocks, so once this thread owns its core it will not voluntarily or
- * (short of a higher-priority thread) involuntarily context-switch --
- * which is precisely the state that starves the passive drain.
- */
+/* Pinned real-time thread running a CPU loop. */
 static void *
 worker(void *arg)
 {
@@ -162,7 +111,7 @@ worker(void *arg)
 		warn("cpuset_setaffinity cpu=%d", cpu);
 
 	rtp.type = RTP_PRIO_REALTIME;
-	rtp.prio = 30;			/* above timeshare, below clock */
+	rtp.prio = 30;			/* Real-time priority. */
 	if (rtprio_thread(RTP_SET, 0, &rtp) != 0)
 		warn("rtprio_thread cpu=%d (continuing at normal prio)", cpu);
 
@@ -274,10 +223,7 @@ main(void)
 		return (77);
 	}
 
-	/*
-	 * Leave CPU 0 for the rotation kthread, this main thread and the
-	 * rest of the system; pin the workers onto CPUs 1..nworkers.
-	 */
+	/* Pin workers to CPU 1 through nworkers. */
 	nworkers = ncpu - 1;
 	if (nworkers > MAX_WORKERS)
 		nworkers = MAX_WORKERS;
@@ -286,7 +232,7 @@ main(void)
 	    "counters, %d pinned RT workers (cpus 1..%d)\n",
 	    MAX_GROUPS, per_group, core, nworkers, nworkers);
 
-	/* Build the groups from disjoint slices of the event pool. */
+	/* Create groups with non-overlapping events. */
 	for (i = 0; i < MAX_GROUPS; i++) {
 		int got = build_group(&grps[i], per_group, i * per_group);
 
@@ -317,7 +263,7 @@ main(void)
 			return (1);
 		}
 
-	/* Fastest rotation the kernel accepts, to hammer the drain. */
+	/* Set rotation period to minimum value. */
 	new_period = 1;
 	s = sizeof(saved_period);
 	saved_period = -1;
@@ -328,11 +274,11 @@ main(void)
 	else
 		saved_period = -1;
 
-	/* Arm the watchdog before we do anything that can wedge. */
+	/* Set watchdog timer. */
 	signal(SIGALRM, on_watchdog);
 	alarm(WATCHDOG_SECS);
 
-	/* Spin up the pinned RT workers and wait for them to be busy. */
+	/* Start worker threads. */
 	g_stop = 0;
 	g_running = 0;
 	for (i = 0; i < nworkers; i++)
@@ -351,27 +297,18 @@ main(void)
 			goto restore;
 		}
 
-	/*
-	 * Phase A -- rotation drain stress.  With mux_period_ms=1 the
-	 * rotation kthread evicts a whole group ~1000 times/second; each
-	 * eviction drains the pinned RT workers that hold the counters.
-	 * A passive-drain kernel dies inside this sleep.
-	 */
+	/* Phase A: test rotation drain. */
 	printf("stressing rotation drain for %d s ...\n", STRESS_SECS);
 	sleep(STRESS_SECS);
 
-	/*
-	 * Phase B -- teardown drain stress.  Stop, then release every
-	 * sibling while the RT workers are STILL spinning, so the counters
-	 * are loaded on pinned cores when pmc_wait_for_pmc_idle runs.
-	 */
+	/* Phase B: test teardown drain while workers run. */
 	printf("tearing down while workers still spinning ...\n");
 	for (i = 0; i < MAX_GROUPS; i++)
 		(void)pmc_stop(grps[i].ids[0]);
 	for (i = 0; i < MAX_GROUPS; i++)
 		release_group(&grps[i]);
 
-	/* Survived both drains -- now let the workers go. */
+	/* Stop worker threads. */
 	g_stop = 1;
 	for (i = 0; i < nworkers; i++)
 		pthread_join(tid[i], NULL);

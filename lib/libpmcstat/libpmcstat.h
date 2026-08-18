@@ -387,12 +387,8 @@ int pmcstat_open_log(const char *_p, int _mode);
 int pmcstat_close_log(struct pmcstat_args *args);
 
 /*
- * libpmcstat_group.c: parse a -b {a,b,c} brace-list event group.
- * Returns 0 on success and fills *out_events with a malloc'd
- * NULL-terminated array of malloc'd event-spec strings.  Returns
- * a positive count via *n_out.  When the input is not a brace-list
- * the function returns 1 and the caller treats `spec` as a single
- * non-grouped event.  Returns -1 on parse error with errno set.
+ * Parse a brace-delimited event group {a,b,c}.
+ * Returns 0 on success, 1 if spec is a single event, -1 on error.
  */
 int pmcstat_parse_event_group(const char *spec, char ***out_events,
     size_t *n_out);

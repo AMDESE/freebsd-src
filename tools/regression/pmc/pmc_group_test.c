@@ -1,10 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Regression test for hwpmc grouping (phase 1).
- *
- * Build:  cc -o pmc_group_test pmc_group_test.c -lpmc
- * Run:    sudo ./pmc_group_test     (requires hwpmc loaded, AMD CPU)
+ * Regression test for hwpmc event grouping.
  */
 
 #include <sys/types.h>
@@ -19,12 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 
-/*
- * Must match PMC_HANDLE_DEFERRED_SLOTS in <sys/pmc.h>, which is only
- * visible under _KERNEL and so cannot be included here.  A group may hold
- * PMC_GROUP_MAX_MEMBERS (32) members, so the pool has to supply that many
- * concurrent deferred handles per (owner, CPU).
- */
+/* Maximum concurrent deferred handles per owner and CPU. */
 #define	TEST_DEFERRED_HANDLE_SLOTS	32
 
 static int
@@ -154,14 +146,7 @@ fail:
 	return (1);
 }
 
-/*
- * Probe how many process-mode core PMCs we can simultaneously allocate
- * with the canonical "instructions" event.  Returns the count without
- * leaving any allocations behind.  Used to size the rest of the test
- * dynamically per-CPU instead of relying on pmc_npmc(0), which sums
- * SOFT/TSC/K8/IBS classes and is therefore meaningless for sizing a
- * single core-class group.
- */
+/* Return count of available core hardware counters. */
 static int
 probe_core_pmcs(void)
 {
@@ -269,17 +254,7 @@ test_basic_group(void)
 	return (0);
 }
 
-/*
- * The atomic-group scheduler must reject a single group whose event
- * count exceeds the core HW counter pool.  Within-group placement is
- * all-or-none, so a group that cannot fit at commit MUST fail rather
- * than silently get split across rotation windows.
- *
- * Sizing: query the actual per-class core count via probe_core_pmcs()
- * (Zen5 = 6, Zen3/4 = 6, Zen6 = up to 12, EPYC = vendor-dependent),
- * then attempt a group of (core + 2) events.  Hard-coding 16 missed
- * Zen6 and any future generation that exceeds it.
- */
+/* Verify that groups larger than available hardware rows fail at commit. */
 static int
 test_oversubscription_rejected(void)
 {

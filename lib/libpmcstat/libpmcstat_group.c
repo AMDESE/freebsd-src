@@ -3,18 +3,7 @@
  *
  * Copyright (c) 2026 Advanced Micro Devices, Inc.
  *
- * Brace-list event-group parser used by pmcstat -b.
- *
- * Grammar:
- *     spec    := group | event
- *     group   := '{' event ( ',' event )* '}'
- *     event   := <whatever pmcstat already accepts as a counter spec,
- *                 e.g. "instructions:k" or "ex_ret_instr,thread=0">
- *
- * Note: commas inside an event spec (e.g. unit masks) collide with
- * the sibling separator, so this v1 parser splits ONLY on top-level
- * commas - any '{' / ',' / '}' inside a quoted token is preserved.
- * Callers that need per-event attributes can put them after a ':'.
+ * Parser for brace-delimited event groups.
  */
 
 #include <sys/types.h>
@@ -60,7 +49,7 @@ pmcstat_parse_event_group(const char *spec, char ***out_events, size_t *n_out)
 	while (*spec != '\0' && isspace((unsigned char)*spec))
 		spec++;
 	if (*spec != '{') {
-		/* Not a group - caller handles single event. */
+		/* Input is a single event. */
 		return (1);
 	}
 
@@ -101,15 +90,7 @@ pmcstat_parse_event_group(const char *spec, char ***out_events, size_t *n_out)
 			p++;
 	}
 	if (n < 2) {
-		/*
-		 * Fewer than two events is not a real group.  For a
-		 * single-element brace list like "{instructions}", hand the
-		 * brace-stripped, whitespace-trimmed inner event back to the
-		 * caller (return 1) so it can allocate it as a plain event;
-		 * passing the literal "{...}" -- including the '{' -- down to
-		 * pmc_allocate() makes the kernel reject it with EINVAL.  An
-		 * empty list ("{}") has nothing to return.
-		 */
+		/* Return single event or empty list to caller. */
 		if (n == 1) {
 			*out_events = events;
 			*n_out = 1;
@@ -141,12 +122,7 @@ pmcstat_free_event_group(char **events, size_t n)
 }
 
 /*
- * Append one event entry to args->pa_events.  This factors out the
- * per-event setup so brace-list expansion can reuse it without
- * duplicating the inline body of pmcstat's getopt switch.  Only the
- * minimum subset of fields needed to drive pmc_allocate_group is
- * filled in here; the entry is returned so the caller can apply the
- * per-event modifiers (-n/-C/-c, callchain flags) it tracks.
+ * Add an event descriptor to the event list.
  */
 struct pmcstat_ev *
 pmcstat_add_one_event(int option, const char *spec, struct pmcstat_args *pa,

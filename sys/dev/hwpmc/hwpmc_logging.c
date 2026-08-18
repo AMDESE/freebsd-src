@@ -964,11 +964,8 @@ pmclog_process_map_in(struct pmc_owner *po, pid_t pid, uintfptr_t start,
 }
 
 /*
- * Mapping records for callers that already hold a spin mutex.  Waking
- * the log kthread from such a context would invert established spin
- * lock orders, so these queue the buffer without a wakeup, exactly as
- * pmclog_process_proccsw() does under a scheduler lock; the record is
- * flushed by the next emitter that can wake the kthread.
+ * Queue mapping records without thread wakeup.
+ * Use when caller holds a spin lock.
  */
 void
 pmclog_process_map_in_nowakeup(struct pmc_owner *po, pid_t pid,

@@ -1,17 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Copyright (c) 2026 Advanced Micro Devices, Inc.
- *
- * Userland unit test for pmcstat_parse_event_group().
- *
- * Build:  cc -o test_libpmcstat_group test_libpmcstat_group.c -lpmcstat
- * Run:    ./test_libpmcstat_group   (no root, no kernel module needed)
- *
- * The test exercises the brace-list parser only; no PMU is touched.
- * Exit status:
- *     0  - all assertions pass
- *     1  - one or more cases failed
+ * Unit test for pmcstat_parse_event_group().
  */
 
 #include <sys/types.h>
@@ -48,7 +38,7 @@ free_arr(char **a, size_t n)
 	pmcstat_free_event_group(a, n);
 }
 
-/* {a,b,c} -> 3 elements, returns 0 (real group). */
+/* Verify {a,b,c} parses as 3 elements and returns 0. */
 static void
 t_basic(void)
 {
@@ -67,7 +57,7 @@ t_basic(void)
 	free_arr(out, n);
 }
 
-/* {ev} (single element) -> rv==1 (degenerate, caller handles as non-group). */
+/* Verify single element {ev} returns 1. */
 static void
 t_single_element(void)
 {
@@ -80,7 +70,7 @@ t_single_element(void)
 	free_arr(out, n);
 }
 
-/* No leading '{' -> rv==1 (not a brace list). */
+/* Verify unbraced input returns 1. */
 static void
 t_not_a_group(void)
 {
@@ -94,7 +84,7 @@ t_not_a_group(void)
 	free_arr(out, n);
 }
 
-/* No closing '}' -> rv==-1 (parse error), errno=EINVAL. */
+/* Verify missing closing brace returns -1 with EINVAL. */
 static void
 t_no_close_brace(void)
 {
@@ -109,7 +99,7 @@ t_no_close_brace(void)
 	free_arr(out, n);
 }
 
-/* {a, b , c} with whitespace around commas -> 3 trimmed elements. */
+/* Verify whitespace around commas is trimmed. */
 static void
 t_whitespace(void)
 {
@@ -128,7 +118,7 @@ t_whitespace(void)
 	free_arr(out, n);
 }
 
-/* Empty entries collapse: {,a,,b,} -> only "a" and "b". */
+/* Verify empty entries are discarded. */
 static void
 t_empty_entries(void)
 {
@@ -146,7 +136,7 @@ t_empty_entries(void)
 	free_arr(out, n);
 }
 
-/* Colon qualifier inside event spec must be preserved untouched. */
+/* Verify colon event qualifiers are preserved. */
 static void
 t_colon_preserved(void)
 {
@@ -167,7 +157,7 @@ t_colon_preserved(void)
 	free_arr(out, n);
 }
 
-/* NULL inputs must return -1 with errno EINVAL, not crash. */
+/* Verify NULL arguments return -1 with EINVAL. */
 static void
 t_null_inputs(void)
 {
@@ -191,7 +181,7 @@ t_null_inputs(void)
 	CHECK(errno == EINVAL, "null_n: errno=%d, want EINVAL", errno);
 }
 
-/* A leading-space spec like " {a,b}" should still parse as a group. */
+/* Verify leading whitespace before opening brace is accepted. */
 static void
 t_leading_ws(void)
 {
@@ -205,8 +195,7 @@ t_leading_ws(void)
 	free_arr(out, n);
 }
 
-/* pmcstat_add_one_event: verify it appends to args.pa_events with the
- * expected ev_groupid / ev_is_leader / ev_mode for option='p'. */
+/* Verify pmcstat_add_one_event appends expected event descriptors. */
 static void
 t_add_one_event(void)
 {

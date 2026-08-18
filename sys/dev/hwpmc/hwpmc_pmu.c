@@ -3,11 +3,7 @@
  *
  * Copyright (c) 2026 Advanced Micro Devices, Inc.
  *
- * hwpmc PMU layer: event groups, all-or-none commit, time accounting and
- * round-robin multiplex rotation when nevents > available HW slots.  The
- * heavy lifting (per-class hardware row binding, KASSERT-checked AMD
- * sub-class match, etc.) lives in hwpmc_assign.c and the per-class
- * back-ends (hwpmc_amd.c, hwpmc_intel.c).
+ * PMU event grouping, time accounting, and multiplex rotation.
  */
 
 #include <sys/param.h>
@@ -41,18 +37,14 @@ static struct pmu_group_cpu_list pmu_group_cpu_active[MAXCPU];
 SYSCTL_DECL(_kern_hwpmc);
 
 /*
- * Multiplex rotation period.  Default 50ms balances counter accuracy
- * (longer windows -> more stable counts per sibling) against fairness
- * (shorter windows -> every sibling gets time on HW within a few
- * scheduler quanta).  Tunable so tests with very long or very short
- * runtimes can adjust.
+ * Multiplex rotation period in milliseconds.
  */
 static int pmu_mux_period_ms = 50;
 SYSCTL_INT(_kern_hwpmc, OID_AUTO, mux_period_ms, CTLFLAG_RWTUN,
     &pmu_mux_period_ms, 0,
     "PMU multiplex rotation period floor in milliseconds");
 
-/* One rotation window in ticks; §7.4 upward jitter breaks phase-lock. */
+/* Rotation window in ticks with random jitter. */
 static int
 pmu_rot_period_ticks(void)
 {
@@ -73,20 +65,15 @@ static void pmu_group_attach_siblings(pmu_group_t *pg,
     struct pmc_process *pp);
 
 /*
- * System-wide (PMC_MODE_SC) multiplex state.  Process-mode groups hang
- * off a pmc_process and rotate in a per-pp kthread; system-wide groups
- * are bound to a single CPU and rotate in a per-CPU kthread keyed by
- * this registry.  pg_proc_next (the same LIST_ENTRY the per-pp path
- * uses) links a system group onto sc_groups -- the two worlds are
- * mutually exclusive for any given group (pg_system selects which).
+ * State for system-mode (PMC_MODE_SC) multiplexing.
  */
 struct pmu_syscpu {
 	struct pmu_group_list	sc_groups;	/* groups bound to this CPU */
-	pmu_group_t		*sc_cursor;	/* round-robin start point */
-	struct thread		*sc_td;		/* rotation kthread */
+	pmu_group_t		*sc_cursor;	/* rotation cursor */
+	struct thread		*sc_td;		/* rotation thread */
 	u_int			sc_quiesce;
-	bool			sc_running;	/* kthread should keep going */
-	bool			sc_needed;	/* unplaced MUX group waiting */
+	bool			sc_running;	/* rotation thread is active */
+	bool			sc_needed;	/* deferred group is waiting */
 };
 static struct pmu_syscpu pmu_syscpu[MAXCPU];
 
@@ -181,14 +168,8 @@ pmu_group_ticks_to_ns(uint64_t ticks, uint64_t tickrate)
 		return (0);
 
 	/*
-	 * Scale without a 128-bit intermediate, as __uint128_t is not
-	 * available on all platforms and its division needs a compiler
-	 * runtime helper the kernel does not link against:
-	 *
-	 *	ticks * 1e9 / tickrate == (ticks / tickrate) * 1e9 +
-	 *				  (ticks % tickrate) * 1e9 / tickrate
-	 *
-	 * This is the decomposition used by __utime64_scale32_floor().
+	 * Scale ticks to nanoseconds without 128-bit division:
+	 * (ticks / rate) * 1e9 + (ticks % rate) * 1e9 / rate.
 	 */
 	quot = ticks / tickrate;
 	rem = ticks % tickrate;
@@ -197,11 +178,7 @@ pmu_group_ticks_to_ns(uint64_t ticks, uint64_t tickrate)
 		return (UINT64_MAX);
 	secs = quot * 1000000000;
 
-	/*
-	 * rem is below tickrate, so the multiplication below is exact for
-	 * every tick rate under ~18GHz.  Scale down first above that, which
-	 * costs at most a nanosecond of precision.
-	 */
+	/* Prevent overflow for high tick rates. */
 	if (rem <= UINT64_MAX / 1000000000)
 		frac = rem * 1000000000 / tickrate;
 	else
@@ -373,7 +350,7 @@ pmu_pp_stop_rotate(struct pmc_process *pp, const char *wmesg)
 	mtx_unlock_spin(&pp->pp_pmu_lock);
 }
 
-/* Hang pg off pp's group list unless it is already linked. */
+/* Add group to process list if not present. */
 static void
 pmu_pp_link_group(pmu_group_t *pg, struct pmc_process *pp)
 {
@@ -386,7 +363,7 @@ pmu_pp_link_group(pmu_group_t *pg, struct pmc_process *pp)
 	mtx_unlock_spin(&pp->pp_pmu_lock);
 }
 
-/* Unhook pg from pp, stepping the rotation cursor past it. */
+/* Remove group from process list and update cursor. */
 static void
 pmu_pp_unlink_group(pmu_group_t *pg, struct pmc_process *pp)
 {
@@ -400,7 +377,7 @@ pmu_pp_unlink_group(pmu_group_t *pg, struct pmc_process *pp)
 	mtx_unlock_spin(&pp->pp_pmu_lock);
 }
 
-/* Place any deferred group that now fits and re-arm rotation. */
+/* Assign deferred groups and restart rotation. */
 static void
 pmu_pp_backfill(struct pmc_process *pp)
 {
@@ -421,7 +398,7 @@ pmu_event_from_pmc(struct pmc *pm)
 	return (pm != NULL ? pm->pm_pmu : NULL);
 }
 
-/* Group pm belongs to, or NULL for an ungrouped PMC. */
+/* Return group for PMC or NULL. */
 pmu_group_t *
 pmu_group_from_pmc(struct pmc *pm)
 {
@@ -565,10 +542,7 @@ pmu_group_commit(pmu_group_t *pg)
 		return (error);
 	}
 
-	/*
-	 * Pre-compute each event's constraint up front so the assigner
-	 * can sort by weight without recomputing.
-	 */
+	/* Cache event constraints for sorting. */
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 		error = pmu_event_get_constraint(pe, &pe->pe_cons);
 		if (error != 0) {
@@ -593,29 +567,14 @@ pmu_group_commit(pmu_group_t *pg)
 		return (EINVAL);
 
 	/*
-	 * System-wide group.  There is no target process: the group is
-	 * pinned to a single CPU (validated identical across siblings).
-	 * Unlike the process path below -- which binds a fitting group to
-	 * HW rows right here at commit -- system groups defer ALL HW
-	 * placement to pmu_sys_group_on_start() and the per-CPU rotation
-	 * kthread, because programming a system counter requires the
-	 * pmc_select_cpu() bind dance that only runs in thread context.
-	 * Commit therefore only proves the group can ever fit.
+	 * System groups bind to one CPU.
+	 * Hardware assignment occurs at group start.
 	 */
 	if (PMC_IS_SYSTEM_MODE(pg->pg_leader->pe_alloc.pm_mode)) {
 		pg->pg_system = true;
 		pg->pg_cpu = pg->pg_leader->pe_alloc.pm_cpu;
 
-		/*
-		 * Only the questions that cannot change later are asked
-		 * here.  pmu_group_can_fit() above has already proved the
-		 * group fits the PMU at all; whether the rows happen to be
-		 * free is a property of this instant, and by the time the
-		 * caller reaches pmc_start it may have changed either way.
-		 * pmu_sys_group_on_start() makes that call and fails
-		 * ENOSPC for a group that cannot defer, so committing here
-		 * cannot leave a group counting nothing.
-		 */
+		/* Commit succeeds if the group can fit on the PMU. */
 		error = pmu_group_can_place(pg, p, pg->pg_cpu);
 		PMCDBG5(PMC, OPS, 1,
 		    "group_commit: SYS gid=%u cpu=%d nevents=%u "
@@ -629,23 +588,8 @@ pmu_group_commit(pmu_group_t *pg)
 	}
 
 	/*
-	 * Two scheduling regimes, both atomic:
-	 *
-	 * 1. The group fits in the rows currently free for this
-	 *    target proc -- bind every sibling to a HW row right
-	 *    now.  pmc_start(leader) finds an already-scheduled
-	 *    group and just flips the per-PMC running flag.
-	 *
-	 * 2. The group does NOT fit at the moment (other groups
-	 *    already attached to this proc are holding the rows
-	 *    we would need).  If the caller passed
-	 *    PMC_F_GROUP_MUX on the leader we accept the commit
-	 *    in the DEFERRED state; the per-pp rotation kthread
-	 *    will atomically schedule this group in -- ALL of
-	 *    its siblings, never a subset -- whenever an evicted
-	 *    peer frees enough rows for it.  Without the flag we
-	 *    preserve the historical strict semantics and reject
-	 *    with ENOSPC so the caller can pick a smaller group.
+	 * Assign hardware rows immediately if available.
+	 * If rows are busy and PMC_F_GROUP_MUX is set, defer assignment.
 	 */
 	error = pmu_group_can_place(pg, p, PMC_CPU_ANY);
 	if (error == 0)
@@ -825,28 +769,7 @@ pmu_group_on_attach(struct pmc *pm, struct proc *p)
 }
 
 /*
- * Resolve the TARGET proc the group is being scheduled against.  All
- * pp_pmu_groups bookkeeping, pp_pmcs[] writes and rotation must hang
- * off the target's pmc_process -- that is the pp the scheduler walks
- * at csw_in/out time for the proc whose threads are actually running
- * the workload being measured.
- *
- * Lookup order:
- *   1. pg->pg_attach_proc, recorded by pmc_attach_one_process for the
- *      first sibling that successfully attaches (committed-bound or
- *      deferred-skip path; see hwpmc_mod.c).  This is the canonical
- *      and only correct source.
- *   2. Fallback: the pmc_target list of any committed sibling.  In
- *      practice all siblings of one group target the same proc, so
- *      the first non-empty pm_targets gives us the answer.  This is
- *      defensive only; once (1) is set on attach we never get here.
- *
- * pg->pg_owner / pg->pg_owner->po_owner is INTENTIONALLY NOT used
- * here: the owner (e.g. pmcstat parent) is typically NOT the target
- * (e.g. the child workload), and using owner-pp produced the
- * "Row index mismatch pmc 255 != ri N" csw_in panic where rotation
- * unbound rows on owner-pp while target-pp still held the stale
- * pp_pmcs[ri] -> pm pointer.
+ * Find the target process for a group.
  */
 static struct proc *
 pmu_group_target_proc(pmu_group_t *pg)
@@ -944,23 +867,7 @@ pmu_group_on_start(struct pmc *pm)
 }
 
 /*
- * Mark the group stopped.  We deliberately do NOT release HW rows
- * here:
- *
- *   1. Group PMCSTOP retains pmc_sx exclusively while active CPU
- *      markers are drained, but keeps the assigned rows reserved.
- *
- *   2. Stop semantics in the framework only freeze the HW counter,
- *      they do not unbind the row from the target proc -- so
- *      preserving rows across stop matches the existing per-PMC
- *      behaviour and lets a subsequent pmc_start re-run the group
- *      with the same row assignments.
- *
- * A stopped-but-placed MUX group remains a valid rotation victim,
- * so its idle rows can be reclaimed when a deferred running group
- * needs them; restart then re-places it via pmu_pp_schedule_in.
- * Final HW row release happens in pmu_group_on_release which always
- * runs under sx_xlock.
+ * Mark the group stopped. Assigned rows stay reserved until release.
  */
 void
 pmu_group_on_stop(struct pmc *pm)
@@ -972,7 +879,7 @@ pmu_group_on_stop(struct pmc *pm)
 	pe = pmu_event_from_pmc(pm);
 	if (pe == NULL || pe->pe_group == NULL)
 		return;
-	/* PMCSTOP downgrades pmc_sx for ungrouped PMCs; assert after the gate. */
+	/* Assert lock exclusivity for grouped stops. */
 	sx_assert(&pmc_sx, SX_XLOCKED);
 	pg = pe->pe_group;
 	pp = pg->pg_pp;
@@ -1003,7 +910,7 @@ pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
 	uint64_t now;
 	int cpu;
 
-	/* Unlocked peek: a racing insert is caught on the next switch. */
+	/* Check list without lock. */
 	if (LIST_EMPTY(&pp->pp_pmu_groups))
 		return;
 	cpu = PCPU_GET(cpuid);
@@ -1013,7 +920,7 @@ pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
 		if (pg->pg_system || cpu < 0 || (u_int)cpu >= pg->pg_ncpu)
 			continue;
 		pgcs = &pg->pg_cpu_state[cpu];
-		/* Never wait out a snapshot here: its IPIs may target this CPU. */
+		/* Do not wait for snapshot during context switch. */
 		mtx_lock_spin(&pg->pg_snapshot_lock);
 		mtx_pool_lock_spin(pmc_mtxpool, pg);
 		if (!pg->pg_committed || !pg->pg_running ||
@@ -1104,7 +1011,7 @@ pmu_group_csw_out(struct thread *td, int cpu)
 		if (pgcs->pgcs_td != td)
 			continue;
 		pg = pgcs->pgcs_group;
-		/* Never wait out a snapshot here: its IPIs may target this CPU. */
+		/* Do not wait for snapshot during context switch. */
 		mtx_lock_spin(&pg->pg_snapshot_lock);
 		mtx_pool_lock_spin(pmc_mtxpool, pg);
 		if (pgcs->pgcs_counted && pgcs->pgcs_td == td &&
@@ -1186,11 +1093,7 @@ pmu_group_on_release(struct pmc *pm)
 }
 
 /*
- * Hook every sibling of pg onto pp via the rotation attach helper.
- * Called both from pmu_group_on_start (initial placement when commit
- * already bound the rows) and from pmu_pp_schedule_in (rotation brings
- * the group in mid-flight).  All-or-none scheduling means every
- * sibling holds a row once pmu_assign_group succeeds.
+ * Attach all sibling events of a group to the process descriptor.
  */
 static void
 pmu_group_attach_siblings(pmu_group_t *pg, struct pmc_process *pp)
@@ -1204,18 +1107,13 @@ pmu_group_attach_siblings(pmu_group_t *pg, struct pmc_process *pp)
 		    ("[pmu] attach_siblings: gid=%u pm_id=0x%jx unassigned",
 		    pg->pg_id, (uintmax_t)pm->pm_id));
 		if (pp->pp_pmcs[PMC_TO_ROWINDEX(pm)].pp_pmc == pm)
-			continue;	/* idempotent: already attached */
+			continue;	/* Skip if already attached. */
 		pmc_rotation_attach(pm, pp);
 	}
 }
 
 /*
- * Atomically schedule pg in: assign HW rows for ALL siblings or do
- * nothing.  Called either from pmu_group_on_start (lazy first
- * placement) or from the per-pp rotation kthread (when an evicted
- * peer freed enough rows for pg).  Returns 0 if pg is now scheduled,
- * ENOSPC if it still does not fit (pg stays deferred), other errno
- * if something hard-failed.
+ * Schedule a group in by assigning hardware rows for all siblings.
  */
 static int
 pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
@@ -1226,7 +1124,7 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 
 	if (pg == NULL || pg->pg_assigned)
 		return (0);
-	/* Only the recorded TARGET proc; see pmu_group_target_proc(). */
+	/* Target process only. */
 	p = pmu_group_target_proc(pg);
 	if (p == NULL)
 		return (EINVAL);
@@ -1248,11 +1146,7 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 		return (error);
 	}
 
-	/*
-	 * Restore RUNNING before attach_siblings publishes the rows:
-	 * csw_in only loads counters for RUNNING PMCs, so the reverse
-	 * order leaves a rebound group stopped forever.
-	 */
+	/* Set running state before publishing rows. */
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
 		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
 
@@ -1265,10 +1159,7 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 }
 
 /*
- * Atomically schedule pg out: detach every sibling from pp and
- * release every HW row in one pass.  Counts already accumulated in
- * pm->pm_gv.pm_savedvalue are preserved (we never zero them).
- * Caller holds pmc_sx exclusive.
+ * Schedule a group out and release assigned hardware rows.
  */
 static void
 pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
@@ -1284,7 +1175,7 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
 	pg->pg_account_placement_admit = false;
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 
-	/* Phase 1: stop every sibling so csw_in/csw_out skip them. */
+	/* Phase 1: stop sibling events. */
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 		if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pe->pe_pmc))) {
 			atomic_store_rel_int(&pe->pe_pmc->pm_rotation_drain,
@@ -1294,14 +1185,14 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
 		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
 	}
 
-	/* Phase 2: flush the owner's log once, then drain in-flight csw_out. */
+	/* Phase 2: flush log and drain context switches. */
 	if (pg->pg_owner != NULL &&
 	    (pg->pg_owner->po_flags & PMC_PO_OWNS_LOGFILE) != 0)
 		(void)pmclog_flush(pg->pg_owner, 1);
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
 		pmc_rotation_drain(pe->pe_pmc);
 
-	/* Phase 3: detach every sibling from the target. */
+	/* Phase 3: detach siblings from target. */
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 		struct pmc *pm = pe->pe_pmc;
 
@@ -1312,16 +1203,12 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
 			pmc_rotation_detach(pm, pp);
 	}
 
-	/* Phase 4: release every HW row in one pass. */
+	/* Phase 4: release hardware rows. */
 	pmu_unassign_group(pg, 0);
 }
 
 /*
- * Purge every pmu_group hanging off pp->pp_pmu_groups and tear down the
- * per-pp rotation kthread, so the eventual pmu_group_on_release for
- * each sibling sees pg_pp == NULL instead of a freed pp.  The groups
- * themselves stay owned by the pmc_owner / pmu_event lifetime.  Caller
- * must hold pmc_sx exclusive.
+ * Remove all groups from the process and stop the rotation thread.
  */
 static void
 pmu_pp_release_all(struct pmc_process *pp)
@@ -1338,24 +1225,12 @@ pmu_pp_release_all(struct pmc_process *pp)
 		pmu_group_accounting_block(pg);
 	mtx_unlock_spin(&pp->pp_pmu_lock);
 
-	/*
-	 * Tear down the rotation kthread first.  It holds pp as its
-	 * arg, so once pp is freed the next muxrot tick would
-	 * dereference freed memory.  The sx_sleep below transiently
-	 * drops pmc_sx; the kthread acquires it, observes
-	 * pp_pmu_rot_running == false, clears pp_pmu_rot_td, and
-	 * exits.
-	 */
+	/* Stop the rotation thread before freeing the process descriptor. */
 	pmu_pp_stop_rotate(pp, "muxpurge");
 	while (pp->pp_pmu_refs != 0)
 		(void)sx_sleep(&pp->pp_pmu_refs, &pmc_sx, 0, "muxrefs", 1);
 
-	/*
-	 * Schedule out every group that is currently bound to pp, then
-	 * unhook every pg from pp->pp_pmu_groups regardless of state.
-	 * pg_pp gets cleared so a later pmu_group_on_release for any
-	 * surviving sibling skips the now-stale LIST_REMOVE.
-	 */
+	/* Schedule out assigned groups and unhook all groups. */
 	for (;;) {
 		mtx_lock_spin(&pp->pp_pmu_lock);
 		pg = LIST_FIRST(&pp->pp_pmu_groups);
@@ -1369,7 +1244,7 @@ pmu_pp_release_all(struct pmc_process *pp)
 	}
 }
 
-/* Set up the PMU-layer fields of a fresh pp. */
+/* Initialize PMU fields in process descriptor. */
 void
 pmu_pp_init(struct pmc_process *pp)
 {
@@ -1378,7 +1253,7 @@ pmu_pp_init(struct pmc_process *pp)
 	LIST_INIT(&pp->pp_pmu_groups);
 }
 
-/* Tear down the PMU-layer state of pp just before it is freed. */
+/* Destroy PMU state in process descriptor. */
 void
 pmu_pp_destroy(struct pmc_process *pp)
 {
@@ -1423,7 +1298,7 @@ pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp)
 	pmu_pp_backfill(pp);
 }
 
-/* True if any running MUX group on the list is waiting for hardware. */
+/* Return true if a running MUX group is unassigned. */
 static bool
 pmu_list_has_deferred(struct pmu_group_list *gl)
 {
@@ -1437,10 +1312,7 @@ pmu_list_has_deferred(struct pmu_group_list *gl)
 }
 
 /*
- * Ensure pp's deferred MUX groups will be serviced: mark rotation
- * needed and wake the per-pp kthread, spawning it if absent.  Every
- * path that leaves a running MUX group unplaced must end up here --
- * a missed kick is a permanent silent stall (spec §7.3).  Idempotent.
+ * Start or wake the process rotation thread.
  */
 static void
 pmu_pp_kick_rotate(struct pmc_process *pp)
@@ -1479,9 +1351,7 @@ pmu_pp_kick_after_exec(struct pmc_process *pp)
 }
 
 /*
- * Rows currently held by the list's placed MUX groups, running or
- * stopped -- everything rotation could evict -- as the global-ri mask
- * the satisfiability probe consumes.
+ * Return bitmask of rows held by assigned MUX groups.
  */
 static uint64_t
 pmu_list_evictable_rows(struct pmu_group_list *gl)
@@ -1505,12 +1375,7 @@ pmu_list_evictable_rows(struct pmu_group_list *gl)
 }
 
 /*
- * Next placed MUX group at or after *vpg, wrapping over the list
- * until *vseen reaches ngroups.  Pinned (non-MUX) and unplaced groups
- * are passed over without being counted as victims; stopped-but-placed
- * MUX groups are eligible so their idle rows can be reclaimed.
- * Advances the scan state so successive calls continue the same wrap
- * (the escalation path in the rotation ticks relies on this).
+ * Find the next assigned MUX group to evict.
  */
 static pmu_group_t *
 pmu_list_next_victim(struct pmu_group_list *gl, pmu_group_t **vpg,
@@ -1531,27 +1396,8 @@ pmu_list_next_victim(struct pmu_group_list *gl, pmu_group_t **vpg,
 }
 
 /*
- * Run one rotation tick for pp (spec §7.2).
- *
- * At most one victim is evicted per tick: the first placed MUX group
- * at or after the cursor.  Non-MUX groups are pinned -- the cursor
- * passes over them without evicting.  Unplaced MUX groups are then
- * placed in cursor order until the first ENOSPC, which pins the next
- * tick's cursor and stops the walk.
- *
- * Progress guarantee: one victim cannot free enough rows for a group
- * larger than itself, so while the tick has placed nothing, an ENOSPC
- * escalates -- further MUX victims are evicted until the blocked group
- * fits or no placed MUX group remains.
- *
- * A group that cannot fit even with every placed MUX peer evicted is
- * genuinely unsatisfiable: pinned groups and ungrouped PMCs hold the
- * rows it needs permanently.  It is skipped rather than allowed to
- * stall the cursor and keeps accruing enabled time with running == 0,
- * which is the correct user-visible signal.  A tick whose deferred
- * groups are all unsatisfiable evicts nothing.
- *
- * Caller holds pmc_sx exclusive.
+ * Run one multiplex rotation tick for a process.
+ * Evicts assigned MUX groups and assigns deferred MUX groups.
  */
 static void
 pmu_pp_rotate_one(struct pmc_process *pp)
@@ -1570,10 +1416,7 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 		return;
 	}
 
-	/*
-	 * Validate the cursor: a release path could have removed the
-	 * cursor group between ticks; reset to the head in that case.
-	 */
+	/* Reset cursor to head if invalid. */
 	ngroups = 0;
 	cursor = pp->pp_pmu_rot_cursor;
 	found_cursor = false;
@@ -1585,11 +1428,7 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 	if (!found_cursor)
 		cursor = LIST_FIRST(&pp->pp_pmu_groups);
 
-	/*
-	 * A tick with no deferred MUX group, or whose deferred groups
-	 * are all unsatisfiable, does nothing -- evicting a victim
-	 * would only put it straight back.
-	 */
+	/* Do not rotate if no deferred group can run. */
 	evictable = pmu_list_evictable_rows(&pp->pp_pmu_groups);
 	satisfiable = false;
 	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
@@ -1605,7 +1444,7 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 	if (!satisfiable)
 		goto out;
 
-	/* Evict the single victim at the cursor, advance past it. */
+	/* Evict group at cursor and advance cursor. */
 	vpg = cursor;
 	vseen = 0;
 	victim = pmu_list_next_victim(&pp->pp_pmu_groups, &vpg, &vseen,
@@ -1619,7 +1458,7 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 			cursor = LIST_FIRST(&pp->pp_pmu_groups);
 	}
 
-	/* Place unplaced MUX groups in cursor order until first ENOSPC. */
+	/* Assign deferred MUX groups in order. */
 	placed_any = false;
 	pg = cursor;
 	seen = 0;
@@ -1654,22 +1493,18 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 			pp->pp_pmu_rot_cursor = pg;
 			goto out;
 		}
-		/* Hard failure: skip the group for this tick. */
+		/* Skip group on hard error. */
 next:
 		pg = LIST_NEXT(pg, pg_proc_next);
 	}
 	pp->pp_pmu_rot_cursor = cursor;
 out:
-	/* §7.3: the kthread self-stops once nothing is left deferred. */
+	/* Stop thread if all groups are assigned. */
 	pp->pp_pmu_rot_needed = pmu_list_has_deferred(&pp->pp_pmu_groups);
 }
 
 /*
- * Per-pp rotation kthread.  Wakes every kern.hwpmc.mux_period_ms (or
- * early on a kick), runs one pmu_pp_rotate_one tick, and goes back to
- * sleep.  Exits when a tick leaves nothing deferred (spec §7.3 idle
- * self-stop) or when pmu_pp_stop_rotate() clears pp_pmu_rot_running;
- * pmu_pp_kick_rotate() respawns it when a group is deferred again.
+ * Rotation thread for process-mode groups.
  */
 static void
 pmu_pp_rotate_thread(void *arg)
@@ -1694,28 +1529,10 @@ pmu_pp_rotate_thread(void *arg)
 }
 
 /*
- * ============================================================
- * System-wide (PMC_MODE_SC) grouping + per-CPU multiplex.
- * ============================================================
- *
- * The functions above schedule groups onto a target process and
- * multiplex them with a per-pp kthread.  The mirror image below
- * schedules system-wide groups onto a single CPU and multiplexes them
- * with a per-CPU kthread.  The structural logic is identical (atomic
- * all-or-none schedule in/out, fair round-robin rotation with a moving
- * cursor); the only real difference is HOW the hardware is touched:
- *
- *   - process mode programs the counter lazily at csw_in time via
- *     pp_pmcs[] / pmc_rotation_attach;
- *
- *   - system mode programs the counter eagerly here, because a
- *     system-wide PMC is never context switched -- it just runs on its
- *     bound CPU until stopped.  hwpmc_pmu_sys_start_row/stop_row do the
- *     pmc_select_cpu() bind dance and carry the cumulative count in
- *     pm->pm_gv.pm_savedvalue so values are continuous across windows.
+ * System-mode (PMC_MODE_SC) grouping and per-CPU multiplexing.
  */
 
-/* Enter and leave SC residency at the group's hardware edges. */
+/* Update system-mode active count for the CPU. */
 static void
 pmu_sys_residency_mark(pmu_group_t *pg, bool admit)
 {
@@ -1727,11 +1544,7 @@ pmu_sys_residency_mark(pmu_group_t *pg, bool admit)
 }
 
 /*
- * Atomically schedule a system group in on its CPU: reserve a HW row
- * for every sibling (all-or-none) and program+start each one.  Returns
- * 0 on success, ENOSPC if the group does not currently fit (it stays
- * deferred for the rotation kthread), or another errno on hard failure.
- * Caller holds pmc_sx exclusive.
+ * Schedule a system group in and start hardware counters.
  */
 static int
 pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
@@ -1743,11 +1556,7 @@ pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
 	if (pg == NULL || pg->pg_assigned)
 		return (0);
 
-	/*
-	 * The owner proc (e.g. pmcstat) is used ONLY for the
-	 * pmc_can_allocate_rowindex() bookkeeping check inside the
-	 * assigner -- system rows are bound to pg_cpu, not to a process.
-	 */
+	/* Check owner process allocation permission. */
 	owner = pg->pg_owner != NULL ? pg->pg_owner->po_owner : NULL;
 	if (owner == NULL)
 		return (EINVAL);
@@ -1777,9 +1586,7 @@ pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
 }
 
 /*
- * Atomically schedule a system group out: stop+read every sibling's HW
- * (folding the window count into pm_gv.pm_savedvalue) and release every
- * row in one pass.  Caller holds pmc_sx exclusive.
+ * Schedule a system group out and stop hardware counters.
  */
 static void
 pmu_sys_schedule_out(int cpu, pmu_group_t *pg)
@@ -1800,11 +1607,7 @@ pmu_sys_schedule_out(int cpu, pmu_group_t *pg)
 }
 
 /*
- * pmc_start() entry point for a system-wide group sibling.  Registers
- * the group on its CPU's rotation list, drives the initial HW placement
- * (first sibling only -- the rest are no-ops because the group is
- * already running), and kicks the per-CPU rotation kthread if the group
- * was left deferred.  Idempotent across siblings.
+ * Start a system group on its bound CPU.
  */
 int
 pmu_sys_group_on_start(struct pmc *pm)
@@ -1849,7 +1652,7 @@ pmu_sys_group_on_start(struct pmc *pm)
 		PMCDBG3(PMC, OPS, 2,
 		    "sys_on_start: gid=%u cpu=%d schedule_in=%d",
 		    pg->pg_id, cpu, sin_err);
-		/* Only a MUX group may stay deferred; anyone else fails. */
+		/* Fail if non-multiplex group cannot fit. */
 		if (sin_err != 0 && (sin_err != ENOSPC || !pg->pg_defer_ok)) {
 			mtx_pool_lock_spin(pmc_mtxpool, pg);
 			pmu_group_running_stop_locked(pg, cpu_ticks());
@@ -1866,11 +1669,7 @@ pmu_sys_group_on_start(struct pmc *pm)
 }
 
 /*
- * pmc_stop() entry point for a system-wide group sibling.  Takes the
- * whole group off hardware (freezing its cumulative count in
- * pm_gv.pm_savedvalue) and frees its rows so a peer can use them.  The
- * group stays on the CPU's rotation list; the rotation kthread skips it
- * because pg_running is now false.  A subsequent pmc_start re-binds it.
+ * Stop a system group and release its hardware rows.
  */
 void
 pmu_sys_group_on_stop(struct pmc *pm)
@@ -1915,14 +1714,7 @@ pmu_syscpu_stop_rotate(struct pmu_syscpu *sc, const char *wmesg)
 }
 
 /*
- * Called at the very top of pmc_release_pmc_descriptor(), BEFORE the
- * framework touches the row, for any system-wide group sibling.  Stops
- * per-CPU rotation, schedules the whole group out so every sibling becomes
- * UNASSIGNED, and unlinks the group from the CPU's rotation list.  After
- * this returns the framework sees PMC_ROW_IS_UNASSIGNED() for the
- * releasing pm and takes its deferred-release path, so it never
- * double-releases a HW row we already freed.  Idempotent across the
- * group's siblings.  Caller holds pmc_sx exclusive.
+ * Prepare a system group for descriptor release.
  */
 void
 pmu_sys_group_pre_release(struct pmc *pm)
@@ -1944,7 +1736,7 @@ pmu_sys_group_pre_release(struct pmc *pm)
 		return;
 	sc = &pmu_syscpu[cpu];
 
-	/* Stop rotation before changing the CPU's group set. */
+	/* Stop rotation before modifying group list. */
 	if (pg->pg_sys_listed)
 		pmu_syscpu_stop_rotate(sc, "muxsrel");
 
@@ -1968,8 +1760,7 @@ pmu_sys_group_pre_release(struct pmc *pm)
 }
 
 /*
- * System-mode mirror of pmu_pp_kick_rotate(): mark rotation needed
- * and wake the per-CPU kthread, spawning it if absent.  Idempotent.
+ * Start or wake the CPU rotation thread.
  */
 static void
 pmu_syscpu_kick_rotate(int cpu)
@@ -2003,11 +1794,7 @@ pmu_syscpu_kick_rotate(int cpu)
 }
 
 /*
- * Run one rotation tick for a CPU.  Identical policy to
- * pmu_pp_rotate_one() -- one victim per tick, escalation while nothing
- * has been placed, pinned groups never evicted, unsatisfiable groups
- * skipped -- keyed on the per-CPU group list, with the owner proc
- * standing in for the target.  Caller holds pmc_sx exclusive.
+ * Run one rotation tick on the bound CPU.
  */
 static void
 pmu_syscpu_rotate_one(int cpu)
@@ -2052,7 +1839,7 @@ pmu_syscpu_rotate_one(int cpu)
 	if (!satisfiable)
 		goto out;
 
-	/* Evict the single victim at the cursor, advance past it. */
+	/* Evict group at cursor and advance cursor. */
 	vpg = cursor;
 	vseen = 0;
 	victim = pmu_list_next_victim(&sc->sc_groups, &vpg, &vseen, ngroups);
@@ -2065,7 +1852,7 @@ pmu_syscpu_rotate_one(int cpu)
 			cursor = LIST_FIRST(&sc->sc_groups);
 	}
 
-	/* Place unplaced MUX groups in cursor order until first ENOSPC. */
+	/* Assign deferred MUX groups in order. */
 	placed_any = false;
 	pg = cursor;
 	seen = 0;
@@ -2097,22 +1884,18 @@ pmu_syscpu_rotate_one(int cpu)
 			sc->sc_cursor = pg;
 			goto out;
 		}
-		/* Hard failure: skip the group for this tick. */
+		/* Skip group on hard error. */
 next:
 		pg = LIST_NEXT(pg, pg_proc_next);
 	}
 	sc->sc_cursor = cursor;
 out:
-	/* §7.3: the kthread self-stops once nothing is left deferred. */
+	/* Stop thread if all groups are assigned. */
 	sc->sc_needed = pmu_list_has_deferred(&sc->sc_groups);
 }
 
 /*
- * Per-CPU rotation kthread.  Wakes every kern.hwpmc.mux_period_ms (or
- * early on a kick), runs one rotation tick, and goes back to sleep.
- * Exits when a tick leaves nothing deferred (spec §7.3 idle self-stop)
- * or when pmu_syscpu_stop_rotate() clears sc_running;
- * pmu_syscpu_kick_rotate() respawns it when a group is deferred again.
+ * Rotation thread for system-mode groups on a CPU.
  */
 static void
 pmu_syscpu_rotate_thread(void *arg)

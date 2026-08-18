@@ -3,13 +3,8 @@
  *
  * Copyright (c) 2026 Advanced Micro Devices, Inc.
  *
- * hwpmc PMU grouping/multiplex layer.  This is a lightweight virtual
- * layer that lets multiple events be programmed atomically (group)
- * and, when there are not enough hardware rows, time-shared
- * (multiplex).  It does NOT replace the existing pcd_allocate_pmc /
- * pcd_release_pmc / pcd_start_pmc / pcd_stop_pmc paths; it only defers
- * those calls until the group is started, and drives them via a
- * sorted, constraint-aware assigner.
+ * PMU event grouping and multiplexing interface.
+ * Defers hardware row allocation until group start.
  */
 
 #ifndef _DEV_HWPMC_PMU_H_
@@ -24,9 +19,7 @@
 #ifdef _KERNEL
 
 /*
- * Mode flags shared by the hwpmc process/thread descriptor lookup
- * helpers.  Originally local to hwpmc_mod.c; promoted to this header
- * so the PMU grouping layer (hwpmc_pmu.c) can use the same names.
+ * Flags for process and thread descriptor lookups.
  */
 enum pmc_flags {
 	PMC_FLAG_NONE	  = 0x00, /* do nothing */
@@ -36,9 +29,8 @@ enum pmc_flags {
 };
 
 /*
- * Scheduling constraint emitted by the per-class backend.  pc_allowed_rows
- * is a bitmask over the backend-defined row index namespace ("row 0..N-1
- * for this class on this CPU"), not a raw MSR/RDPMC number.
+ * Scheduling constraint from the class backend.
+ * pc_allowed_rows is a bitmask of valid class row indices.
  */
 #define	PMC_SC_F_FIXED		0x0001	/* must use pc_fixed_row */
 #define	PMC_SC_F_SHARED		0x0004	/* tolerates sharing siblings */
@@ -51,7 +43,7 @@ struct pmc_sched_constraint {
 };
 typedef struct pmc_sched_constraint pmc_sched_constraint_t;
 
-/* A pmu_event wraps one PMC with its immutable allocation state. */
+/* Event wrapper for group allocation state. */
 struct pmu_event {
 	TAILQ_ENTRY(pmu_event)		pe_sibling;
 	pmu_group_t			*pe_group;
@@ -80,14 +72,8 @@ struct pmu_group_time_snapshot {
 };
 
 /*
- * pmu_group is the unit of all-or-none scheduling.  Either every
- * sibling is bound to a HW row and attached to the target process
- * (pg_assigned == true == "scheduled in") or none of them is (pg_assigned
- * == false == "deferred").  When the union of all groups attached to
- * one pp exceeds the HW counter budget the per-pp rotation kthread
- * evicts the front-most scheduled group atomically and tries to bring
- * in any deferred group that now fits.  Within a group placement is
- * never partial -- every sibling is on a HW row whenever pg_assigned.
+ * PMU event group for atomic scheduling.
+ * All sibling events are assigned together or deferred together.
  */
 struct pmu_group {
 	LIST_ENTRY(pmu_group)		pg_owner_next;
@@ -102,10 +88,8 @@ struct pmu_group {
 	bool				pg_running;	/* between start/stop */
 	bool				pg_defer_ok;	/* PMC_F_GROUP_MUX hint */
 	struct proc			*pg_attach_proc;
-	struct pmc_process		*pg_pp;	/* TARGET pp we hung off
-						 * pp_pmu_groups; cleared on
-						 * release. */
-	/* Virtual enabled/running are thread-ticks; wall fields stay wall-ticks. */
+	struct pmc_process		*pg_pp;	/* target process descriptor */
+	/* Virtual enabled and running times use thread ticks; wall uses TSC. */
 	uint64_t			pg_time_enabled_ticks;
 	uint64_t			pg_time_running_ticks;
 	uint64_t			pg_enabled_wall_ticks;
@@ -124,11 +108,8 @@ struct pmu_group {
 	bool				pg_snapshot_active;
 	bool				pg_releasing;
 	/*
-	 * System-wide (PMC_MODE_SC) group state.  Process-mode groups
-	 * hang off a pmc_process (pg_pp) and rotate in a per-pp kthread;
-	 * system-mode groups are bound to a single CPU and rotate in a
-	 * per-CPU kthread instead (see the pmu_syscpu[] registry in
-	 * hwpmc_pmu.c).  pg_system selects which world a group lives in.
+	 * System-mode (PMC_MODE_SC) state.
+	 * System groups bind to one CPU and rotate on that CPU.
 	 */
 	bool				pg_system;	/* system-wide group */
 	bool				pg_sys_listed;	/* on pmu_syscpu list */
@@ -136,8 +117,7 @@ struct pmu_group {
 };
 
 /*
- * Hooks exported by hwpmc_mod.c so that hwpmc_pmu.c and hwpmc_assign.c
- * stay file-local for the rest of the hwpmc module.
+ * Core hooks from hwpmc_mod.c.
  */
 struct pmc_mdep *hwpmc_get_mdep(void);
 struct pmc_classdep *hwpmc_ri_to_classdep(int ri, int *adjri);
@@ -151,37 +131,14 @@ bool hwpmc_row_is_unallocated(int cpu, int ri);
 void hwpmc_unconfigure_row_all_cpus(struct pmc *pm, int ri);
 
 /*
- * Program / unprogram one system-wide PMC row's hardware on its bound
- * CPU.  Both helpers do the pmc_select_cpu() bind dance internally.
- * start_row zeroes the hardware window and stop_row folds that window
- * into the 64-bit pm_gv.pm_savedvalue software total.  This keeps counts
- * continuous across multiplex windows without narrowing the cumulative
- * value to the hardware width.
+ * Start and stop system-mode PMC hardware on the target CPU.
+ * Values accumulate across multiplex windows.
  */
 void hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm);
 void hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm);
 
 /*
- * The PMU grouping/multiplex scheduler is architecture-independent:
- * hwpmc_pmu.c and hwpmc_assign.c are compiled on every platform.  The
- * only machine-specific piece is the per-event scheduling constraint,
- * which each PMC class supplies through the optional
- * pcd_get_sched_constraint / pcd_can_assign_pmc hooks of its
- * pmc_classdep (implemented for AMD in hwpmc_amd.c).  A class that does
- * not implement them leaves those pointers NULL, and the wrappers in
- * hwpmc_assign.c report the feature unsupported (EOPNOTSUPP) so a group
- * simply fails to commit on such a class -- no per-architecture #ifdefs
- * and no per-class checks anywhere in the grouping code.
- */
-
-/*
- * Assigner (hwpmc_assign.c).  Scheduling is strictly all-or-none at
- * the group level: pmu_assign_group either places every sibling on a
- * HW row or rolls back; pmu_unassign_group releases every row in one
- * pass.  No partial-placement helpers are exposed -- the inter-group
- * rotation in hwpmc_pmu.c achieves multiplexing by atomically
- * scheduling out one group and scheduling in another, never by
- * splitting a single group across windows.
+ * Hardware row assigner (hwpmc_assign.c).
  */
 int pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu);
 void pmu_unassign_group(pmu_group_t *pg, int cpu);
@@ -224,27 +181,15 @@ void pmu_group_csw_out(struct thread *td, int cpu);
 void pmu_group_csw_out_complete(struct thread *td, int cpu);
 
 /*
- * System-wide (PMC_MODE_SC) group lifecycle.  The process-mode hooks
- * above key everything off a pmc_process; system-wide groups have no
- * target process and are instead bound to a single CPU and rotated by a
- * per-CPU kthread.  pmc_start / pmc_stop in hwpmc_mod.c route system
- * group siblings here instead of through the normal per-CPU start/stop.
- * pmu_sys_group_pre_release MUST be called at the very top of
- * pmc_release_pmc_descriptor (before the row is touched): it tears down
- * rotation and atomically schedules the whole group out so every sibling
- * becomes UNASSIGNED, after which the framework's deferred-release path
- * handles each sibling without double-releasing a HW row.
+ * System-mode (PMC_MODE_SC) group lifecycle functions.
  */
 int pmu_sys_group_on_start(struct pmc *pm);
 void pmu_sys_group_on_stop(struct pmc *pm);
 void pmu_sys_group_pre_release(struct pmc *pm);
 
 /*
- * PMU-layer half of the pmc_process lifecycle.  pmu_pp_init sets up the
- * spin lock and group list of a fresh pp; pmu_pp_destroy tears down the
- * per-pp rotation kthread and unhooks every pmu_group still hanging off
- * pp->pp_pmu_groups before the caller frees pp.  pmu_pp_destroy needs
- * pmc_sx held exclusive.
+ * Process descriptor PMU lifecycle functions.
+ * Caller must hold pmc_sx exclusive before pmu_pp_destroy().
  */
 void pmu_pp_init(struct pmc_process *pp);
 void pmu_pp_destroy(struct pmc_process *pp);
@@ -252,8 +197,7 @@ void pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp);
 void pmu_pp_kick_after_exec(struct pmc_process *pp);
 
 /*
- * Hook exported into hwpmc_mod.c so the PMU layer can find a
- * pmc_process descriptor without reaching into mod.c internals.
+ * Find a process descriptor for the PMU layer.
  */
 struct pmc_process *pmc_find_process_descriptor_pmu(struct proc *p,
     uint32_t mode);
@@ -261,15 +205,7 @@ struct pmc_process *pmc_find_process_descriptor_pmu(struct proc *p,
 void hwpmc_pmu_force_context_switch(void);
 
 /*
- * Rotation helpers (hwpmc_mod.c).  These manipulate pp_pmcs[ri]
- * and the pmc_target list directly so the multiplex rotation kthread
- * can swap which sibling owns each HW row without going through
- * pmc_attach_one_process / pmc_release_pmc_descriptor (which would
- * also stop-the-world / signal SIGIO).  Cumulative counts are kept
- * in pm->pm_gv.pm_savedvalue exactly as the framework's csw_out path
- * already maintains them, so detach/attach do not move counters.
- * pmc_rotation_drain spins until pm->pm_runcount drops to zero so
- * the swap is safe.
+ * Rotation helper functions (hwpmc_mod.c).
  */
 void pmc_rotation_drain(struct pmc *pm);
 void pmc_rotation_detach(struct pmc *pm, struct pmc_process *pp);

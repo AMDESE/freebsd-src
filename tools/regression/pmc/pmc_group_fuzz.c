@@ -1,20 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * E7: fuzz the hwpmc group syscalls.
- *
- * Calls PMC_OP_PMCGROUPADD / PMCGROUPCOMMIT / PMCGROUPREAD directly --
- * bypassing libpmc's argument validation, which is the point: the kernel
- * must reject bad input itself.  Randomises group ids, pmc ids, capacities
- * (0, 1, 32, 33, UINT32_MAX and arbitrary), and targets groups in every
- * lifecycle state (never-created, uncommitted, committed, released) as
- * well as ids belonging to another process.
- *
- * Build: cc -O -g -Wall -o pmc_group_fuzz pmc_group_fuzz.c -lpmc
- * Run:   sudo ./pmc_group_fuzz [iterations]
- *
- * Acceptance: every call returns an errno; no panic; no KASSERT.
- * Exit 0 = survived, 77 = skip.
+ * Fuzz test for hwpmc group system calls.
  */
 #include <sys/param.h>
 #include <sys/types.h>
@@ -39,7 +26,7 @@ static int pmc_sc = -1;
 static unsigned long calls, errs, oks;
 static unsigned int seed = 12345;
 
-/* Deterministic PRNG so a failing run can be replayed. */
+/* PRNG for repeatable test runs. */
 static uint32_t
 rnd(void)
 {
@@ -73,9 +60,7 @@ note(long rv)
 }
 
 /*
- * PMCGROUPREAD with a wild capacity. The snapshot buffer is sized for
- * 'alloc' members but pm_nmembers claims 'claim' -- the kernel must not
- * write past what we allocated.
+ * Test PMCGROUPREAD with arbitrary capacity values.
  */
 static void
 fuzz_read(pmc_id_t leader, uint32_t claim, uint32_t alloc)
@@ -83,14 +68,7 @@ fuzz_read(pmc_id_t leader, uint32_t claim, uint32_t alloc)
 	struct pmc_op_pmcgroupread *gr;
 	size_t sz;
 
-	/*
-	 * pm_nmembers is the caller's declaration of how big the buffer is;
-	 * the kernel sizes its copyout from it (bounded by the group's real
-	 * membership).  A caller that claims more than it allocated corrupts
-	 * its own memory, and that is caller error, not a kernel bug -- so
-	 * always allocate for at least what we claim, and use the red zone
-	 * to catch the kernel writing beyond even that.
-	 */
+	/* Allocate memory with guard bytes. */
 	if (alloc > 64)
 		alloc = 64;
 	if (alloc < claim && claim <= 64)
@@ -98,7 +76,7 @@ fuzz_read(pmc_id_t leader, uint32_t claim, uint32_t alloc)
 	if (claim > 64)
 		alloc = 64;
 	sz = sizeof(*gr) + (size_t)alloc * sizeof(gr->pm_members[0]);
-	gr = calloc(1, sz + 4096);	/* red zone */
+	gr = calloc(1, sz + 4096);	/* guard zone */
 	if (gr == NULL)
 		return;
 	memset((char *)gr + sz, 0xA5, 4096);
@@ -107,7 +85,7 @@ fuzz_read(pmc_id_t leader, uint32_t claim, uint32_t alloc)
 	errno = 0;
 	note(CALL(PMC_OP_PMCGROUPREAD, gr));
 
-	/* The kernel must not have touched the red zone. */
+	/* Verify guard zone was not modified. */
 	for (size_t i = 0; i < 4096; i++) {
 		if (((unsigned char *)gr)[sz + i] != 0xA5) {
 			printf("  *** RED ZONE CLOBBERED at +%zu "
@@ -167,7 +145,7 @@ main(int argc, char **argv)
 	printf("hwpmc syscall=%d, %ld iterations, seed=%u\n", pmc_sc, iters,
 	    seed);
 
-	/* A real, committed, running group to aim at. */
+	/* Create committed test group. */
 	if (pmc_group_create(&real_gid) < 0)
 		errx(77, "group_create: %s", strerror(errno));
 	{
@@ -194,11 +172,11 @@ main(int argc, char **argv)
 	if (pmc_start(real_ids[0]) < 0)
 		errx(77, "start: %s", strerror(errno));
 
-	/* An uncommitted group. */
+	/* Create uncommitted test group. */
 	if (pmc_group_create(&uncommitted_gid) < 0)
 		errx(77, "group_create 2");
 
-	/* A group that is created then released, so its id is stale. */
+	/* Create released test group. */
 	if (pmc_group_create(&released_gid) == 0) {
 		pmc_id_t tmp;
 
@@ -223,7 +201,7 @@ main(int argc, char **argv)
 		uint32_t gid;
 		pmc_id_t pid_;
 
-		/* Pick a group id from a mix of valid and wild values. */
+		/* Select group identifier. */
 		switch (rnd() % 6) {
 		case 0: gid = real_gid; break;
 		case 1: gid = uncommitted_gid; break;
@@ -233,7 +211,7 @@ main(int argc, char **argv)
 		default: gid = UINT32_MAX; break;
 		}
 
-		/* And a pmc id likewise. */
+		/* Select PMC identifier. */
 		switch (rnd() % 6) {
 		case 0: pid_ = real_ids[0]; break;
 		case 1: pid_ = real_ids[nreal - 1]; break;
@@ -263,7 +241,7 @@ main(int argc, char **argv)
 	printf("done: %lu calls, %lu returned an errno, %lu returned 0\n",
 	    calls, errs, oks);
 
-	/* The real group must still be intact and readable. */
+	/* Verify group is readable. */
 	{
 		struct pmc_group_times t;
 		uint32_t n = 0;

@@ -373,10 +373,8 @@ enum pmc_ops {
 #define	PMC_F_NEWVALUE		0x00000010 /*OP RW write new value */
 #define	PMC_F_OLDVALUE		0x00000020 /*OP RW get old value */
 /*
- * NOTE: bit 0x00000001 is reserved by PMC_PP_ENABLE_MSR_ACCESS in
- * pp_flags but is incorrectly tested against pm_flags inside
- * pmc_attach_process(); avoid using it as a pm_flags bit.  Bit
- * 0x00000040 is the first slot that is otherwise free.
+ * Bit 0x00000001 is reserved for PMC_PP_ENABLE_MSR_ACCESS in pp_flags.
+ * Do not use bit 0x00000001 for pm_flags. Bit 0x00000040 is free.
  */
 #define	PMC_F_GROUP_DEFER	0x00000040 /* defer HW row assign (group) */
 
@@ -465,7 +463,7 @@ struct pmc_op_pmcgroupadd {
 #define	PMC_GROUP_F_LEADER	0x00000001
 #define	PMC_GROUP_MAX_MEMBERS	32
 
-/* Presentation clamp: tools refuse to extrapolate beyond this ratio. */
+/* Maximum scaling ratio for count extrapolation. */
 #define	PMC_SCALE_MAX		10
 
 struct pmc_op_pmcgroupcommit {
@@ -811,12 +809,8 @@ struct pmc_pcpu_state {
 
 #ifdef _KERNEL
 /*
- * Opaque handles for the hwpmc PMU grouping/multiplex layer
- * (sys/dev/hwpmc/hwpmc_pmu.h).  Declared here as incomplete types so
- * that struct pmc and struct pmc_process can embed pointers to them;
- * the full struct definitions (and the matching pmc_sched_constraint_t)
- * live in the PMU layer header, which is only compiled in on
- * architectures that provide the grouping backend.
+ * Types for PMU grouping and multiplexing.
+ * Full definitions are in sys/dev/hwpmc/hwpmc_pmu.h.
  */
 typedef struct pmu_event pmu_event_t;
 typedef struct pmu_group pmu_group_t;
@@ -879,19 +873,13 @@ struct pmc {
 
 #ifdef _KERNEL
 	pmu_event_t		*pm_pmu;	/* grouping/multiplex state */
-	pmc_id_t		pm_handle;	/* stable user-facing id;
-						 * pm_id may be rewritten by
-						 * the group assigner, but
-						 * pm_handle is fixed at
-						 * allocate time */
+	pmc_id_t		pm_handle;	/* stable user handle */
 #endif
 };
 
 /*
- * Reserved range in the row-index byte for deferred (group) PMC handles
- * before the assigner places them on real hardware rows.  Distinguishes
- * each deferred PMC for pmc_find_pmc() lookups.  Real hardware rows are
- * always < md->pmd_npmc which is much smaller than 0x80.
+ * Row-index range for deferred group PMC handles before assignment.
+ * Hardware row indices are always less than 0x80.
  */
 #define	PMC_HANDLE_DEFERRED_BASE	0x80
 #define	PMC_HANDLE_DEFERRED_MAX		0xFE
@@ -972,13 +960,8 @@ struct pmc_process {
 	struct pmu_group_list pp_pmu_groups;	/* attached PMU groups (FIFO) */
 	struct mtx	pp_pmu_lock;		/* protects pp_pmu_groups */
 	/*
-	 * Inter-group multiplex rotation.  When the union of events
-	 * across pp_pmu_groups exceeds the available HW counters, the
-	 * pp-level rotation kthread evicts the front-most scheduled
-	 * group every kern.hwpmc.mux_period_ms tick and brings in
-	 * any deferred group whose nevents now fits.  Within a group
-	 * scheduling is always atomic: every sibling is placed on HW
-	 * together or none of them is.
+	 * Multiplex rotation thread. Rotates groups when total events
+	 * exceed available hardware counters.
 	 */
 	struct thread	*pp_pmu_rot_td;
 	u_int		pp_pmu_refs;
@@ -987,14 +970,7 @@ struct pmc_process {
 	bool		pp_pmu_rot_needed;	/* unplaced MUX group waiting */
 	bool		pp_pmu_unhashed;
 	/*
-	 * Round-robin cursor: where the next rotation tick starts.
-	 * Both the victim scan (the placed MUX group evicted this
-	 * tick) and the placement walk begin here.  When a group
-	 * fails to fit (ENOSPC) we record it as the next cursor and
-	 * stop the tick; the next tick begins from there.  When a
-	 * group is removed from pp_pmu_groups (release path) it must
-	 * clear this if it points at itself, so the kthread does not
-	 * chase a freed pmu_group.
+	 * Group cursor for the next rotation tick.
 	 */
 	pmu_group_t	*pp_pmu_rot_cursor;
 #endif
@@ -1209,8 +1185,7 @@ struct pmc_classdep {
 	int (*pcd_stop_pmc)(int _cpu, int _ri, struct pmc *_pm);
 
 	/*
-	 * optional context-switch batch ops. pcd_stop_all runs before
-	 * per-PMC stop/read; pcd_start_all runs after per-PMC starts.
+	 * Optional context-switch batch operations.
 	 */
 	int (*pcd_start_all)(int _cpu);
 	int (*pcd_stop_all)(int _cpu);
@@ -1228,12 +1203,7 @@ struct pmc_classdep {
 	int (*pcd_get_msr)(int _ri, uint32_t *_msr);
 
 	/*
-	 * PMU event-grouping / multiplex constraint providers (optional).
-	 * A class that does not implement grouping leaves these NULL; the
-	 * pmu layer wrappers then report the feature as unsupported
-	 * (EOPNOTSUPP) or treat the row as unconstrained.  Keeping these
-	 * in the class descriptor lets the grouping code stay free of
-	 * per-architecture #ifdefs and per-class checks.
+	 * PMU grouping and multiplex constraint functions (optional).
 	 */
 	int (*pcd_can_assign_pmc)(int _ri, struct pmc *_pm,
 	    const struct pmc_op_pmcallocate *_a);

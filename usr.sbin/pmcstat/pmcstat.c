@@ -277,8 +277,7 @@ pmcstat_start_pmcs(void)
 }
 
 /*
- * Width of the per-group trailing residency column (spec section 5.3);
- * blank while the group is fully resident so scrapers see stable rows.
+ * Column width for group residency percentage.
  */
 #define	PRINT_RESIDENCY_WIDTH	8
 
@@ -357,7 +356,7 @@ pmcstat_print_counters(void)
 		if (PMC_IS_SAMPLING_MODE(ev->ev_mode))
 			continue;
 
-		/* close the previous group's trailing residency column */
+		/* Print residency for previous group. */
 		if (gid != 0 && ev->ev_groupid != gid) {
 			pmcstat_print_residency(have_times, residency);
 			gid = 0;
@@ -381,7 +380,7 @@ pmcstat_print_counters(void)
 			continue;
 		}
 
-		/* one snapshot per leader per interval (spec section 5.3) */
+		/* Read group snapshot from leader. */
 		if (ev->ev_is_leader) {
 			gid = ev->ev_groupid;
 			nmembers = PMC_GROUP_MAX_MEMBERS;
@@ -419,7 +418,7 @@ pmcstat_print_counters(void)
 		d_value = value - ev->ev_saved;
 		ev->ev_saved = value;
 
-		/* scale per spec section 4.4 */
+		/* Scale count by enabled and running ratio. */
 		if (!have_times) {
 			(void) fprintf(args.pa_printfile, "%*ju ", width,
 			    (uintmax_t) ev->ev_cumulative ? value : d_value);
@@ -431,7 +430,7 @@ pmcstat_print_counters(void)
 			    "<not counted>");
 		} else {
 			if (d_enabled > (uint64_t)PMC_SCALE_MAX * d_running)
-				estimate = d_value; /* refuse to extrapolate */
+				estimate = d_value; /* Cap scaling ratio. */
 			else
 				estimate = (uint64_t)((long double)d_value *
 				    d_enabled / d_running);
@@ -641,7 +640,7 @@ main(int argc, char **argv)
 	while ((option = getopt(argc, argv,
 	    "ACD:EF:G:ILM:NO:P:R:S:TUWZa:bc:def:gi:l:m:n:o:p:qr:s:t:u:vw:z:")) != -1)
 		switch (option) {
-		case 'b':	/* batch grouping: {a,b,c} forms a PMU group */
+		case 'b':	/* Group events in braces {a,b,c}. */
 			args.pa_flags |= FLAG_DO_GROUPING;
 			break;
 
@@ -823,16 +822,7 @@ main(int argc, char **argv)
 					    nsib);
 					break;
 				}
-				/*
-				 * rv == 1: a single-element brace list such as
-				 * "{instructions}" -- not a real group.  The
-				 * parser stripped the braces and surrounding
-				 * whitespace; use that cleaned spec for the
-				 * fall-through single-event path below.  Passing
-				 * the literal "{...}" optarg (with its '{') to
-				 * pmc_allocate() is what the kernel rejects with
-				 * EINVAL.
-				 */
+				/* Handle single-event brace list as plain event. */
 				if (nsib == 1 && siblings != NULL) {
 					optarg = strdup(siblings[0]);
 					if (optarg == NULL)
@@ -840,7 +830,7 @@ main(int argc, char **argv)
 						    "ERROR: Out of memory.");
 				}
 				pmcstat_free_event_group(siblings, nsib);
-				/* not really a group; fall through */
+				/* Process as single event. */
 			}
 			caps = 0;
 			if ((ev = calloc(1, sizeof(*ev))) == NULL)
@@ -1344,19 +1334,7 @@ main(int argc, char **argv)
 	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
 		int rc;
 
-		/*
-		 * In brace-grouping mode (-b) we cannot tell at parse time
-		 * whether the combined event count of every group attached
-		 * to one target will fit in the available HW counters.  Two
-		 * groups that each fit on their own can still collectively
-		 * over-subscribe the PMU (e.g. 2+3+3 events on a 6-counter
-		 * Zen3).  The kernel only consults PMC_F_GROUP_MUX on the
-		 * leader's allocation and only acts on it when nevents
-		 * exceeds the *remaining* HW slot budget at commit time, so
-		 * setting it unconditionally on every leader is a no-op for
-		 * groups that fit and a graceful fallback for groups that
-		 * would otherwise hit ENOSPC at pmc_group_commit.
-		 */
+		/* Enable multiplexing for group leaders. */
 		if (ev->ev_groupid > 0 && ev->ev_is_leader)
 			ev->ev_flags |= PMC_F_GROUP_MUX;
 

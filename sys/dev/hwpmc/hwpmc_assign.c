@@ -3,21 +3,13 @@
  *
  * Copyright (c) 2026 Advanced Micro Devices, Inc.
  *
- * Most-constrained-first greedy assigner for hwpmc grouping/multiplex.
+ * Greedy row assigner for PMU event groups.
  *
  * Algorithm:
- *   1. Each event has a pmc_sched_constraint published by its class
- *      back-end through pcd_get_sched_constraint.  pc_allowed_rows is
- *      a bitmask in the backend's row-index namespace; pc_weight is
- *      popcount(pc_allowed_rows).
- *   2. pmu_assign_group walks events in increasing pc_weight order.
- *      Lower weight == more constrained == placed first.  Ties are
- *      broken by insertion order (TAILQ position) for determinism.
- *   3. For each event we scan its allowed rows, pick the first that
- *      is not already used by this group and that the existing
- *      pcd_allocate_pmc accepts.
- *   4. Failure to place ANY event triggers pmu_unassign_group, which
- *      releases everything that was placed earlier (all-or-none).
+ * 1. Read event constraints from the class backend.
+ * 2. Sort events by weight in ascending order.
+ * 3. Assign each event to the first available allowed row.
+ * 4. On assignment failure, release all assigned rows.
  */
 
 #include <sys/param.h>
@@ -30,10 +22,7 @@
 #include "hwpmc_pmu.h"
 
 /*
- * Look up the class descriptor for a PMC class.  Returns NULL if the
- * class is not present on this machine.  Used by the constraint /
- * can-assign wrappers below so the assigner never needs to name a
- * specific back-end.
+ * Find the class descriptor for a PMC class.
  */
 static struct pmc_classdep *
 pmu_class_to_classdep(enum pmc_class class)
@@ -54,10 +43,7 @@ pmu_class_to_classdep(enum pmc_class class)
 }
 
 /*
- * Per-row feasibility check via the class back-end.  A class that does
- * not publish pcd_can_assign_pmc imposes no extra per-row constraint,
- * so an absent (NULL) provider means "allowed" (0); the group is still
- * gated by pcd_get_sched_constraint's allowed-row mask.
+ * Check row assignment feasibility with the class backend.
  */
 static int
 pmu_can_assign_pmc(struct pmc_classdep *pcd, int adjri, struct pmc *pm,
@@ -69,11 +55,7 @@ pmu_can_assign_pmc(struct pmc_classdep *pcd, int adjri, struct pmc *pm,
 }
 
 /*
- * Fetch an event's scheduling constraint from its class back-end.  The
- * provider is optional: a class that does not implement grouping leaves
- * pcd_get_sched_constraint NULL, and we report the feature unsupported
- * (EOPNOTSUPP) so pmu_validate_group rejects the group cleanly.  This
- * keeps the assigner platform-agnostic -- no per-class special cases.
+ * Get scheduling constraints for an event from the class backend.
  */
 int
 pmu_event_get_constraint(pmu_event_t *pe,
@@ -92,10 +74,7 @@ pmu_event_get_constraint(pmu_event_t *pe,
 }
 
 /*
- * True if the given PMC class participates in event grouping, i.e. its
- * back-end publishes a scheduling-constraint provider.  Lets callers
- * (e.g. the deferred-group allocation path) reject unsupported classes
- * early without naming any specific architecture.
+ * Return true if the PMC class supports event grouping.
  */
 bool
 pmu_class_supports_grouping(enum pmc_class class)
@@ -107,12 +86,7 @@ pmu_class_supports_grouping(enum pmc_class class)
 }
 
 /*
- * Try to bind one event to a row.  used_mask tracks rows already
- * consumed by earlier events in this group.  evictable_rows is a
- * global-ri mask of rows whose current occupant rotation could evict;
- * those rows are treated as allocatable even when the framework's
- * occupancy checks reject them.  A NULL p probes against an empty
- * machine: the framework occupancy checks are skipped entirely.
+ * Assign one event to a hardware row.
  */
 static int
 pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
@@ -126,10 +100,8 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 	bool sys;
 
 	/*
-	 * pe_cons.pc_allowed_rows / *used_mask / pc_fixed_row all live in
-	 * the per-class adjri namespace (e.g., bits 0..5 for AMD CORE).
-	 * Global ri = pcd->pcd_ri + adjri.  We iterate adjri space and
-	 * convert to global ri only where the framework requires it.
+	 * Constraints use the per-class row index (adjri).
+	 * Global row index is pcd->pcd_ri + adjri.
 	 */
 	pcd = pmu_class_to_classdep(pe->pe_alloc.pm_class);
 	if (pcd == NULL)
@@ -137,11 +109,7 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 	pm = pe->pe_pmc;
 	mode = pe->pe_alloc.pm_mode;
 	allowed = pe->pe_cons.pc_allowed_rows;
-	/*
-	 * Virtual rows are CPU-agnostic and encode PMC_CPU_ANY; system
-	 * rows are bound to the caller-supplied CPU and must encode it so
-	 * PMC_TO_CPU() resolves correctly on the start/stop/read paths.
-	 */
+	/* System mode binds to a specific CPU; virtual mode uses any CPU. */
 	sys = PMC_IS_SYSTEM_MODE(mode);
 	idcpu = sys ? cpu : PMC_CPU_ANY;
 
@@ -170,7 +138,7 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 		    !hwpmc_can_allocate_rowindex(p, n, idcpu)) &&
 		    (n >= 64 || (evictable_rows & (1ULL << n)) == 0))
 			goto skip;
-		/* System rows publish occupancy via phw_pmc (spec §5.4). */
+		/* Check system row occupancy. */
 		if (sys && p != NULL && !hwpmc_row_is_unallocated(cpu, n) &&
 		    (n >= 64 || (evictable_rows & (1ULL << n)) == 0))
 			goto skip;
@@ -185,11 +153,7 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 			return (0);
 		pm->pm_id = PMC_ID_MAKE_ID(idcpu, mode,
 		    pe->pe_alloc.pm_class, n);
-		/*
-		 * Mark the row's disposition to match its world: system
-		 * rows are STANDALONE (so a process-mode PMC can never grab
-		 * the same row on this CPU), virtual rows are THREAD.
-		 */
+		/* Mark row as STANDALONE for system mode or THREAD for virtual mode. */
 		if (sys)
 			hwpmc_mark_row_standalone(n);
 		else
@@ -205,10 +169,7 @@ skip:
 }
 
 /*
- * Atomically release every HW row currently held by pg.  All-or-none
- * scheduling means there is no "partial" path: either pg is fully
- * scheduled in (every sibling on a row) or fully out, so this single
- * function suffices.
+ * Release all hardware rows assigned to a group.
  */
 void
 pmu_unassign_group(pmu_group_t *pg, int cpu)
@@ -222,13 +183,7 @@ pmu_unassign_group(pmu_group_t *pg, int cpu)
 
 	sys = (pg != NULL && pg->pg_system);
 
-	/*
-	 * AMD's pcd_release_pmc is logically a no-op but its KASSERT
-	 * still requires cpu >= 0.  PMC_CPU_ANY (-1) is a perfectly
-	 * legitimate "any CPU" value for virtual-mode PMCs, so coerce
-	 * it to CPU 0 here rather than fan it out across the per-class
-	 * back-ends.  System groups always pass their real bound CPU.
-	 */
+	/* Set CPU index to 0 for virtual mode. */
 	if (cpu < 0)
 		cpu = 0;
 
@@ -241,15 +196,8 @@ pmu_unassign_group(pmu_group_t *pg, int cpu)
 		pcd = hwpmc_ri_to_classdep(n, &adjri);
 		if (pcd != NULL) {
 			/*
-			 * Unconfigure before releasing: pcd_config_pmc is
-			 * what clears the row's phw_pmc back-pointer, and
-			 * pcd_release_pmc asserts that it is already NULL.
-			 *
-			 * A system row is only ever configured on its bound
-			 * CPU.  A virtual row is configured by csw_in on
-			 * whichever CPU ran the target, and rotation can
-			 * reclaim it before that thread switches out again,
-			 * so sweep every CPU still pointing at this PMC.
+			 * Clear configuration before releasing the row.
+			 * Unconfigure all CPUs for virtual mode.
 			 */
 			if (sys)
 				(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
@@ -259,7 +207,7 @@ pmu_unassign_group(pmu_group_t *pg, int cpu)
 		}
 		pm->pm_id = PMC_ID_MAKE_ID(PMC_CPU_ANY, mode,
 		    pe->pe_alloc.pm_class, PMC_ROW_UNASSIGNED);
-		/* Undo the disposition we took in pmu_assign_one(). */
+		/* Clear row disposition. */
 		if (sys)
 			hwpmc_unmark_row_standalone(n);
 		else
@@ -269,8 +217,7 @@ pmu_unassign_group(pmu_group_t *pg, int cpu)
 }
 
 /*
- * Sort events by pe_cons.pc_weight ascending into 'order[]'.  Stable
- * insertion-sort; ties keep insertion order.
+ * Sort events by constraint weight in ascending order.
  */
 static void
 pmu_sort_by_weight(pmu_group_t *pg, pmu_event_t **order, u_int n)
@@ -336,11 +283,7 @@ pmu_group_can_place(pmu_group_t *pg, struct proc *p, int cpu)
 }
 
 /*
- * Third probe view (spec §7.2): could pg be placed if every row in
- * evictable_rows -- the rows currently held by the domain's placed MUX
- * groups -- were freed?  ENOSPC here means the group is genuinely
- * unsatisfiable: pinned groups and ungrouped PMCs hold the rows it
- * needs permanently, so rotation must skip it rather than evict for it.
+ * Check if a group can fit when evictable rows become free.
  */
 int
 pmu_group_satisfiable(pmu_group_t *pg, struct proc *p, int cpu,
@@ -364,13 +307,7 @@ pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu)
 	if (pg->pg_assigned)
 		return (0);
 
-	/*
-	 * pmu_assign_group is called both from pmu_group_commit (where
-	 * pg_committed is still false because we are mid-commit) and
-	 * from pmu_pp_schedule_in (where pg_committed is true).  Don't
-	 * gate on pg_committed; pmu_validate_group below covers all the
-	 * structural invariants we actually care about.
-	 */
+	/* Validate group configuration before assignment. */
 	error = pmu_validate_group(pg);
 	if (error != 0)
 		return (error);
@@ -378,7 +315,7 @@ pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu)
 	KASSERT(pg->pg_nevents <= PMC_GROUP_MAX_MEMBERS,
 	    ("[pmu] assign: gid=%u nevents=%u", pg->pg_id, pg->pg_nevents));
 
-	/* See comment in pmu_unassign_group: AMD insists on cpu >= 0. */
+	/* Set CPU index to 0 for virtual mode. */
 	if (cpu < 0)
 		cpu = 0;
 
@@ -418,20 +355,8 @@ pmu_validate_group(pmu_group_t *pg)
 	nleaders = 0;
 
 	/*
-	 * Every sibling must share the leader's world.  A group is
-	 * either fully virtual (per-process) or fully system-wide; mixed
-	 * groups make no sense because they would rotate on different
-	 * schedulers.  For system-wide groups we additionally require a
-	 * single bound CPU -- all-or-none placement is per-CPU, so
-	 * siblings on different CPUs could never be co-scheduled.
-	 *
-	 * A system-wide group must also be COUNTING (PMC_MODE_SC).  Every
-	 * other system-wide mode -- PMC_MODE_SS today -- is rejected: those
-	 * PMCs are published in per-CPU hardware and fanned out to a row on
-	 * every CPU, and their owners carry po_sscount accounting, none of
-	 * which this layer's single-bound-CPU, all-or-none placement models.
-	 * Reject them cleanly so userland falls back instead of silently
-	 * mis-sampling.
+	 * Validate group mode. All siblings must match the leader.
+	 * System groups must use PMC_MODE_SC and bind to one CPU.
 	 */
 	lmode = pg->pg_leader->pe_alloc.pm_mode;
 	sys = PMC_IS_SYSTEM_MODE(lmode);

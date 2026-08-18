@@ -93,7 +93,7 @@ CTASSERT(sizeof(struct pmc_op_pmcgroupread) == 48);
  * Types
  */
 
-/* enum pmc_flags moved to hwpmc_pmu.h so the PMU grouping layer can use it. */
+/* enum pmc_flags is defined in hwpmc_pmu.h. */
 
 /*
  * The offset in sysent where the syscall is allocated.
@@ -872,7 +872,7 @@ pmc_remove_owner(struct pmc_owner *po)
 	/* Remove descriptor from the owner hash table */
 	LIST_REMOVE(po, po_next);
 
-	/* release groups before any remaining standalone PMCs */
+	/* Release groups before standalone PMCs. */
 	while ((pg = LIST_FIRST(&po->po_groups)) != NULL) {
 		if (pg->pg_releasing) {
 			(void)sx_sleep(&pg->pg_releasing, &pmc_sx, 0,
@@ -1005,7 +1005,7 @@ pmc_drain_pmc_cpu(struct pmc *pm, int cpu)
 }
 
 /*
- * Wait until no CPU or queued sample references this PMC.
+ * Wait until no CPU or sample references this PMC.
  */
 void
 pmc_rotation_drain(struct pmc *pm)
@@ -1020,33 +1020,8 @@ pmc_rotation_drain(struct pmc *pm)
 	sx_assert(&pmc_sx, SX_XLOCKED);
 
 	/*
-	 * pm_runcount is bumped at csw_in and dropped at csw_out, so it
-	 * only falls when the CPUs currently holding this PMC in hardware
-	 * actually context-switch.  The old implementation just pause()d
-	 * on the *calling* CPU and hoped the remote targets would switch
-	 * on their own.  That is unsafe for the multiplex rotation: a
-	 * counting-mode target thread that is the only runnable thread on
-	 * its core is never involuntarily preempted, so it never runs
-	 * csw_out, pm_runcount never reaches zero, and this loop spins
-	 * until the INVARIANTS cap trips and panics (or, on a production
-	 * kernel, stalls for a long time while holding pmc_sx).
-	 *
-	 * Drive the drain actively instead: migrate onto every CPU whose
-	 * pps_cpustate still advertises the counter (spec §7.5 -- the
-	 * cost is bounded by the PMC's own footprint, not the machine
-	 * size).  pmc_select_cpu() binds us there at PRI_MIN, which
-	 * preempts the resident target thread and forces its csw_out
-	 * (that runs during the switch *to* us, so by the time we execute
-	 * on the CPU the runcount for that CPU has already dropped).
-	 * Because rotation has already stamped every sibling STOPPED
-	 * before draining, the preempted thread's next csw_in will not
-	 * re-load the counter, so a single visit per CPU is enough.
-	 *
-	 * The derived CPU set is advisory under PerfMonV2: the csw-out
-	 * prepare pass clears pps_cpustate before the runcount drops, so
-	 * an empty set with pm_runcount > 0 means a switch-out is
-	 * completing right now (or queued samples still reference the
-	 * PMC) -- re-poll briefly, never treat it as already drained.
+	 * Migrate to each CPU running the target to force a context
+	 * switch and drain the PMC run count.
 	 */
 	pmc_save_cpu_binding(&pb);
 	while (counter_u64_fetch(pm->pm_runcount) > 0) {
@@ -1078,11 +1053,8 @@ pmc_rotation_drain(struct pmc *pm)
 }
 
 /*
- * Detach a PMC from a process target without touching the cumulative
- * count (already maintained in pm->pm_gv.pm_savedvalue by the regular
- * csw_out path) and without sending SIGIO when pm->pm_targets becomes
- * empty.  Caller must hold pmc_sx and must have transitioned pm to
- * STOPPED + drained pm_runcount first.
+ * Detach a PMC from a target process.
+ * Caller must hold pmc_sx and ensure the PMC is stopped and drained.
  */
 void
 pmc_rotation_detach(struct pmc *pm, struct pmc_process *pp)
@@ -1325,23 +1297,8 @@ pmc_attach_one_process(struct proc *p, struct pmc *pm)
 	pg = pmu_group_from_pmc(pm);
 
 	/*
-	 * Deferred grouped sibling: under the new all-or-none scheduling
-	 * a group is either fully placed (every sibling on a HW row,
-	 * pm_id valid) or fully deferred (every sibling carries pm_id =
-	 * PMC_ROW_UNASSIGNED until the per-pp rotation kthread brings
-	 * the group in atomically).
-	 *
-	 * Trying to opportunistically run pmu_assign_group from this
-	 * path is wrong: the per-proc rows are already occupied by the
-	 * previously-committed groups, so the placement would always
-	 * fail with EBUSY/ENOSPC and abort pmc_attach.  Instead we
-	 * mark the deferred sibling attached and register the whole group
-	 * on pp->pp_pmu_groups; pmu_group_on_start either schedules it in
-	 * (if rows are free now) or the per-pp rotation kthread later
-	 * atomically binds every sibling at
-	 * once.  Walking pp_pmcs[ri] here would also be unsafe because
-	 * pp_pmcs[] is a flexible array sized to md->pmd_npmc, so
-	 * indexing it at PMC_ROW_UNASSIGNED (255) is an OOB read+write.
+	 * Deferred group member. Mark attached and register on the process
+	 * group list without hardware row assignment.
 	 */
 	if (PMC_ROW_IS_UNASSIGNED(pm)) {
 		error = pmu_group_on_attach(pm, p);
@@ -1506,13 +1463,7 @@ pmc_detach_one_process(struct proc *p, struct pmc *pm, int flags)
 	PMCDBG6(PRC,ATT,2, "detach-one pm=%p ri=%d proc=%p (%d, %s) flags=0x%x",
 	    pm, ri, p, p->p_pid, p->p_comm, flags);
 
-	/*
-	 * Symmetric with the attach path: a deferred multiplex sibling is
-	 * never linked into pp_pmcs[] (its row is rotated in transparently
-	 * by pmc_rotation_attach when its turn comes), and its pm_id has
-	 * the synthetic PMC_ROW_UNASSIGNED row index.  Treat detach as a
-	 * silent no-op rather than dereferencing pp_pmcs[255] OOB.
-	 */
+	/* Deferred group members are not in pp_pmcs[]. */
 	if (PMC_ROW_IS_UNASSIGNED(pm)) {
 		pm->pm_flags &= ~PMC_F_ATTACH_DONE;
 		return (0);
@@ -1784,8 +1735,7 @@ pmc_process_exec(struct thread *td, struct pmckern_procexec *pk)
 }
 
 /*
- * call optional per-class context-switch batch ops.
- * classes without shared hw gate leave these callbacks NULL.
+ * Execute optional context-switch batch operations for all classes.
  */
 static void
 pmc_process_csw_start_all(int cpu)
@@ -1816,8 +1766,7 @@ pmc_process_csw_stop_all(int cpu)
 }
 
 /*
- * mark every configured virtual PMC undesired before stop-all closes
- * shared gate. separate pass keeps stalled-PMC restart order for batch.
+ * Mark virtual PMCs stopped before closing hardware gates.
  */
 static void
 pmc_process_csw_out_prepare(int cpu)
@@ -2499,10 +2448,7 @@ pmc_process_thread_userret(struct thread *td)
 }
 
 /*
- * Does 'pg' have a sampling member that is not currently on a hardware
- * row?  Placed members are also reachable through pp_pmcs[], and are
- * logged by the normal walk in the mapping hooks; only members a
- * multiplex window has evicted (or never placed) need the group list.
+ * Return true if the group contains an unassigned sampling event.
  */
 static bool
 pmc_group_needs_mapping(pmu_group_t *pg)
@@ -2524,29 +2470,7 @@ pmc_group_needs_mapping(pmu_group_t *pg)
 }
 
 /*
- * Log a mapping change to the owners of grouped sampling PMCs targeting
- * 'pp'.  A group stays hooked to pp->pp_pmu_groups while it is evicted
- * from hardware, so its members are invisible to the pp_pmcs[] walk and
- * would otherwise miss every mapping taken during that window, leaving
- * the samples of the next window unsymbolizable.
- *
- * 'path' selects the record: non-NULL emits a MAP_IN at 'start', NULL
- * emits a MAP_OUT for [start, end).
- *
- * The callers run from a VM callback, so this may neither sleep nor
- * acquire pmc_sx.  The group list is therefore walked under
- * pp_pmu_lock, which is what keeps it consistent: a group is unlinked
- * from pp_pmu_groups under that lock before its members are destroyed.
- * The owners found are snapshotted and their records emitted after the
- * lock is dropped, so the log kthread is woken normally and the record
- * reaches the log file ahead of the samples it describes.  The callers
- * hold the PMC epoch across that window and owner destruction waits for
- * it, which is what keeps the snapshotted pointers alive.
- *
- * Mapping records are owner-scoped, so this walk emits at most one per
- * owner.  An owner that also has a placed member still gets that
- * member's record from the pp_pmcs[] walk, exactly as it already does
- * for two ordinary sampling PMCs on one target.
+ * Log memory mappings to owners of unassigned sampling groups.
  */
 #define	PMC_GROUP_MAP_OWNERS	8
 
@@ -2559,7 +2483,7 @@ pmc_log_group_mapping(struct pmc_process *pp, pid_t pid, uintfptr_t start,
 	struct pmc_owner *po;
 	u_int i, nowners;
 
-	/* Unlocked peek: a racing insert catches up on its own csw_in. */
+	/* Check list without lock. */
 	if (LIST_EMPTY(&pp->pp_pmu_groups))
 		return;
 
@@ -2570,7 +2494,7 @@ pmc_log_group_mapping(struct pmc_process *pp, pid_t pid, uintfptr_t start,
 			continue;
 		po = pg->pg_owner;
 
-		/* Skip owners an earlier group of this target covered. */
+		/* Skip duplicate owner. */
 		LIST_FOREACH(other, &pp->pp_pmu_groups, pg_proc_next) {
 			if (other == pg)
 				break;
@@ -2586,13 +2510,7 @@ pmc_log_group_mapping(struct pmc_process *pp, pid_t pid, uintfptr_t start,
 			continue;
 		}
 
-		/*
-		 * More distinct owners than the snapshot holds.  Emit the
-		 * remainder from here with the nowakeup variants: waking
-		 * the log kthread under a spin mutex would invert the
-		 * scheduler lock order in which pmu_group_csw_in() takes
-		 * pp_pmu_lock.
-		 */
+		/* Emit mapping records without wakeup under spin lock. */
 		if (path != NULL)
 			pmclog_process_map_in_nowakeup(po, pid, start, path);
 		else
@@ -2651,7 +2569,7 @@ pmc_process_mmap(struct thread *td, struct pmckern_map_in *pkm)
 		}
 	}
 
-	/* Members of groups that are currently evicted from hardware. */
+	/* Log mappings for unassigned group members. */
 	pmc_log_group_mapping(pp, pid, pkm->pm_address, 0, fullpath);
 
 done:
@@ -2692,7 +2610,7 @@ pmc_process_munmap(struct thread *td, struct pmckern_map_out *pkm)
 		}
 	}
 
-	/* Members of groups that are currently evicted from hardware. */
+	/* Log mappings for unassigned group members. */
 	pmc_log_group_mapping(pp, pid, pkm->pm_address,
 	    pkm->pm_address + pkm->pm_size, NULL);
 done:
@@ -3133,7 +3051,7 @@ pmc_destroy_owner_descriptor(struct pmc_owner *po)
 		LIST_REMOVE(pdh, pdh_next);
 		free(pdh, M_PMC);
 	}
-	/* The group mapping walks dereference pg_owner under the epoch. */
+	/* Wait for active epoch readers. */
 	epoch_wait_preempt(global_epoch_preempt);
 	mtx_destroy(&po->po_mtx);
 	free(po, M_PMC);
@@ -3171,7 +3089,7 @@ pmc_allocate_deferred_handle(struct pmc_owner *po, uint32_t cpu,
 		generation = pdh->pdh_generation[index];
 		row = PMC_HANDLE_DEFERRED_ROW(index, generation);
 		if (!PMC_ROW_IS_DEFERRED_HANDLE(row)) {
-			/* Index 31 generation 3 encodes PMC_ROW_UNASSIGNED. */
+			/* Skip value that matches PMC_ROW_UNASSIGNED. */
 			generation = (generation + 1) &
 			    PMC_HANDLE_DEFERRED_GENERATION_MASK;
 			pdh->pdh_generation[index] = generation;
@@ -3656,27 +3574,13 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 	sx_assert(&pmc_sx, SX_XLOCKED);
 	KASSERT(pm, ("[pmc,%d] null pmc", __LINE__));
 
-	/*
-	 * System-wide group sibling: evict the whole group off hardware
-	 * and tear down its per-CPU rotation BEFORE we read ri/mode or
-	 * touch the row below.  After this returns the releasing pm is
-	 * UNASSIGNED, so it falls into the deferred-release path that does
-	 * no HW work (the rows were already freed here), which is exactly
-	 * what avoids a double release of a row the rotation layer owns.
-	 * The callee filters out everything but system-wide group members.
-	 */
+	/* Prepare system group for release before modifying row. */
 	pmu_sys_group_pre_release(pm);
 
 	ri = PMC_TO_ROWINDEX(pm);
 	mode = PMC_TO_MODE(pm);
 	if (PMC_ROW_IS_UNASSIGNED(pm)) {
-		/*
-		 * Deferred-group PMC that was allocated with
-		 * PMC_F_GROUP_DEFER but never bound to hardware (commit
-		 * failed or release before commit).  No targets, no HW
-		 * to deconfigure - just unwind the PMU layer and the
-		 * owner list.
-		 */
+		/* Release unassigned group member descriptor. */
 		pm->pm_state = PMC_STATE_DELETED;
 		pmc_free_deferred_handle(pm->pm_owner, pm->pm_handle);
 		pm->pm_handle = PMC_ID_INVALID;
@@ -3764,19 +3668,7 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 		/* Wait for the PMCs runcount to come to zero. */
 		pmc_wait_for_pmc_idle(pm);
 
-		/*
-		 * Unwind PMU group bookkeeping FIRST, while every pp on
-		 * pp_pmu_groups is still alive.  pmu_group_on_release
-		 * calls pmu_pp_schedule_out -> pmc_rotation_detach which
-		 * removes the rotation-installed pmc_targets from
-		 * pm_targets, decrements pp_refcnt, and LIST_REMOVE's pg
-		 * from pp->pp_pmu_groups.  If we left this until AFTER
-		 * the pm_targets unlink loop below, an earlier sibling's
-		 * release could already have driven pp_refcnt to zero
-		 * and freed pp -- the next sibling's pmu_group_on_release
-		 * would then LIST_REMOVE pg from a freed pp's list,
-		 * panicking with "Bad link elm prev->next != elm".
-		 */
+		/* Release PMU group state before unlinking targets. */
 		if (pm->pm_pmu != NULL)
 			pmu_group_on_release(pm);
 
@@ -3831,12 +3723,7 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 		pm->pm_owner = NULL;
 	}
 
-	/*
-	 * For VIRTUAL_MODE pms, the PMU layer was already unwound above
-	 * (before the unlink loop) so its pp_pmu_groups state stays
-	 * coherent with pp lifetime.  For SYSTEM_MODE the rotation never
-	 * runs, so pmu_group_on_release here is just the destroy path.
-	 */
+	/* Destroy PMU group state for system mode. */
 	if (!PMC_IS_VIRTUAL_MODE(mode) && pm->pm_pmu != NULL)
 		pmu_group_on_release(pm);
 }
@@ -4000,12 +3887,7 @@ hwpmc_row_is_unallocated(int cpu, int ri)
 }
 
 /*
- * Unconfigure row 'ri' on every CPU whose hardware still points at 'pm'.
- *
- * A virtual-mode PMC is configured by csw_in on whichever CPU runs the
- * target and normally unconfigured by the matching csw_out.  Group
- * rotation can reclaim the row before that happens, so it has to clear
- * the stale back-pointers itself; pcd_release_pmc asserts they are gone.
+ * Clear hardware configuration for a row across all active CPUs.
  */
 void
 hwpmc_unconfigure_row_all_cpus(struct pmc *pm, int ri)
@@ -4028,11 +3910,7 @@ hwpmc_unconfigure_row_all_cpus(struct pmc *pm, int ri)
 }
 
 /*
- * Program and start one system-wide PMC's hardware on its bound CPU.
- * Used by the PMU grouping layer's per-CPU multiplex rotation (see
- * hwpmc_pmu.c).  pm->pm_gv.pm_savedvalue carries the cumulative count
- * across rotation windows.  Each window starts from zero and its delta is
- * folded into that software total by hwpmc_pmu_sys_stop_row().
+ * Start hardware counter for a system PMC on its bound CPU.
  */
 void
 hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
@@ -4049,7 +3927,7 @@ hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
 	pmc_save_cpu_binding(&pb);
 	pmc_select_cpu(cpu);
 	critical_enter();
-	/* Publish row occupancy so other allocators skip this counter. */
+	/* Publish row occupancy in hardware descriptor. */
 	(void)pcd->pcd_config_pmc(cpu, adjri, pm);
 	(void)pcd->pcd_write_pmc(cpu, adjri, pm, 0);
 	mtx_pool_lock_spin(pmc_mtxpool, pm);
@@ -4062,9 +3940,7 @@ hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
 }
 
 /*
- * Stop one system-wide PMC's hardware on its bound CPU and fold the
- * final hardware reading into pm->pm_gv.pm_savedvalue so the cumulative
- * count survives the multiplex eviction.
+ * Stop hardware counter and accumulate value into pm_savedvalue.
  */
 void
 hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm)
@@ -4149,12 +4025,7 @@ pmc_find_pmc_descriptor_in_process(struct pmc_owner *po, pmc_id_t pmcid)
 		    ri, md->pmd_npmc));
 	}
 
-	/*
-	 * Match against pm_handle (stable user-facing id) first; for
-	 * non-deferred PMCs pm_handle == pm_id so this is a no-op.  This
-	 * lets userland keep using the original pmcid even after the
-	 * group assigner rewrites pm_id with the real hardware row.
-	 */
+	/* Match against stable user handle pm_handle. */
 	LIST_FOREACH(pm, &po->po_pmcs, pm_next) {
 		if (pm->pm_handle == pmcid)
 			return (pm);
@@ -4186,11 +4057,7 @@ pmc_find_pmc(pmc_id_t pmcid, struct pmc **pmc)
 		    PMC_FLAG_NONE);
 		if (pp == NULL)
 			return (ESRCH);
-		/*
-		 * Deferred-handle pmcids do not index pp_pmcs directly; the
-		 * descendants path is only valid for pmcids whose row-index
-		 * is the real hardware row.
-		 */
+		/* Deferred handles cannot be looked up in pp_pmcs. */
 		if (PMC_ROW_IS_DEFERRED_HANDLE(PMC_ID_TO_ROWINDEX(pmcid)))
 			return (ESRCH);
 		opm = pp->pp_pmcs[PMC_ID_TO_ROWINDEX(pmcid)].pp_pmc;
@@ -4234,15 +4101,7 @@ pmc_start(struct pmc *pm)
 
 	mode = PMC_TO_MODE(pm);
 
-	/*
-	 * System-wide group sibling: hand the whole group to the PMU
-	 * layer, which programs every sibling's HW on its bound CPU (or
-	 * defers it to the per-CPU multiplex rotation).  This must run
-	 * before the unassigned-row fast path below: a deferred sibling
-	 * carries ri == PMC_ROW_UNASSIGNED while an already-bound one does
-	 * not, and both have to funnel through the group layer rather than
-	 * the normal per-CPU system start path.
-	 */
+	/* Route system group members through the PMU group layer. */
 	if (!PMC_IS_VIRTUAL_MODE(mode) && pmu_group_from_pmc(pm) != NULL) {
 		error = pmu_sys_group_on_start(pm);
 		if (error == 0)
@@ -4280,7 +4139,7 @@ pmc_start(struct pmc *pm)
 			return (error);
 	}
 
-	/* Route unassigned virtual members through the group layer. */
+	/* Route unassigned virtual members to PMU group layer. */
 	if (PMC_ROW_IS_UNASSIGNED(pm)) {
 		KASSERT(PMC_IS_VIRTUAL_MODE(mode),
 		    ("[pmc,%d] start on unassigned non-virtual pmc=%p",
@@ -4426,12 +4285,7 @@ pmc_stop(struct pmc *pm)
 		return (0);
 	}
 
-	/*
-	 * System-wide group sibling: the PMU layer stops every sibling's
-	 * HW on its bound CPU (and frees the rows).  We must not fall
-	 * through to the normal per-CPU stop below, which would dereference
-	 * row 255 for a currently-evicted multiplex sibling.
-	 */
+	/* Stop system group members through the PMU group layer. */
 	if (pmu_group_from_pmc(pm) != NULL) {
 		pmu_sys_group_on_stop(pm);
 		return (0);
@@ -4660,39 +4514,17 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 	if ((flags & PMC_F_GROUP_DEFER) != 0) {
 		u_int defcpu;
 
-		/*
-		 * Deferred grouping/multiplex supports per-process virtual
-		 * groups (TC/TS) and system-wide COUNTING groups (SC).
-		 * Every other system-wide mode -- PMC_MODE_SS today -- is
-		 * rejected: those PMCs are published in per-CPU hardware and
-		 * fanned out to a row on every CPU, and their owners carry
-		 * po_sscount accounting, none of which the PMU grouping layer
-		 * models (see pmu_validate_group()).  Reject it cleanly here
-		 * rather than allocate a row that could never be scheduled
-		 * in.
-		 */
+		/* System groups support PMC_MODE_SC only. */
 		if (!PMC_IS_VIRTUAL_MODE(mode) && mode != PMC_MODE_SC) {
 			pmc_destroy_pmc_descriptor(pmc);
 			return (EOPNOTSUPP);
 		}
-		/*
-		 * The class must publish a grouping constraint provider
-		 * (pcd_get_sched_constraint); classes that do not implement
-		 * grouping are rejected here, keeping this path free of any
-		 * per-architecture knowledge.
-		 */
+		/* Check class grouping support. */
 		if (!pmu_class_supports_grouping(class)) {
 			pmc_destroy_pmc_descriptor(pmc);
 			return (EOPNOTSUPP);
 		}
-		/*
-		 * Virtual siblings float across CPUs (PMC_CPU_ANY); a
-		 * system-wide sibling is pinned to its caller-supplied CPU
-		 * (already validated active above).  pmu_group_commit()
-		 * reads the bound CPU back from pe_alloc.pm_cpu and the
-		 * assigner re-encodes it into pm_id when the group is
-		 * scheduled in -- the row stays UNASSIGNED until then.
-		 */
+		/* Virtual PMCs use PMC_CPU_ANY; system PMCs bind to a CPU. */
 		defcpu = PMC_IS_SYSTEM_MODE(mode) ? cpu : PMC_CPU_ANY;
 		pmc->pm_id = PMC_ID_MAKE_ID(defcpu, mode, class,
 		    PMC_ROW_UNASSIGNED);
@@ -4882,8 +4714,7 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 }
 
 /*
- * Grouped PMCs accept start/stop/attach control via the leader only;
- * a group mid-release accepts none.  Ungrouped PMCs pass.
+ * Allow operations only through the group leader.
  */
 static int
 pmc_group_leader_gate(struct pmc *pm)
@@ -5142,13 +4973,7 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 		 * read/write to the savedvalue field.
 		 */
 
-		/*
-		 * Deferred multiplex sibling: no HW row right now, so the
-		 * pcd_read_pmc / pmc_ri_to_classdep path would dereference
-		 * row 255 and panic.  pm_savedvalue is the cumulative count
-		 * maintained by csw_out across rotation windows, which is
-		 * exactly what userland wants to see; return it directly.
-		 */
+		/* Return accumulated value for unassigned virtual member. */
 		if (PMC_ROW_IS_UNASSIGNED(pm)) {
 			mtx_pool_lock_spin(pmc_mtxpool, pm);
 			if ((prw->pm_flags & PMC_F_OLDVALUE) != 0)
@@ -5180,15 +5005,7 @@ pmc_do_op_pmcrw(const struct pmc_op_pmcrw *prw, pmc_value_t *valp)
 
 		mtx_pool_unlock_spin(pmc_mtxpool, pm);
 	} else { /* System mode PMCs */
-		/*
-		 * Evicted system-wide multiplex sibling: it holds no HW row
-		 * right now (ri == 255), so the pcd_read path below would
-		 * dereference row 255 and panic.  pm_gv.pm_savedvalue is the
-		 * cumulative count maintained by hwpmc_pmu_sys_stop_row()
-		 * across rotation windows; return it directly.  A resident
-		 * sibling counts the current window from zero; the read below
-		 * adds the unflushed window delta to that software total.
-		 */
+		/* Return accumulated value for unassigned system member. */
 		if (pmu_group_from_pmc(pm) != NULL &&
 		    PMC_ROW_IS_UNASSIGNED(pm)) {
 			mtx_pool_lock_spin(pmc_mtxpool, pm);
@@ -5947,12 +5764,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		if ((error = pmc_find_pmc(pmcid, &pm)) != 0)
 			break;
 
-		/*
-		 * For non-deferred PMCs pm_handle == pm_id; for deferred
-		 * group PMCs pm_id is rewritten by the assigner with the
-		 * real hardware row, while pm_handle stays equal to the
-		 * stable user-facing pmcid.  Compare against pm_handle.
-		 */
+		/* Compare against user handle pm_handle. */
 		KASSERT(pmcid == pm->pm_handle,
 		    ("[pmc,%d] pmcid %x != handle %x", __LINE__,
 			pm->pm_handle, pmcid));
@@ -5960,10 +5772,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		if ((error = pmc_group_leader_gate(pm)) != 0)
 			break;
 
-		/*
-		 * Gate before pmc_start(): its owner self-attach would
-		 * poison pg_attach_proc for the eventual real target.
-		 */
+		/* Reject start for uncommitted group member. */
 		pg = pmu_group_from_pmc(pm);
 		if (pg != NULL && !pg->pg_committed) {
 			error = EXTERROR(EINVAL,
@@ -6008,7 +5817,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		if ((error = pmc_find_pmc(pmcid, &pm)) != 0)
 			break;
 
-		/* See deferred-PMC pm_handle vs pm_id note in PMC_OP_PMCSTART. */
+		/* Check user handle. */
 		KASSERT(pmcid == pm->pm_handle,
 		    ("[pmc,%d] pmcid %x != handle %x", __LINE__,
 			pm->pm_handle, pmcid));
@@ -6200,12 +6009,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		gr.pm_leader = pm->pm_handle;
 		gr.pm_nmembers = pg->pg_nevents;
 		if (capacity == 0 || capacity < pg->pg_nevents) {
-			/*
-			 * A size query reports the group's times too: they
-			 * do not depend on the member array, and a caller
-			 * that only wants enabled/running has no reason to
-			 * supply one.  A short buffer still fails E2BIG.
-			 */
+			/* Report group times for size query. */
 			if (capacity == 0) {
 				struct pmu_group_time_snapshot times;
 
@@ -6267,7 +6071,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		if ((error = pmc_find_pmc(pmcid, &pm)) != 0)
 			break;
 
-		/* See deferred-PMC pm_handle vs pm_id note in PMC_OP_PMCSTART. */
+		/* Check user handle. */
 		KASSERT(pmcid == pm->pm_handle,
 		    ("[pmc,%d] pmcid %x != handle %x", __LINE__,
 			pm->pm_handle, pmcid));
@@ -6285,7 +6089,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 				error = pmu_event_get_constraint(pe, &cons);
 				if (error != 0)
 					break;
-				/* Report capabilities common to every assignable row. */
+				/* Intersect capabilities across all allowed rows. */
 				found = false;
 				for (n = 0; n < pcd->pcd_num && n < 32; n++) {
 					if ((cons.pc_allowed_rows & (1u << n)) == 0)
@@ -6717,7 +6521,7 @@ pmc_process_samples(int cpu, ring_type_t ring)
 
 		po = pm->pm_owner;
 
-		/* A stopped target cannot finish a deferred user callchain. */
+		/* Skip pending callchain for stopped PMC. */
 		if (ps->ps_nsamples == PMC_USER_CALLCHAIN_PENDING &&
 		    pm->pm_state != PMC_STATE_RUNNING)
 			goto entrydone;
@@ -6883,7 +6687,7 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 
 	PMCDBG2(PRC,EXT,2, "process-exit proc=%p pmc-process=%p", p, pp);
 
-	/* pseudo context switch out; close shared class gates too */
+	/* Execute context-switch out for process exit. */
 	pmu_group_csw_out(curthread, cpu);
 	pmc_process_csw_stop_all(cpu);
 
@@ -6973,14 +6777,7 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 		}
 	}
 
-	/*
-	 * Sever every pmu_group still hooked off pp before pp is
-	 * freed.  pmcstat (the OWNER) typically issues PMC_OP_PMCRELEASE
-	 * AFTER its target dies, and pmu_group_on_release would otherwise
-	 * follow stale pg->pg_pp into freed memory and panic LIST_REMOVE
-	 * with "Bad link prev->next != elm".  This also tears down the
-	 * per-pp rotation kthread, which itself holds pp as its arg.
-	 */
+	/* Destroy process PMU groups and rotation thread. */
 	PMCDBG2(PMC, OPS, 2,
 	    "process_exit: pid=%d pp=%p draining pmu groups",
 	    p->p_pid, pp);

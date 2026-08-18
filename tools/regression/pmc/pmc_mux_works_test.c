@@ -1,33 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Positive regression test for hwpmc PMU multiplexing under the new
- * strictly-atomic group scheduler.
- *
- * Two invariants must hold:
- *
- *   1. Within-group all-or-none.  Every event in a group is either
- *      simultaneously bound to a HW counter or simultaneously deferred.
- *      Siblings of one group never see a partial schedule.
- *
- *   2. Inter-group rotation.  When the union of two committed groups
- *      exceeds the HW counter pool, the per-pp rotation kthread must
- *      cycle whole groups in/out so both eventually progress.
- *
- * Strategy:
- *   - Allocate two groups whose combined event count > npmc but each
- *     group individually <= npmc, with PMC_F_GROUP_MUX on each leader.
- *   - Tighten kern.hwpmc.mux_period_ms so rotation is fast.
- *   - Start both groups, run a busy workload, snapshot.
- *   - Demand:
- *       (a) every event in every group progressed (rotation is fair);
- *       (b) within each group, all siblings progressed at comparable
- *           rates (all-or-none atomicity, not partial placement).
- *
- * Build:  cc -o pmc_mux_works_test pmc_mux_works_test.c -lpmc
- * Run:    sudo ./pmc_mux_works_test     (requires hwpmc loaded, AMD CPU)
- *
- * Exit codes: 0 = pass, 1 = fail, 77 = skip.
+ * Test PMU event multiplexing across rotating groups.
  */
 
 #include <sys/types.h>
@@ -101,12 +75,7 @@ is_amd(void)
 	    strstr(buf, "HygonGenuine") != NULL);
 }
 
-/*
- * Probe the actual per-class core PMC capacity.  pmc_npmc(0) sums all
- * classes (SOFT/TSC/K8/IBS), which on Zen5 is 47 -- meaningless for
- * sizing a core-class group.  The real constraint is the number of
- * core counters (Zen2/3/4/5: 6, Zen6: up to 12).
- */
+/* Return count of available core hardware counters. */
 static int
 probe_core_pmcs(void)
 {
@@ -183,7 +152,7 @@ build_group(struct pmu_grp *g, int n_target, int pool_start, int pool_end)
 			flags |= PMC_F_GROUP_MUX;
 		if (pmc_allocate_group(event_pool[i], PMC_MODE_TC, flags,
 		    PMC_CPU_ANY, &id, 0) < 0) {
-			/* Event unsupported on this CPU model -- skip. */
+			/* Skip unsupported event. */
 			continue;
 		}
 		if (pmc_group_add(g->gid, id, g->nevents == 0) < 0) {
@@ -233,17 +202,7 @@ main(void)
 		return (77);
 	}
 
-	/*
-	 * Pick per_group so that each group fits the core pool but two
-	 * groups together oversubscribe.  Concretely:
-	 *   core=6  (Zen3/4/5)        -> per_group=4, total=8 > 6   (mux)
-	 *   core=8                    -> per_group=5, total=10 > 8  (mux)
-	 *   core=12 (Zen6 perf core)  -> per_group=8, total=16 > 12 (mux)
-	 *   core=4                    -> per_group=2, total=4 = 4   (skip)
-	 * The per_group computation is (core*2)/3 (integer-truncated)
-	 * which keeps single-group commits safe but guarantees inter-
-	 * group oversubscription when core >= 5.
-	 */
+	/* Calculate group size to oversubscribe hardware counters. */
 	per_group = (core * 2) / 3;
 	if (per_group < 2)
 		per_group = 2;
@@ -256,7 +215,7 @@ main(void)
 		return (77);
 	}
 
-	/* Build the groups out of disjoint slices of event_pool[]. */
+	/* Create groups using distinct events from pool. */
 	int pool_used = 0;
 	for (i = 0; i < MAX_GROUPS; i++) {
 		int got = build_group(&grps[i], per_group, pool_used,
@@ -269,13 +228,7 @@ main(void)
 				release_group(&grps[j]);
 			return (77);
 		}
-		/*
-		 * Each event in event_pool[] only allocates once on a
-		 * given CPU; advance the cursor by the actual number of
-		 * pool entries we consumed (some may have failed
-		 * allocate).  Conservatively advance by per_group * 2 so
-		 * the next group does not race for the same slots.
-		 */
+		/* Advance pool index for the next group. */
 		pool_used += per_group;
 		if (pool_used >= POOL_SIZE) {
 			fprintf(stderr, "SKIP: ran out of distinct events\n");
@@ -350,19 +303,9 @@ main(void)
 		}
 
 	/*
-	 * Validation.
-	 *   (a) Every sibling in every group must have advanced strictly
-	 *       between snapshot 1 and snapshot 2.  If rotation is broken
-	 *       one entire group will sit at zero deltas.
-	 *   (b) Within each group, the spread of deltas across siblings
-	 *       must be modest.  All-or-none atomic placement means every
-	 *       sibling sees the same set of rotation windows, so their
-	 *       deltas should differ only by their natural per-event
-	 *       count rates.  We bound the ratio min/max >= 1/256, which
-	 *       is loose enough to pass even very different events
-	 *       (cache-misses vs instructions) but still catches the
-	 *       failure mode where some siblings of a group are stuck
-	 *       deferred while their peers are running.
+	 * Validation:
+	 * (a) All events in all groups must advance.
+	 * (b) All siblings within a group must advance together.
 	 */
 	rc = 0;
 	pmc_value_t group_cycles[MAX_GROUPS] = { 0 };
@@ -384,29 +327,12 @@ main(void)
 				progressed++;
 			if (grps[i].vfin[j] > 0)
 				nonzero++;
-			/*
-			 * Track the highest-rate event per group as a
-			 * proxy for "how much HW time did this group
-			 * actually get".  cycles or instructions in a
-			 * busy-spin loop dominate; the ratio across
-			 * groups gives us a fairness proxy without
-			 * having to name a specific event.
-			 */
+			/* Track highest event count in group. */
 			if (d > group_cycles[i])
 				group_cycles[i] = d;
 		}
 
-		/*
-		 * Within-group all-or-none atomicity = every sibling
-		 * progressed AND every sibling finished with a non-zero
-		 * count.  We deliberately do NOT enforce a ratio across
-		 * siblings here: a group can legitimately mix events
-		 * with vastly different natural rates (e.g. cycles vs
-		 * a rare ls_smi_rx subset), and a tight ratio test would
-		 * false-positive on rate variance instead of catching
-		 * real "sibling stuck deferred" bugs.  The progressed
-		 * + nonzero pair already catches the real failure mode.
-		 */
+		/* Verify all sibling events advanced. */
 		if (nonzero != grps[i].nevents) {
 			fprintf(stderr,
 			    "FAIL: group %d: %d/%d siblings finished with "
@@ -424,16 +350,7 @@ main(void)
 		}
 	}
 
-	/*
-	 * Inter-group fairness check.  Rotation is round-robin with
-	 * equal-length windows, so over a 1.2-second window with
-	 * 10-ms ticks each group should get ~50% of HW time.  If
-	 * one group's max delta is more than 64x the other's, the
-	 * rotation kthread is starving one group.  Threshold 64
-	 * leaves headroom for first-window startup transients while
-	 * still catching the "Group 0 got 2 us / Group 1 got 1 s"
-	 * failure mode.
-	 */
+	/* Verify equal execution across groups. */
 	if (MAX_GROUPS == 2 && group_cycles[0] > 0 && group_cycles[1] > 0) {
 		pmc_value_t hi = group_cycles[0] > group_cycles[1] ?
 		    group_cycles[0] : group_cycles[1];
