@@ -343,7 +343,6 @@ pmu_validate_group(pmu_group_t *pg)
 {
 	pmu_event_t *pe;
 	pmc_sched_constraint_t cons;
-	enum pmc_mode lmode;
 	bool sys;
 	u_int nleaders;
 	int lcpu, rc;
@@ -355,17 +354,24 @@ pmu_validate_group(pmu_group_t *pg)
 	nleaders = 0;
 
 	/*
-	 * Validate group mode. All siblings must match the leader.
-	 * System groups must use PMC_MODE_SC and bind to one CPU.
+	 * Validate group mode.  Siblings must be on the leader's side of the
+	 * virtual/system split; counting and sampling may mix within a side.
+	 * System groups bind to one CPU.
 	 */
-	lmode = pg->pg_leader->pe_alloc.pm_mode;
-	sys = PMC_IS_SYSTEM_MODE(lmode);
+	sys = PMC_IS_SYSTEM_MODE(pg->pg_leader->pe_alloc.pm_mode);
 	lcpu = pg->pg_leader->pe_alloc.pm_cpu;
-	if (sys && lmode != PMC_MODE_SC) {
-		PMCDBG2(PMC, OPS, 1,
-		    "validate: gid=%u system sampling groups unsupported "
-		    "(mode=%d)", pg->pg_id, (int)lmode);
-		return (EOPNOTSUPP);
+
+	/*
+	 * PMC_F_DESCENDANTS is leader-only and governs the whole group.  A
+	 * system group is bound to a CPU and has no process target, so it
+	 * cannot follow a fork.
+	 */
+	if (sys && (pg->pg_leader->pe_alloc.pm_flags & PMC_F_DESCENDANTS) !=
+	    0) {
+		PMCDBG1(PMC, OPS, 1,
+		    "validate: gid=%u PMC_F_DESCENDANTS on a system group",
+		    pg->pg_id);
+		return (EINVAL);
 	}
 
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
@@ -375,8 +381,11 @@ pmu_validate_group(pmu_group_t *pg)
 			nleaders++;
 			if (pg->pg_leader != pe)
 				return (EINVAL);
-		} else if ((pe->pe_alloc.pm_flags & PMC_F_GROUP_MUX) != 0)
+		} else if ((pe->pe_alloc.pm_flags &
+		    (PMC_F_GROUP_MUX | PMC_F_DESCENDANTS)) != 0) {
+			/* Both flags are leader-only. */
 			return (EINVAL);
+		}
 		if (pe->pe_pmc == NULL)
 			return (EINVAL);
 		if (!PMC_ROW_IS_UNASSIGNED(pe->pe_pmc)) {
@@ -394,8 +403,6 @@ pmu_validate_group(pmu_group_t *pg)
 			return (EINVAL);
 		}
 		if (sys) {
-			if (m != PMC_MODE_SC)
-				return (EOPNOTSUPP);
 			if (pe->pe_alloc.pm_cpu != lcpu) {
 				PMCDBG3(PMC, OPS, 1,
 				    "validate: gid=%u system siblings span "

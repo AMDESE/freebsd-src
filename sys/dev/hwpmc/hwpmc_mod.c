@@ -4458,12 +4458,16 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 		return (EXTERROR(EINVAL, "Invalid PMC flags %#jx",
 		    (uintmax_t)flags));
 
-	if ((flags & PMC_F_GROUP_DEFER) != 0) {
-		if ((flags & PMC_F_DESCENDANTS) != 0)
-			return (EOPNOTSUPP);
-		if (!PMC_IS_SAMPLING_MODE(mode) && pa->pm_count != 0)
-			return (EINVAL);
-	}
+	/*
+	 * PMC_F_DESCENDANTS is accepted on a deferred allocation, but it is
+	 * leader-only and governs the whole group.  The leader is designated
+	 * at PMCGROUPADD, so the flag cannot be validated here; commit does
+	 * it.  A deferred counting PMC must start from zero because its
+	 * value accumulates in software across placements.
+	 */
+	if ((flags & PMC_F_GROUP_DEFER) != 0 &&
+	    !PMC_IS_SAMPLING_MODE(mode) && pa->pm_count != 0)
+		return (EINVAL);
 
 	/* PMC_F_USERCALLCHAIN is only valid with PMC_F_CALLCHAIN. */
 	if ((flags & (PMC_F_CALLCHAIN | PMC_F_USERCALLCHAIN)) ==
@@ -4514,11 +4518,6 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 	if ((flags & PMC_F_GROUP_DEFER) != 0) {
 		u_int defcpu;
 
-		/* System groups support PMC_MODE_SC only. */
-		if (!PMC_IS_VIRTUAL_MODE(mode) && mode != PMC_MODE_SC) {
-			pmc_destroy_pmc_descriptor(pmc);
-			return (EOPNOTSUPP);
-		}
 		/* Check class grouping support. */
 		if (!pmu_class_supports_grouping(class)) {
 			pmc_destroy_pmc_descriptor(pmc);
