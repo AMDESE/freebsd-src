@@ -248,6 +248,15 @@ field will be zero.
 Allocate a system mode sampling PMC measuring hardware events
 specified in
 .Ar event-spec .
+A system mode PMC is bound to a single CPU: the lowest-numbered one in
+the set given by
+.Fl c ,
+or in the process's root CPU set if
+.Fl c
+was not given.
+To profile several CPUs, run one
+.Nm
+per CPU.
 .It Fl T
 Use a
 .Xr top 1 Ns -like
@@ -362,6 +371,24 @@ the raw interval count is shown instead of an extrapolated estimate.
 With
 .Fl C ,
 cumulative values are running sums of the per-interval estimates.
+.Pp
+A scaled value is an estimate of what the count would have been had the
+group stayed on hardware, obtained by assuming the events the group did
+not see resemble the ones it did.
+Over a short interval that assumption is weak: a group that was resident
+for one rotation window in three has sampled the interval three times,
+and the resulting estimate is correspondingly rough.
+Choose a display interval spanning at least about twenty rotation
+periods \(em with the default
+.Va kern.hwpmc.mux_period_ms
+of 50, roughly one second \(em before reading much into a scaled number.
+.Pp
+For system-wide sampling, multiplexing costs coverage rather than
+accuracy.
+A CPU whose group is evicted produces no samples at all for that window,
+and nothing reconstructs them: the profile is of the time the group was
+resident, not of the whole run.
+Sample counts are therefore never scaled.
 .It Fl c Ar cpu-spec
 Set the cpus for subsequent system mode PMCs specified on the
 command line to
@@ -379,11 +406,32 @@ process' current and future children or only measuring events for
 the target process.
 The default is to measure events for the target process alone.
 (it has to be passed in the command line prior to
-.Fl p ,
-.Fl s ,
-.Fl P ,
+.Fl p
 or
-.Fl S ) .
+.Fl P ) .
+.Pp
+A system mode PMC is bound to a CPU and has no process target to follow
+through a fork, so combining
+.Fl d
+with
+.Fl s
+or
+.Fl S
+is rejected.
+.Pp
+With
+.Fl b ,
+a brace-list group follows a fork as a whole: every member attaches to
+the child, or none does.
+If the kernel cannot attach the group to a new child \(em a fork cannot
+be failed, so under memory pressure the child is simply not measured \(em
+its work is missing from the totals, which otherwise look complete.
+.Nm
+reports that at the end of the run:
+.Bd -literal -offset indent
+pmcstat: WARNING: 2 descendant attaches failed; their contributions
+are not in these totals.
+.Ed
 .It Fl e
 Specify that the gprof profile files will use a wide history counter.
 These files are produced in a format compatible with
