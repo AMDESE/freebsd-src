@@ -1074,6 +1074,9 @@ pmc_rotation_detach(struct pmc *pm, struct pmc_process *pp)
 	    ("[pmc,%d] rotation detach pm=%p ri=%d pp_pmcs=%p",
 	    __LINE__, pm, ri, pp->pp_pmcs[ri].pp_pmc));
 
+	if (PMC_TO_MODE(pm) == PMC_MODE_TS)
+		pmu_event_save_residual(pm, pp, ri);
+
 	pp->pp_pmcs[ri].pp_pmc = NULL;
 	pp->pp_pmcs[ri].pp_pmcval = (pmc_value_t)0;
 	if (PMC_TO_MODE(pm) == PMC_MODE_TS) {
@@ -1121,8 +1124,11 @@ pmc_rotation_attach(struct pmc *pm, struct pmc_process *pp)
 
 	atomic_store_rel_ptr((uintptr_t *)&pp->pp_pmcs[ri].pp_pmc,
 	    (uintptr_t)pm);
-	pp->pp_pmcs[ri].pp_pmcval = PMC_TO_MODE(pm) == PMC_MODE_TS ?
-	    pm->pm_sc.pm_reloadcount : 0;
+	if (PMC_TO_MODE(pm) == PMC_MODE_TS) {
+		pp->pp_pmcs[ri].pp_pmcval = pmu_event_restore_residual(pm);
+		pmu_event_restore_thread_residual(pm, pp, ri);
+	} else
+		pp->pp_pmcs[ri].pp_pmcval = 0;
 	pp->pp_refcnt++;
 
 	if (pm->pm_owner != NULL && pm->pm_owner->po_owner == pp->pp_proc)
@@ -3917,22 +3923,34 @@ hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
 {
 	struct pmc_binding pb;
 	struct pmc_classdep *pcd;
+	pmc_value_t v;
 	int adjri, ri;
+	bool sampling;
 
 	ri = PMC_TO_ROWINDEX(pm);
 	pcd = pmc_ri_to_classdep(md, ri, &adjri);
 	if (pcd == NULL || !pmc_cpu_is_active(cpu))
 		return;
 
+	/*
+	 * A sampling member resumes from the progress it had when it was
+	 * evicted; a counting member restarts from zero and accumulates its
+	 * delta in software.
+	 */
+	sampling = PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm));
+	v = sampling ? pmu_event_restore_residual(pm) : 0;
+
 	pmc_save_cpu_binding(&pb);
 	pmc_select_cpu(cpu);
 	critical_enter();
 	/* Publish row occupancy in hardware descriptor. */
 	(void)pcd->pcd_config_pmc(cpu, adjri, pm);
-	(void)pcd->pcd_write_pmc(cpu, adjri, pm, 0);
+	(void)pcd->pcd_write_pmc(cpu, adjri, pm, v);
 	mtx_pool_lock_spin(pmc_mtxpool, pm);
-	PMC_PCPU_SAVED(cpu, ri) = 0;
+	PMC_PCPU_SAVED(cpu, ri) = v;
 	mtx_pool_unlock_spin(pmc_mtxpool, pm);
+	if (sampling)
+		pm->pm_pcpu_state[cpu].pps_stalled = 0;
 	pm->pm_pcpu_state[cpu].pps_cpustate = 1;
 	(void)pcd->pcd_start_pmc(cpu, adjri, pm);
 	critical_exit();
@@ -3962,11 +3980,21 @@ hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm)
 	(void)pcd->pcd_stop_pmc(cpu, adjri, pm);
 	v = 0;
 	if (pcd->pcd_read_pmc(cpu, adjri, pm, &v) == 0) {
-		mtx_pool_lock_spin(pmc_mtxpool, pm);
-		tmp = pmc_delta(pcd, v, PMC_PCPU_SAVED(cpu, ri));
-		pm->pm_gv.pm_savedvalue += tmp;
-		PMC_PCPU_SAVED(cpu, ri) = v;
-		mtx_pool_unlock_spin(pmc_mtxpool, pm);
+		/*
+		 * A sampling counter reads back the events still to go
+		 * before its next sample, which the next placement resumes
+		 * from.  A counting one reads back a running total, whose
+		 * delta accumulates in software.
+		 */
+		if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)))
+			pmu_event_set_residual(pm, v);
+		else {
+			mtx_pool_lock_spin(pmc_mtxpool, pm);
+			tmp = pmc_delta(pcd, v, PMC_PCPU_SAVED(cpu, ri));
+			pm->pm_gv.pm_savedvalue += tmp;
+			PMC_PCPU_SAVED(cpu, ri) = v;
+			mtx_pool_unlock_spin(pmc_mtxpool, pm);
+		}
 	}
 	(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
 	critical_exit();

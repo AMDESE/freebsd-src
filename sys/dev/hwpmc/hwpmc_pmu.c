@@ -1093,6 +1093,98 @@ pmu_group_on_release(struct pmc *pm)
 }
 
 /*
+ * Save a sampling member's progress toward its next sample, so that the
+ * next placement resumes from it instead of restarting the climb.  Without
+ * this a member whose period exceeds one residency window never reaches an
+ * overflow and delivers no samples at all.
+ *
+ * The per-thread counts live in pt_pmcs[], which is indexed by hardware
+ * row, and a member does not keep its row across a rotation, so the value
+ * is stashed on the member.  A multithreaded target has one count per
+ * thread; keep the smallest, which is the thread nearest its next sample.
+ * That never overshoots a period, so no sample is skipped.
+ */
+void
+pmu_event_save_residual(struct pmc *pm, struct pmc_process *pp, int ri)
+{
+	pmu_event_t *pe;
+	struct pmc_thread *pt;
+	pmc_value_t least, v;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL)
+		return;
+
+	least = 0;
+	mtx_lock_spin(pp->pp_tdslock);
+	LIST_FOREACH(pt, &pp->pp_tds, pt_next) {
+		v = pt->pt_pmcs[ri].pt_pmcval;
+		if (v > 0 && (least == 0 || v < least))
+			least = v;
+	}
+	mtx_unlock_spin(pp->pp_tdslock);
+
+	if (least == 0)
+		least = pp->pp_pmcs[ri].pp_pmcval;
+	if (least > 0 && least <= pm->pm_sc.pm_reloadcount)
+		pe->pe_residual = least;
+}
+
+/*
+ * Save a system-mode sampling member's progress, read straight off the
+ * hardware at eviction.  A value outside (0, reloadcount] means the
+ * counter overflowed or was never seeded, so the next placement should
+ * start from a full period.
+ */
+void
+pmu_event_set_residual(struct pmc *pm, pmc_value_t residual)
+{
+	pmu_event_t *pe;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL)
+		return;
+	pe->pe_residual = (residual > 0 &&
+	    residual <= pm->pm_sc.pm_reloadcount) ? residual : 0;
+}
+
+/*
+ * Seed the per-thread counts a sampling member resumes from.  A context
+ * switch reads pt_pmcval and only falls back to the per-process value when
+ * the thread has no descriptor, so restoring the per-process value alone
+ * would be ignored for every real thread.
+ */
+void
+pmu_event_restore_thread_residual(struct pmc *pm, struct pmc_process *pp,
+    int ri)
+{
+	struct pmc_thread *pt;
+	pmc_value_t v;
+
+	v = pmu_event_restore_residual(pm);
+	mtx_lock_spin(pp->pp_tdslock);
+	LIST_FOREACH(pt, &pp->pp_tds, pt_next)
+		pt->pt_pmcs[ri].pt_pmcval = v;
+	mtx_unlock_spin(pp->pp_tdslock);
+}
+
+/*
+ * The count a sampling member resumes from at placement: its saved
+ * progress, or a full period if it has none yet.
+ */
+pmc_value_t
+pmu_event_restore_residual(struct pmc *pm)
+{
+	pmu_event_t *pe;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || pe->pe_residual == 0 ||
+	    pe->pe_residual > pm->pm_sc.pm_reloadcount)
+		return (pm->pm_sc.pm_reloadcount);
+	return (pe->pe_residual);
+}
+
+/*
  * Attach all sibling events of a group to the process descriptor.
  */
 static void

@@ -47,10 +47,15 @@ test_allocation_gates(void)
 	pmc_id_t pmcid;
 
 	pmcid = PMC_ID_INVALID;
-	if (expect_errno("grouped descendants",
-	    pmc_allocate_group("instructions", PMC_MODE_TC,
-	    PMC_F_DESCENDANTS, PMC_CPU_ANY, &pmcid, 0), EOPNOTSUPP) != 0)
+	/* PMC_F_DESCENDANTS is accepted here and validated at commit. */
+	if (pmc_allocate_group("instructions", PMC_MODE_TC,
+	    PMC_F_DESCENDANTS, PMC_CPU_ANY, &pmcid, 0) < 0) {
+		warn("grouped descendants");
 		return (1);
+	}
+	if (pmc_release(pmcid) < 0)
+		return (1);
+	pmcid = PMC_ID_INVALID;
 	if (expect_errno("grouped counting initial value",
 	    pmc_allocate_group("instructions", PMC_MODE_TC, 0,
 	    PMC_CPU_ANY, &pmcid, 1), EINVAL) != 0)

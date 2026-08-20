@@ -52,6 +52,13 @@ struct pmu_event {
 	bool				pe_is_leader;
 	struct pmc_op_pmcallocate	pe_alloc;
 	pmc_sched_constraint_t		pe_cons;
+	/*
+	 * Progress toward the next sample, kept across eviction.  Per-thread
+	 * state lives in pt_pmcs[], which is indexed by hardware row, and a
+	 * member does not keep its row across a rotation; this is keyed to
+	 * the member instead.  Zero means "start from the reload count".
+	 */
+	pmc_value_t			pe_residual;
 };
 
 struct pmu_group_cpu_state {
@@ -168,6 +175,11 @@ void pmu_group_time_snapshot_locked(pmu_group_t *pg,
 void pmu_event_destroy(pmu_event_t *pe);
 pmu_event_t *pmu_event_from_pmc(struct pmc *pm);
 pmu_group_t *pmu_group_from_pmc(struct pmc *pm);
+void pmu_event_save_residual(struct pmc *pm, struct pmc_process *pp, int ri);
+void pmu_event_set_residual(struct pmc *pm, pmc_value_t residual);
+void pmu_event_restore_thread_residual(struct pmc *pm,
+    struct pmc_process *pp, int ri);
+pmc_value_t pmu_event_restore_residual(struct pmc *pm);
 
 int pmu_group_on_allocate(struct pmc *pm, const struct pmc_op_pmcallocate *pa);
 int pmu_group_on_attach(struct pmc *pm, struct proc *p);
