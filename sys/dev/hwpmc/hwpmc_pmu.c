@@ -363,6 +363,142 @@ pmu_pp_link_group(pmu_group_t *pg, struct pmc_process *pp)
 	mtx_unlock_spin(&pp->pp_pmu_lock);
 }
 
+/*
+ * Does this group follow its targets through fork?  The flag is
+ * leader-only and governs the whole group, and commit has already
+ * rejected it on a system group.
+ */
+static bool
+pmu_group_follows_fork(pmu_group_t *pg)
+{
+
+	return (pg->pg_committed && !pg->pg_releasing && !pg->pg_system &&
+	    pg->pg_leader != NULL &&
+	    (pg->pg_leader->pe_alloc.pm_flags & PMC_F_DESCENDANTS) != 0);
+}
+
+/* Is pp a target this group already follows? */
+static bool
+pmu_group_has_target(pmu_group_t *pg, struct pmc_process *pp)
+{
+	struct pmu_group_target *pgt;
+
+	if (pg->pg_pp == pp)
+		return (true);
+	LIST_FOREACH(pgt, &pg->pg_inherited, pgt_next) {
+		if (pgt->pgt_pp == pp)
+			return (true);
+	}
+	return (false);
+}
+
+/*
+ * Record a target the group reached through fork.  Only the explicit
+ * target carries the group on its pp_pmu_groups list -- pg_proc_next is a
+ * single link, so the group cannot be on two of those at once -- and that
+ * target keeps anchoring rotation, placement and release.  An inherited
+ * target is reached through this list instead; its threads count toward
+ * the same member totals through the per-CPU state, which is keyed by CPU
+ * rather than by process.
+ *
+ * Returns false if the record could not be allocated.  The caller must
+ * surface that: the child then goes unmonitored (spec §3.9).
+ */
+static bool
+pmu_group_add_inherited(pmu_group_t *pg, struct pmc_process *pp)
+{
+	struct pmu_group_target *pgt;
+
+	if (pmu_group_has_target(pg, pp))
+		return (true);
+	pgt = malloc(sizeof(*pgt), M_PMU, M_NOWAIT | M_ZERO);
+	if (pgt == NULL)
+		return (false);
+	pgt->pgt_pp = pp;
+	pgt->pgt_group = pg;
+	LIST_INSERT_HEAD(&pg->pg_inherited, pgt, pgt_next);
+	mtx_lock_spin(&pp->pp_pmu_lock);
+	LIST_INSERT_HEAD(&pp->pp_pmu_inherited, pgt, pgt_pp_next);
+	mtx_unlock_spin(&pp->pp_pmu_lock);
+	return (true);
+}
+
+/* Drop one inherited target, or all of them when pp is NULL. */
+static void
+pmu_group_drop_inherited(pmu_group_t *pg, struct pmc_process *pp)
+{
+	struct pmu_group_target *pgt, *tmp;
+
+	LIST_FOREACH_SAFE(pgt, &pg->pg_inherited, pgt_next, tmp) {
+		if (pp != NULL && pgt->pgt_pp != pp)
+			continue;
+		mtx_lock_spin(&pgt->pgt_pp->pp_pmu_lock);
+		LIST_REMOVE(pgt, pgt_pp_next);
+		mtx_unlock_spin(&pgt->pgt_pp->pp_pmu_lock);
+		LIST_REMOVE(pgt, pgt_next);
+		free(pgt, M_PMU);
+		if (pp != NULL)
+			return;
+	}
+}
+
+/*
+ * Attach every group the parent is a target of to the child (spec §3.9).
+ * A group is taken all at once or not at all, so that §2.4 holds in the
+ * child; a group that cannot be recorded is skipped whole and counted, and
+ * the caller reports how many were missed.
+ *
+ * Only groups whose leader carries PMC_F_DESCENDANTS follow a fork, and
+ * only virtual ones: a system group is bound to a CPU and has no process
+ * target, which commit already rejects.
+ */
+u_int
+pmu_group_inherit(struct pmc_process *ppold, struct pmc_process *ppnew,
+    u_int *nmissed)
+{
+	struct pmu_group_target *pgt;
+	pmu_group_t *pg;
+	u_int ninherited, nmiss;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	ninherited = 0;
+	nmiss = 0;
+
+	LIST_FOREACH(pg, &ppold->pp_pmu_groups, pg_proc_next) {
+		if (!pmu_group_follows_fork(pg))
+			continue;
+		if (pmu_group_add_inherited(pg, ppnew))
+			ninherited++;
+		else
+			nmiss++;
+	}
+	/* A grandchild inherits through its parent's inherited groups. */
+	LIST_FOREACH(pgt, &ppold->pp_pmu_inherited, pgt_pp_next) {
+		pg = pgt->pgt_group;
+		if (!pmu_group_follows_fork(pg))
+			continue;
+		if (pmu_group_add_inherited(pg, ppnew))
+			ninherited++;
+		else
+			nmiss++;
+	}
+
+	if (nmissed != NULL)
+		*nmissed = nmiss;
+	return (ninherited);
+}
+
+/* Detach every group this process only followed as a descendant. */
+void
+pmu_group_disinherit(struct pmc_process *pp)
+{
+	struct pmu_group_target *pgt;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	while ((pgt = LIST_FIRST(&pp->pp_pmu_inherited)) != NULL)
+		pmu_group_drop_inherited(pgt->pgt_group, pp);
+}
+
 /* Remove group from process list and update cursor. */
 static void
 pmu_pp_unlink_group(pmu_group_t *pg, struct pmc_process *pp)
@@ -705,6 +841,8 @@ pmu_group_release(pmu_group_t *pg)
 		return;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
+	/* Stop following every target this group reached through fork. */
+	pmu_group_drop_inherited(pg, NULL);
 	KASSERT(TAILQ_EMPTY(&pg->pg_events) && pg->pg_nevents == 0 &&
 	    pg->pg_leader == NULL,
 	    ("[pmu] freeing non-empty group %u", pg->pg_id));
@@ -902,46 +1040,56 @@ pmu_group_on_stop(struct pmc *pm)
 	pmu_group_accounting_drain(pg, false);
 }
 
+/* Mark one group on-CPU for the switching-in thread. */
+static void
+pmu_group_csw_in_one(pmu_group_t *pg, struct thread *td, int cpu,
+    uint64_t now)
+{
+	struct pmu_group_cpu_state *pgcs;
+
+	if (pg->pg_system || cpu < 0 || (u_int)cpu >= pg->pg_ncpu)
+		return;
+	pgcs = &pg->pg_cpu_state[cpu];
+	/* Do not wait for snapshot during context switch. */
+	mtx_lock_spin(&pg->pg_snapshot_lock);
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	if (!pg->pg_committed || !pg->pg_running || pg->pg_account_blocked) {
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+		mtx_unlock_spin(&pg->pg_snapshot_lock);
+		return;
+	}
+	KASSERT(!pgcs->pgcs_counted,
+	    ("[pmu] duplicate CPU %d marker for group %u", cpu, pg->pg_id));
+	pmu_group_time_update_locked(pg, now);
+	pgcs->pgcs_td = td;
+	pgcs->pgcs_counted = true;
+	pgcs->pgcs_placed = false;
+	pgcs->pgcs_transitioning = true;
+	pg->pg_oncpu_threads++;
+	LIST_INSERT_HEAD(&pmu_group_cpu_active[cpu], pgcs, pgcs_next);
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+	mtx_unlock_spin(&pg->pg_snapshot_lock);
+}
+
 void
 pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
 {
-	struct pmu_group_cpu_state *pgcs;
+	struct pmu_group_target *pgt;
 	pmu_group_t *pg;
 	uint64_t now;
 	int cpu;
 
-	/* Check list without lock. */
-	if (LIST_EMPTY(&pp->pp_pmu_groups))
+	/* Check lists without lock. */
+	if (LIST_EMPTY(&pp->pp_pmu_groups) &&
+	    LIST_EMPTY(&pp->pp_pmu_inherited))
 		return;
 	cpu = PCPU_GET(cpuid);
 	now = cpu_ticks();
 	mtx_lock_spin(&pp->pp_pmu_lock);
-	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
-		if (pg->pg_system || cpu < 0 || (u_int)cpu >= pg->pg_ncpu)
-			continue;
-		pgcs = &pg->pg_cpu_state[cpu];
-		/* Do not wait for snapshot during context switch. */
-		mtx_lock_spin(&pg->pg_snapshot_lock);
-		mtx_pool_lock_spin(pmc_mtxpool, pg);
-		if (!pg->pg_committed || !pg->pg_running ||
-		    pg->pg_account_blocked) {
-			mtx_pool_unlock_spin(pmc_mtxpool, pg);
-			mtx_unlock_spin(&pg->pg_snapshot_lock);
-			continue;
-		}
-		KASSERT(!pgcs->pgcs_counted,
-		    ("[pmu] duplicate CPU %d marker for group %u", cpu,
-		    pg->pg_id));
-		pmu_group_time_update_locked(pg, now);
-		pgcs->pgcs_td = td;
-		pgcs->pgcs_counted = true;
-		pgcs->pgcs_placed = false;
-		pgcs->pgcs_transitioning = true;
-		pg->pg_oncpu_threads++;
-		LIST_INSERT_HEAD(&pmu_group_cpu_active[cpu], pgcs, pgcs_next);
-		mtx_pool_unlock_spin(pmc_mtxpool, pg);
-		mtx_unlock_spin(&pg->pg_snapshot_lock);
-	}
+	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next)
+		pmu_group_csw_in_one(pg, td, cpu, now);
+	LIST_FOREACH(pgt, &pp->pp_pmu_inherited, pgt_pp_next)
+		pmu_group_csw_in_one(pgt->pgt_group, td, cpu, now);
 	mtx_unlock_spin(&pp->pp_pmu_lock);
 }
 
@@ -1350,6 +1498,8 @@ void
 pmu_pp_destroy(struct pmc_process *pp)
 {
 
+	/* Stop being a target of any group this process only inherited. */
+	pmu_group_disinherit(pp);
 	pmu_pp_release_all(pp);
 	KASSERT(pp->pp_pmu_refs == 0 && pp->pp_pmu_rot_quiesce == 0 &&
 	    pp->pp_pmu_rot_td == NULL,

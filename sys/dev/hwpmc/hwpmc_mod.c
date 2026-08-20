@@ -323,6 +323,9 @@ SYSCTL_COUNTER_U64(_kern_hwpmc_stats, OID_AUTO, merges, CTLFLAG_RW,
 SYSCTL_COUNTER_U64(_kern_hwpmc_stats, OID_AUTO, overwrites, CTLFLAG_RW,
     &pmc_stats.pm_overwrites,
     "# of times a sample was overwritten before being logged");
+SYSCTL_COUNTER_U64(_kern_hwpmc_stats, OID_AUTO, group_fork_attach_failures,
+    CTLFLAG_RW, &pmc_stats.pm_group_fork_attach_failures,
+    "# of groups a fork could not follow, leaving the child unmonitored");
 
 static int pmc_callchaindepth = PMC_CALLCHAIN_DEPTH;
 SYSCTL_INT(_kern_hwpmc, OID_AUTO, callchaindepth, CTLFLAG_RDTUN,
@@ -1286,6 +1289,54 @@ pmc_group_log_attach(pmu_group_t *pg, struct proc *p)
 	}
 	if (sampling)
 		pmc_log_process_mappings(po, p);
+}
+
+/*
+ * Log a child that a group followed through fork.  Without a PMCATTACH
+ * record per member handle, and the child's mappings for sampling members,
+ * pmcstat -R cannot resolve a PC sampled in the child (spec §3.9, §6.9).
+ */
+static void
+pmc_group_log_inherit(struct pmc_process *ppnew, struct proc *p1,
+    struct proc *newproc)
+{
+	struct pmu_group_target *pgt;
+	struct pmc_owner *po;
+
+	LIST_FOREACH(pgt, &ppnew->pp_pmu_inherited, pgt_pp_next) {
+		po = pgt->pgt_group->pg_owner;
+		if ((po->po_flags & PMC_PO_OWNS_LOGFILE) == 0)
+			continue;
+		if (po->po_sscount == 0)
+			pmclog_process_procfork(po, p1->p_pid,
+			    newproc->p_pid);
+		pmc_group_log_attach(pgt->pgt_group, newproc);
+	}
+}
+
+/*
+ * Report a child a group could not follow.  The driver statistic is the
+ * always-available floor; with a logfile the miss is also placed in the
+ * stream beside the fork, so that -R analysis can account for the gap
+ * instead of reading the totals as complete (spec §3.9).  A detach record
+ * for a pid that never attached carries the member handle and that pid,
+ * which is the whole of what has to be said, so no new record type is
+ * needed.
+ */
+static void
+pmc_group_log_inherit_miss(struct pmc_process *ppold, struct proc *newproc)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	struct pmc_owner *po;
+
+	LIST_FOREACH(pg, &ppold->pp_pmu_groups, pg_proc_next) {
+		po = pg->pg_owner;
+		if ((po->po_flags & PMC_PO_OWNS_LOGFILE) == 0)
+			continue;
+		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+			pmclog_process_pmcdetach(pe->pe_pmc, newproc->p_pid);
+	}
 }
 
 /*
@@ -4062,6 +4113,35 @@ pmc_find_pmc_descriptor_in_process(struct pmc_owner *po, pmc_id_t pmcid)
 	return (NULL);
 }
 
+/*
+ * Find the owner of a grouped PMC held by a descendant, which cannot be
+ * reached through pp_pmcs: that array is indexed by hardware row, and a
+ * grouped member has no row while it is deferred or evicted.  The groups
+ * attached to the process carry the member, and its handle is stable
+ * across placement, so match on that.
+ */
+static struct pmc_owner *
+pmc_find_group_owner_in_process(struct pmc_process *pp, pmc_id_t pmcid)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	struct pmc *pm;
+
+	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
+		if (pg->pg_releasing)
+			continue;
+		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+			pm = pe->pe_pmc;
+			if (pm == NULL || pm->pm_handle != pmcid)
+				continue;
+			if ((pm->pm_flags & PMC_F_DESCENDANTS) == 0)
+				return (NULL);
+			return (pm->pm_owner);
+		}
+	}
+	return (NULL);
+}
+
 static int
 pmc_find_pmc(pmc_id_t pmcid, struct pmc **pmc)
 {
@@ -4085,18 +4165,27 @@ pmc_find_pmc(pmc_id_t pmcid, struct pmc **pmc)
 		    PMC_FLAG_NONE);
 		if (pp == NULL)
 			return (ESRCH);
-		/* Deferred handles cannot be looked up in pp_pmcs. */
-		if (PMC_ROW_IS_DEFERRED_HANDLE(PMC_ID_TO_ROWINDEX(pmcid)))
-			return (ESRCH);
-		opm = pp->pp_pmcs[PMC_ID_TO_ROWINDEX(pmcid)].pp_pmc;
-		if (opm == NULL)
-			return (ESRCH);
-		if ((opm->pm_flags &
-		    (PMC_F_ATTACHED_TO_OWNER | PMC_F_DESCENDANTS)) !=
-		    (PMC_F_ATTACHED_TO_OWNER | PMC_F_DESCENDANTS))
-			return (ESRCH);
+		/*
+		 * A grouped member keeps a stable handle but not a row, so
+		 * it is reached through the process's groups rather than
+		 * through the row-indexed pp_pmcs.
+		 */
+		if (PMC_ID_TO_ROWINDEX(pmcid) == PMC_ROW_UNASSIGNED ||
+		    PMC_ROW_IS_DEFERRED_HANDLE(PMC_ID_TO_ROWINDEX(pmcid))) {
+			po = pmc_find_group_owner_in_process(pp, pmcid);
+			if (po == NULL)
+				return (ESRCH);
+		} else {
+			opm = pp->pp_pmcs[PMC_ID_TO_ROWINDEX(pmcid)].pp_pmc;
+			if (opm == NULL)
+				return (ESRCH);
+			if ((opm->pm_flags &
+			    (PMC_F_ATTACHED_TO_OWNER | PMC_F_DESCENDANTS)) !=
+			    (PMC_F_ATTACHED_TO_OWNER | PMC_F_DESCENDANTS))
+				return (ESRCH);
 
-		po = opm->pm_owner;
+			po = opm->pm_owner;
+		}
 	}
 
 	if ((pm = pmc_find_pmc_descriptor_in_process(po, pmcid)) == NULL)
@@ -6839,7 +6928,10 @@ pmc_process_fork(void *arg __unused, struct proc *p1, struct proc *newproc,
 	struct pmc_owner *po;
 	struct pmc_process *ppnew, *ppold;
 	unsigned int ri;
+	u_int nmissed;
 	bool is_using_hwpmcs, do_descendants;
+
+	nmissed = 0;
 
 	PROC_LOCK(p1);
 	is_using_hwpmcs = (p1->p_flag & P_HWPMC) != 0;
@@ -6883,6 +6975,14 @@ pmc_process_fork(void *arg __unused, struct proc *p1, struct proc *newproc,
 			break;
 		}
 	}
+	/*
+	 * A grouped member is not in pp_pmcs while it is deferred or
+	 * evicted, so the groups are asked separately.
+	 */
+	if (!do_descendants && !LIST_EMPTY(&ppold->pp_pmu_groups))
+		do_descendants = true;
+	if (!do_descendants && !LIST_EMPTY(&ppold->pp_pmu_inherited))
+		do_descendants = true;
 	if (!do_descendants) /* nothing to do */
 		goto done;
 
@@ -6917,6 +7017,18 @@ pmc_process_fork(void *arg __unused, struct proc *p1, struct proc *newproc,
 				    newproc->p_pid);
 			}
 		}
+	}
+
+	/*
+	 * Grouped members follow the fork as whole groups, so that every
+	 * sibling is present in the child or none is.
+	 */
+	if (pmu_group_inherit(ppold, ppnew, &nmissed) > 0)
+		pmc_group_log_inherit(ppnew, p1, newproc);
+	if (nmissed != 0) {
+		counter_u64_add(pmc_stats.pm_group_fork_attach_failures,
+		    nmissed);
+		pmc_group_log_inherit_miss(ppold, newproc);
 	}
 
 done:
@@ -7131,6 +7243,7 @@ pmc_initialize(void)
 	pmc_stats.pm_log_sweeps = counter_u64_alloc(M_WAITOK);
 	pmc_stats.pm_merges = counter_u64_alloc(M_WAITOK);
 	pmc_stats.pm_overwrites = counter_u64_alloc(M_WAITOK);
+	pmc_stats.pm_group_fork_attach_failures = counter_u64_alloc(M_WAITOK);
 
 #ifdef HWPMC_DEBUG
 	/* parse debug flags first */
@@ -7544,6 +7657,7 @@ pmc_cleanup(void)
 	counter_u64_free(pmc_stats.pm_log_sweeps);
 	counter_u64_free(pmc_stats.pm_merges);
 	counter_u64_free(pmc_stats.pm_overwrites);
+	counter_u64_free(pmc_stats.pm_group_fork_attach_failures);
 	sx_xunlock(&pmc_sx);	/* we are done */
 }
 

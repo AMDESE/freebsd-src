@@ -633,6 +633,8 @@ struct pmc_driverstats {
 						   passes */
 	counter_u64_t	pm_merges;		/* merged k+u */
 	counter_u64_t	pm_overwrites;		/* UR overwrites */
+	counter_u64_t	pm_group_fork_attach_failures;	/* groups a fork
+							   could not follow */
 };
 #endif
 
@@ -815,6 +817,7 @@ struct pmc_pcpu_state {
 typedef struct pmu_event pmu_event_t;
 typedef struct pmu_group pmu_group_t;
 LIST_HEAD(pmu_group_list, pmu_group);
+LIST_HEAD(pmu_group_target_list, pmu_group_target);
 #endif
 
 struct pmc {
@@ -958,6 +961,12 @@ struct pmc_process {
 	struct proc	*pp_proc;		/* target process */
 #ifdef _KERNEL
 	struct pmu_group_list pp_pmu_groups;	/* attached PMU groups (FIFO) */
+	/*
+	 * Groups this process follows only because it descends from a
+	 * target.  A group has a single pp_pmu_groups link, held by its
+	 * explicit target, so inherited targets reach it from here.
+	 */
+	struct pmu_group_target_list pp_pmu_inherited;
 	struct mtx	pp_pmu_lock;		/* protects pp_pmu_groups */
 	/*
 	 * Multiplex rotation thread. Rotates groups when total events

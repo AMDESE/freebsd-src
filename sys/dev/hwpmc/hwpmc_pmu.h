@@ -61,6 +61,18 @@ struct pmu_event {
 	pmc_value_t			pe_residual;
 };
 
+/*
+ * A process a group follows through fork, beyond its explicit target.
+ * The record is on two lists: the group's, to find every target, and the
+ * process's, to find every group a descendant follows.
+ */
+struct pmu_group_target {
+	LIST_ENTRY(pmu_group_target)	pgt_next;	/* pg_inherited */
+	LIST_ENTRY(pmu_group_target)	pgt_pp_next;	/* pp_pmu_inherited */
+	pmu_group_t			*pgt_group;
+	struct pmc_process		*pgt_pp;
+};
+
 struct pmu_group_cpu_state {
 	LIST_ENTRY(pmu_group_cpu_state) pgcs_next;
 	pmu_group_t			*pgcs_group;
@@ -96,6 +108,12 @@ struct pmu_group {
 	bool				pg_defer_ok;	/* PMC_F_GROUP_MUX hint */
 	struct proc			*pg_attach_proc;
 	struct pmc_process		*pg_pp;	/* target process descriptor */
+	/*
+	 * Targets inherited through fork (spec §3.9).  The explicit target
+	 * above anchors rotation, placement and release; these accumulate
+	 * into the same member totals and are detached with the group.
+	 */
+	LIST_HEAD(, pmu_group_target)	pg_inherited;
 	/* Virtual enabled and running times use thread ticks; wall uses TSC. */
 	uint64_t			pg_time_enabled_ticks;
 	uint64_t			pg_time_running_ticks;
@@ -175,6 +193,9 @@ void pmu_group_time_snapshot_locked(pmu_group_t *pg,
 void pmu_event_destroy(pmu_event_t *pe);
 pmu_event_t *pmu_event_from_pmc(struct pmc *pm);
 pmu_group_t *pmu_group_from_pmc(struct pmc *pm);
+u_int pmu_group_inherit(struct pmc_process *ppold, struct pmc_process *ppnew,
+    u_int *nmissed);
+void pmu_group_disinherit(struct pmc_process *pp);
 void pmu_event_save_residual(struct pmc *pm, struct pmc_process *pp, int ri);
 void pmu_event_set_residual(struct pmc *pm, pmc_value_t residual);
 void pmu_event_restore_thread_residual(struct pmc *pm,
