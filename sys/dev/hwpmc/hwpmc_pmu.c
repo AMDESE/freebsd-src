@@ -847,7 +847,7 @@ pmu_group_release(pmu_group_t *pg)
 	    pg->pg_leader == NULL,
 	    ("[pmu] freeing non-empty group %u", pg->pg_id));
 	KASSERT(!pg->pg_assigned && pg->pg_pp == NULL &&
-	    !pg->pg_sys_listed,
+	    !pg->pg_sys_listed && !pg->pg_sscounted,
 	    ("[pmu] freeing scheduled group %u", pg->pg_id));
 	if (pg->pg_owner != NULL) {
 		LIST_REMOVE(pg, pg_owner_next);
@@ -1817,14 +1817,69 @@ pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
 		return (error);
 	}
 
+	/*
+	 * Every member starts or none does (§2.4).  A class whose configure
+	 * can fail would otherwise leave a row running unpublished, which is
+	 * the occupancy hole of §5.4 in per-class form.
+	 */
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
-		hwpmc_pmu_sys_start_row(cpu, pe->pe_pmc);
+		error = hwpmc_pmu_sys_start_row(cpu, pe->pe_pmc);
+		if (error != 0) {
+			pmu_event_t *started;
+
+			PMCDBG3(PMC, OPS, 1,
+			    "sys_schedule_in: start gid=%u cpu=%d err=%d",
+			    pg->pg_id, cpu, error);
+			TAILQ_FOREACH(started, &pg->pg_events, pe_sibling) {
+				if (started == pe)
+					break;
+				hwpmc_pmu_sys_stop_row(cpu, started->pe_pmc);
+				started->pe_pmc->pm_state = PMC_STATE_STOPPED;
+			}
+			pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
+			pmu_unassign_group(pg, cpu);
+			return (error);
+		}
 	}
 	pmu_sys_residency_mark(pg, true);
 	PMCDBG3(PMC, OPS, 4, "sys_schedule_in: gid=%u cpu=%d nevents=%u IN",
 	    pg->pg_id, cpu, pg->pg_nevents);
 	return (0);
+}
+
+/* Does any member of this group sample? */
+static bool
+pmu_group_has_sampling(pmu_group_t *pg)
+{
+	pmu_event_t *pe;
+
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pe->pe_pmc)))
+			return (true);
+	}
+	return (false);
+}
+
+/*
+ * Process every sample still queued for this group's members.  A queued
+ * sample holds a pointer to its PMC, so none may be left behind when a row
+ * is reused or a member released (spec §6.7).
+ */
+static void
+pmu_sys_group_drain_samples(pmu_group_t *pg)
+{
+	pmu_event_t *pe;
+
+	if (!pmu_group_has_sampling(pg))
+		return;
+	if (pg->pg_owner != NULL &&
+	    (pg->pg_owner->po_flags & PMC_PO_OWNS_LOGFILE) != 0)
+		(void)pmclog_flush(pg->pg_owner, 1);
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pe->pe_pmc)))
+			pmc_rotation_drain(pe->pe_pmc);
+	}
 }
 
 /*
@@ -1842,10 +1897,24 @@ pmu_sys_schedule_out(int cpu, pmu_group_t *pg)
 		hwpmc_pmu_sys_stop_row(cpu, pe->pe_pmc);
 		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
 	}
+
+	pmu_sys_group_drain_samples(pg);
 	pmu_sys_residency_mark(pg, false);
 	pmu_unassign_group(pg, cpu);
 	PMCDBG2(PMC, OPS, 4, "sys_schedule_out: gid=%u cpu=%d OUT",
 	    pg->pg_id, cpu);
+}
+
+/* Drop the group from the owner's system-sample accounting. */
+static void
+pmu_sys_group_sscount_drop(pmu_group_t *pg)
+{
+
+	if (!pg->pg_sscounted)
+		return;
+	pg->pg_sscounted = false;
+	if (pg->pg_owner != NULL)
+		hwpmc_sscount_sub(pg->pg_owner);
 }
 
 /*
@@ -1874,11 +1943,6 @@ pmu_sys_group_on_start(struct pmc *pm)
 	if (!pmc_cpu_is_active(cpu))
 		return (ENXIO);
 
-	if (!pg->pg_sys_listed) {
-		LIST_INSERT_HEAD(&pmu_syscpu[cpu].sc_groups, pg, pg_proc_next);
-		pg->pg_sys_listed = true;
-	}
-
 	mtx_pool_lock_spin(pmc_mtxpool, pg);
 	if (pg->pg_account_blocked) {
 		mtx_pool_unlock_spin(pmc_mtxpool, pg);
@@ -1901,6 +1965,28 @@ pmu_sys_group_on_start(struct pmc *pm)
 			mtx_pool_unlock_spin(pmc_mtxpool, pg);
 			return (sin_err);
 		}
+	}
+
+	/*
+	 * List the group for rotation only once it is running: a group left
+	 * listed after a failed start would be walked by the rotation thread
+	 * while it owns nothing.
+	 */
+	if (!pg->pg_sys_listed) {
+		LIST_INSERT_HEAD(&pmu_syscpu[cpu].sc_groups, pg, pg_proc_next);
+		pg->pg_sys_listed = true;
+	}
+
+	/*
+	 * A sampling member puts its owner on the system-sampling owner
+	 * list, which is what gates kernel-mapping records.  This is done
+	 * here rather than at row assignment because a deferred member has
+	 * no row yet (spec §6.5).
+	 */
+	if (!pg->pg_sscounted && pmu_group_has_sampling(pg) &&
+	    pg->pg_owner != NULL) {
+		hwpmc_sscount_add(pg->pg_owner);
+		pg->pg_sscounted = true;
 	}
 
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
@@ -1931,6 +2017,7 @@ pmu_sys_group_on_stop(struct pmc *pm)
 	mtx_pool_lock_spin(pmc_mtxpool, pg);
 	pmu_group_running_stop_locked(pg, cpu_ticks());
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+	pmu_sys_group_sscount_drop(pg);
 
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
 		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
@@ -1984,9 +2071,13 @@ pmu_sys_group_pre_release(struct pmc *pm)
 
 	if (pg->pg_assigned)
 		pmu_sys_schedule_out(cpu, pg);
+	else
+		pmu_sys_group_drain_samples(pg);
 	mtx_pool_lock_spin(pmc_mtxpool, pg);
 	pmu_group_running_stop_locked(pg, cpu_ticks());
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+
+	pmu_sys_group_sscount_drop(pg);
 
 	if (pg->pg_sys_listed) {
 		if (sc->sc_cursor == pg)

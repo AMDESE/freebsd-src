@@ -3967,21 +3967,63 @@ hwpmc_unconfigure_row_all_cpus(struct pmc *pm, int ri)
 }
 
 /*
- * Start hardware counter for a system PMC on its bound CPU.
+ * Count a grouped system-sampling member in the owner's system-sample
+ * accounting.  Membership of that list is what gates kernel-mapping
+ * records, and it has to be maintained at start rather than at row
+ * assignment, because a deferred member has no row yet (spec §6.5).
  */
 void
+hwpmc_sscount_add(struct pmc_owner *po)
+{
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	if (po->po_logprocmaps == 0) {
+		pmc_log_all_process_mappings(po);
+		po->po_logprocmaps = 1;
+	}
+	po->po_sscount++;
+	if (po->po_sscount == 1) {
+		atomic_add_rel_int(&pmc_ss_count, 1);
+		CK_LIST_INSERT_HEAD(&pmc_ss_owners, po, po_ssnext);
+		PMCDBG1(PMC, OPS, 1, "po=%p in global list", po);
+	}
+}
+
+void
+hwpmc_sscount_sub(struct pmc_owner *po)
+{
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	KASSERT(po->po_sscount > 0,
+	    ("[pmc,%d] po=%p sscount underflow", __LINE__, po));
+	po->po_sscount--;
+	if (po->po_sscount == 0) {
+		atomic_subtract_rel_int(&pmc_ss_count, 1);
+		CK_LIST_REMOVE(po, po_ssnext);
+		epoch_wait_preempt(global_epoch_preempt);
+		PMCDBG1(PMC, OPS, 2, "po=%p removed from global list", po);
+	}
+}
+
+/*
+ * Start hardware counter for a system PMC on its bound CPU.  Returns an
+ * error if the row could not be published, in which case nothing was
+ * started: a class whose configure can fail must not end up running
+ * unpublished, which is the occupancy hole of spec §5.4 per class.
+ */
+int
 hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
 {
 	struct pmc_binding pb;
 	struct pmc_classdep *pcd;
 	pmc_value_t v;
-	int adjri, ri;
+	int adjri, error, ri;
 	bool sampling;
 
 	ri = PMC_TO_ROWINDEX(pm);
 	pcd = pmc_ri_to_classdep(md, ri, &adjri);
 	if (pcd == NULL || !pmc_cpu_is_active(cpu))
-		return;
+		return (ENXIO);
 
 	/*
 	 * A sampling member resumes from the progress it had when it was
@@ -3995,7 +4037,15 @@ hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
 	pmc_select_cpu(cpu);
 	critical_enter();
 	/* Publish row occupancy in hardware descriptor. */
-	(void)pcd->pcd_config_pmc(cpu, adjri, pm);
+	error = pcd->pcd_config_pmc(cpu, adjri, pm);
+	if (error != 0) {
+		critical_exit();
+		pmc_restore_cpu_binding(&pb);
+		PMCDBG3(PMC, OPS, 1,
+		    "sys_start_row: config cpu=%d ri=%d err=%d", cpu, ri,
+		    error);
+		return (error);
+	}
 	(void)pcd->pcd_write_pmc(cpu, adjri, pm, v);
 	mtx_pool_lock_spin(pmc_mtxpool, pm);
 	PMC_PCPU_SAVED(cpu, ri) = v;
@@ -4003,9 +4053,14 @@ hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm)
 	if (sampling)
 		pm->pm_pcpu_state[cpu].pps_stalled = 0;
 	pm->pm_pcpu_state[cpu].pps_cpustate = 1;
-	(void)pcd->pcd_start_pmc(cpu, adjri, pm);
+	error = pcd->pcd_start_pmc(cpu, adjri, pm);
+	if (error != 0) {
+		pm->pm_pcpu_state[cpu].pps_cpustate = 0;
+		(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
+	}
 	critical_exit();
 	pmc_restore_cpu_binding(&pb);
+	return (error);
 }
 
 /*
@@ -4313,23 +4368,8 @@ pmc_start(struct pmc *pm)
 	 * Add the owner to the global list if this is a system-wide
 	 * sampling PMC.
 	 */
-	if (mode == PMC_MODE_SS) {
-		/*
-		 * Log mapping information for all existing processes in the
-		 * system.  Subsequent mappings are logged as they happen;
-		 * see pmc_process_mmap().
-		 */
-		if (po->po_logprocmaps == 0) {
-			pmc_log_all_process_mappings(po);
-			po->po_logprocmaps = 1;
-		}
-		po->po_sscount++;
-		if (po->po_sscount == 1) {
-			atomic_add_rel_int(&pmc_ss_count, 1);
-			CK_LIST_INSERT_HEAD(&pmc_ss_owners, po, po_ssnext);
-			PMCDBG1(PMC,OPS,1, "po=%p in global list", po);
-		}
-	}
+	if (mode == PMC_MODE_SS)
+		hwpmc_sscount_add(po);
 
 	/*
 	 * Move to the CPU associated with this
@@ -4440,15 +4480,8 @@ pmc_stop(struct pmc *pm)
 
 	/* Remove this owner from the global list of SS PMC owners. */
 	po = pm->pm_owner;
-	if (PMC_TO_MODE(pm) == PMC_MODE_SS) {
-		po->po_sscount--;
-		if (po->po_sscount == 0) {
-			atomic_subtract_rel_int(&pmc_ss_count, 1);
-			CK_LIST_REMOVE(po, po_ssnext);
-			epoch_wait_preempt(global_epoch_preempt);
-			PMCDBG1(PMC,OPS,2,"po=%p removed from global list", po);
-		}
-	}
+	if (PMC_TO_MODE(pm) == PMC_MODE_SS)
+		hwpmc_sscount_sub(po);
 
 	return (error);
 }

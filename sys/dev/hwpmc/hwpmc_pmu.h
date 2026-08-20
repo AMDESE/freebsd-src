@@ -138,6 +138,7 @@ struct pmu_group {
 	 */
 	bool				pg_system;	/* system-wide group */
 	bool				pg_sys_listed;	/* on pmu_syscpu list */
+	bool				pg_sscounted;	/* in po_sscount */
 	int				pg_cpu;		/* bound CPU (system) */
 };
 
@@ -159,7 +160,9 @@ void hwpmc_unconfigure_row_all_cpus(struct pmc *pm, int ri);
  * Start and stop system-mode PMC hardware on the target CPU.
  * Values accumulate across multiplex windows.
  */
-void hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm);
+int hwpmc_pmu_sys_start_row(int cpu, struct pmc *pm);
+void hwpmc_sscount_add(struct pmc_owner *po);
+void hwpmc_sscount_sub(struct pmc_owner *po);
 void hwpmc_pmu_sys_stop_row(int cpu, struct pmc *pm);
 
 /*
