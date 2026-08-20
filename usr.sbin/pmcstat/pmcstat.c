@@ -140,6 +140,35 @@ pmcstat_get_cpumask(const char *cpuspec, cpuset_t *cpumask)
 }
 
 /*
+ * The most events a CPU could retire while a group holds hardware for one
+ * rotation window.  A sampling member needing more than this than cannot
+ * reach an overflow in a window, however busy the machine, so it will
+ * deliver sparsely or not at all.  Deliberately generous: it assumes the
+ * CPU never stalls and retires several events per cycle, so a warning
+ * means the period really is too long, not merely ambitious.  Zero if the
+ * driver or the clock rate cannot be read.
+ */
+#define	PMCSTAT_MAX_EVENTS_PER_CYCLE	8
+
+static uint64_t
+pmcstat_events_per_window(void)
+{
+	uint64_t freq;
+	size_t len;
+	int period_ms;
+
+	len = sizeof(freq);
+	if (sysctlbyname("machdep.tsc_freq", &freq, &len, NULL, 0) != 0)
+		return (0);
+	len = sizeof(period_ms);
+	if (sysctlbyname("kern.hwpmc.mux_period_ms", &period_ms, &len, NULL,
+	    0) != 0 || period_ms <= 0)
+		return (0);
+	return (freq / 1000 * (uint64_t)period_ms *
+	    PMCSTAT_MAX_EVENTS_PER_CYCLE);
+}
+
+/*
  * How many times a fork could not carry its group to the child.  A kernel
  * counter nobody reads is not observability, so -d compares this across
  * the run and says if it moved.  Zero if the driver does not report it.
@@ -593,7 +622,7 @@ main(int argc, char **argv)
 	const char *errmsg, *graphfilename;
 	enum pmcstat_state runstate;
 	struct pmc_driverstats ds_start, ds_end;
-	uint64_t fork_misses_start, fork_misses_end;
+	uint64_t fork_misses_start, fork_misses_end, events_per_window;
 	struct pmcstat_ev *ev;
 	struct sigaction sa;
 	struct kevent kev;
@@ -1368,12 +1397,29 @@ main(int argc, char **argv)
 	 * Allocate PMCs.
 	 */
 
+	events_per_window = pmcstat_events_per_window();
+
 	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
 		int rc;
 
 		/* Enable multiplexing for group leaders. */
 		if (ev->ev_groupid > 0 && ev->ev_is_leader)
 			ev->ev_flags |= PMC_F_GROUP_MUX;
+
+		/*
+		 * A multiplexed group holds hardware for one rotation window
+		 * at a time.  Say so when a member's period is longer than a
+		 * window could ever retire: it will deliver sparsely, and the
+		 * remedy is a smaller -n or no grouping.
+		 */
+		if (ev->ev_groupid > 0 && PMC_IS_SAMPLING_MODE(ev->ev_mode) &&
+		    events_per_window != 0 &&
+		    (uint64_t)ev->ev_count > events_per_window)
+			warnx(
+"WARNING: \"%s\" samples every %ju events, more than one\n"
+"kern.hwpmc.mux_period_ms rotation window can retire; expect few samples or\n"
+"none.  Lower -n, or drop the braces to stop multiplexing.",
+			    ev->ev_name, (uintmax_t)ev->ev_count);
 
 		if (ev->ev_groupid > 0)
 			rc = pmc_allocate_group(ev->ev_spec, ev->ev_mode,
