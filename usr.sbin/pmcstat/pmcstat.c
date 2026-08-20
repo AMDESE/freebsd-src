@@ -139,6 +139,24 @@ pmcstat_get_cpumask(const char *cpuspec, cpuset_t *cpumask)
 	assert(!CPU_EMPTY(cpumask));
 }
 
+/*
+ * How many times a fork could not carry its group to the child.  A kernel
+ * counter nobody reads is not observability, so -d compares this across
+ * the run and says if it moved.  Zero if the driver does not report it.
+ */
+static uint64_t
+pmcstat_fork_attach_failures(void)
+{
+	uint64_t v;
+	size_t len;
+
+	len = sizeof(v);
+	if (sysctlbyname("kern.hwpmc.stats.group_fork_attach_failures", &v,
+	    &len, NULL, 0) != 0)
+		return (0);
+	return (v);
+}
+
 void
 pmcstat_cleanup(void)
 {
@@ -575,6 +593,7 @@ main(int argc, char **argv)
 	const char *errmsg, *graphfilename;
 	enum pmcstat_state runstate;
 	struct pmc_driverstats ds_start, ds_end;
+	uint64_t fork_misses_start, fork_misses_end;
 	struct pmcstat_ev *ev;
 	struct sigaction sa;
 	struct kevent kev;
@@ -806,7 +825,14 @@ main(int argc, char **argv)
 								ev->ev_flags |=
 								    PMC_F_USERCALLCHAIN;
 						}
-						if (do_descendants)
+						/*
+						 * The flag is leader-only and
+						 * governs the whole group; on
+						 * a sibling it would fail the
+						 * commit.
+						 */
+						if (do_descendants &&
+						    si == 0)
 							ev->ev_flags |=
 							    PMC_F_DESCENDANTS;
 						if (do_logprocexit)
@@ -1162,6 +1188,17 @@ main(int argc, char **argv)
 "ERROR: options -P and -p require a target process or a command line."
 		    );
 
+	/*
+	 * A system-mode PMC is bound to a CPU and has no process target, so
+	 * it cannot follow a fork.  Saying so here turns a confusing
+	 * commit-time EINVAL into an immediate, explicable error.
+	 */
+	if (do_descendants && (args.pa_flags & FLAG_HAS_SYSTEM_PMCS) != 0)
+		errx(EX_USAGE,
+"ERROR: option -d may not be used with -s or -S: a system mode PMC has no\n"
+"process target to follow through fork."
+		    );
+
 	/* check for process-mode options without a process-mode PMC */
 	if ((args.pa_required & FLAG_HAS_PROCESS_PMCS) &&
 	    (args.pa_flags & FLAG_HAS_PROCESS_PMCS) == 0)
@@ -1507,6 +1544,9 @@ main(int argc, char **argv)
 	if (check_driver_stats && pmc_get_driver_stats(&ds_start) < 0)
 		err(EX_OSERR, "ERROR: Cannot retrieve driver statistics");
 
+	if (do_descendants)
+		fork_misses_start = pmcstat_fork_attach_failures();
+
 	/* Attach process pmcs to the target process. */
 	if (args.pa_flags & (FLAG_HAS_TARGET | FLAG_HAS_COMMANDLINE)) {
 		if (SLIST_EMPTY(&args.pa_targets))
@@ -1684,6 +1724,21 @@ main(int argc, char **argv)
 		pmc_close_logfile();
 
 	pmcstat_cleanup();
+
+	/*
+	 * Report children the driver could not carry a group to.  Their work
+	 * is absent from the totals above, which otherwise look complete.
+	 */
+	if (do_descendants) {
+		fork_misses_end = pmcstat_fork_attach_failures();
+		if (fork_misses_end > fork_misses_start)
+			warnx(
+"WARNING: %ju descendant attach%s failed; their contributions are not in\n"
+"these totals.",
+			    (uintmax_t)(fork_misses_end - fork_misses_start),
+			    (fork_misses_end - fork_misses_start) != 1 ?
+			    "es" : "");
+	}
 
 	/* check if the driver lost any samples or events */
 	if (check_driver_stats) {
