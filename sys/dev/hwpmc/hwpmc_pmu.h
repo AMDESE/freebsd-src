@@ -28,6 +28,58 @@ enum pmc_flags {
 	PMC_FLAG_NOWAIT   = 0x04, /* do not wait for mallocs */
 };
 
+#ifdef HWPMC_DEBUG
+/*
+ * Test-only live-object and reference counters.  These are internal to the
+ * hwpmc module and are exposed only by an HWPMC_DEBUG kernel.
+ */
+enum pmc_test_counter {
+	PMC_TEST_LIVE_PMC_TARGETS,
+	PMC_TEST_LIVE_GROUP_TARGETS,
+	PMC_TEST_LIVE_TARGET_PROCESSES,
+	PMC_TEST_LIVE_RESIDUAL_ENTRIES,
+	PMC_TEST_LIVE_ROTATION_REFS,
+	PMC_TEST_LIVE_RUN_REFS,
+	PMC_TEST_COUNTER_COUNT
+};
+
+enum pmc_test_failpoint {
+	PMC_TEST_FAIL_GROUP_TARGET_ALLOC,
+	PMC_TEST_FAIL_TARGET_LINK_ALLOC,
+	PMC_TEST_FAIL_ATTACH_AUTHORIZATION,
+	PMC_TEST_FAIL_SYSTEM_START,
+	PMC_TEST_FAILPOINT_COUNT
+};
+
+void	pmc_test_counter_add(enum pmc_test_counter counter, int64_t delta);
+bool	pmc_test_should_fail(enum pmc_test_failpoint failpoint);
+bool	pmc_test_group_hold_resident(pmu_group_t *pg);
+bool	pmc_test_group_hold_evicted(pmu_group_t *pg);
+void	pmc_test_descendants_attach_pause(pmu_group_t *pg, u_int ntargets);
+void	pmc_test_descendants_exit_observed(struct proc *p);
+void	pmc_test_system_start_pause(pmu_group_t *pg, u_int nstarted);
+void	pmc_test_sample_accepted(struct pmc *pm, uint32_t pid, uint32_t tid);
+bool	pmc_test_sample_worker_paused(struct pmc *pm);
+void	pmc_test_sample_schedule_out(pmu_group_t *pg);
+bool	pmc_test_callchain_log_should_fail(struct pmc *pm);
+void	pmc_test_sample_dropped(struct pmc *pm);
+void	pmc_test_sample_done(struct pmc *pm, bool emitted);
+#else
+#define	pmc_test_counter_add(counter, delta)	do { } while (0)
+#define	pmc_test_should_fail(failpoint)		(false)
+#define	pmc_test_group_hold_resident(pg)	(false)
+#define	pmc_test_group_hold_evicted(pg)		(false)
+#define	pmc_test_descendants_attach_pause(pg, n)	do { } while (0)
+#define	pmc_test_descendants_exit_observed(p)	do { } while (0)
+#define	pmc_test_system_start_pause(pg, n)	do { } while (0)
+#define	pmc_test_sample_accepted(pm, pid, tid)	do { } while (0)
+#define	pmc_test_sample_worker_paused(pm)	(false)
+#define	pmc_test_sample_schedule_out(pg)		do { } while (0)
+#define	pmc_test_callchain_log_should_fail(pm)	(false)
+#define	pmc_test_sample_dropped(pm)		do { } while (0)
+#define	pmc_test_sample_done(pm, emitted)	do { } while (0)
+#endif
+
 /*
  * Scheduling constraint from the class backend.
  * pc_allowed_rows is a bitmask of valid class row indices.
@@ -49,28 +101,64 @@ struct pmu_event {
 	pmu_group_t			*pe_group;
 	struct pmc			*pe_pmc;
 	counter_u64_t			pe_samples;
+#ifdef HWPMC_DEBUG
+	counter_u64_t			pe_samples_emitted;
+	counter_u64_t			pe_samples_dropped;
+	volatile u_int			pe_test_sample_pid;
+	volatile u_int			pe_test_sample_tid;
+#endif
 	bool				pe_is_leader;
 	struct pmc_op_pmcallocate	pe_alloc;
 	pmc_sched_constraint_t		pe_cons;
 	/*
-	 * Progress toward the next sample, kept across eviction.  Per-thread
-	 * state lives in pt_pmcs[], which is indexed by hardware row, and a
-	 * member does not keep its row across a rotation; this is keyed to
-	 * the member instead.  Zero means "start from the reload count".
+	 * System-mode progress toward the next sample, kept across eviction.
+	 * Virtual per-thread state is stored in pp_pmu_residuals instead.
+	 * Zero means "start from the reload count".
 	 */
 	pmc_value_t			pe_residual;
 };
 
 /*
- * A process a group follows through fork, beyond its explicit target.
- * The record is on two lists: the group's, to find every target, and the
- * process's, to find every group a descendant follows.
+ * Explicit saved-residual state.  A raw count of zero is ambiguous: a
+ * down-counting sampling PMC reads zero both when it has overflowed and when
+ * it has no saved progress.  The state is stored separately so the two are
+ * never inferred from the value alone.
+ */
+enum pmu_residual_state {
+	PMU_RESIDUAL_UNINITIALIZED = 0,	/* no saved progress; full reload */
+	PMU_RESIDUAL_COUNT_VALID = 1,	/* ptr_value is a partial count */
+	PMU_RESIDUAL_OVERFLOW_PENDING = 2, /* overflow seen at schedule-out */
+};
+
+/*
+ * Saved virtual-thread sampling progress.  Hardware rows are transient, so
+ * the stable key is the event plus target TID within one process descriptor.
+ * The containing process's pp_tdslock protects this list and its entries.
+ */
+struct pmu_thread_residual {
+	LIST_ENTRY(pmu_thread_residual)	ptr_next;
+	pmu_event_t			*ptr_event;
+	lwpid_t				ptr_tid;
+	pmc_value_t			ptr_value;
+	uint8_t				ptr_state;	/* pmu_residual_state */
+};
+
+/*
+ * One authoritative group-target edge.  Explicit and inherited targets use
+ * the same representation.  Hardware-row links are transient and are not
+ * stored here.
+ *
+ * Target-list mutations require pmc_sx exclusive.  When a process-tree
+ * snapshot is also needed, lock order is:
+ *
+ *     pmc_sx -> proctree_lock -> pp_pmu_lock
  */
 struct pmu_group_target {
-	LIST_ENTRY(pmu_group_target)	pgt_next;	/* pg_inherited */
-	LIST_ENTRY(pmu_group_target)	pgt_pp_next;	/* pp_pmu_inherited */
+	LIST_ENTRY(pmu_group_target)	pgt_group_next;	/* pg_targets */
+	LIST_ENTRY(pmu_group_target)	pgt_process_next; /* pp_pmu_targets */
 	pmu_group_t			*pgt_group;
 	struct pmc_process		*pgt_pp;
+	bool				pgt_explicit;
 };
 
 struct pmu_group_cpu_state {
@@ -106,14 +194,14 @@ struct pmu_group {
 	bool				pg_assigned;	/* SCHEDULED if true */
 	bool				pg_running;	/* between start/stop */
 	bool				pg_defer_ok;	/* PMC_F_GROUP_MUX hint */
-	struct proc			*pg_attach_proc;
-	struct pmc_process		*pg_pp;	/* target process descriptor */
+	struct pmu_group_target		*pg_explicit_target;
+	struct pmc_process		*pg_pp;	/* current scheduling anchor */
 	/*
-	 * Targets inherited through fork (spec §3.9).  The explicit target
-	 * above anchors rotation, placement and release; these accumulate
-	 * into the same member totals and are detached with the group.
+	 * Authoritative target set.  pg_explicit_target, when non-NULL, points
+	 * to the user-requested edge in this list.  pg_pp is only the current
+	 * scheduling/rotation anchor and may identify an inherited target.
 	 */
-	LIST_HEAD(, pmu_group_target)	pg_inherited;
+	LIST_HEAD(, pmu_group_target)	pg_targets;
 	/* Virtual enabled and running times use thread ticks; wall uses TSC. */
 	uint64_t			pg_time_enabled_ticks;
 	uint64_t			pg_time_running_ticks;
@@ -197,13 +285,26 @@ void pmu_event_destroy(pmu_event_t *pe);
 pmu_event_t *pmu_event_from_pmc(struct pmc *pm);
 pmu_group_t *pmu_group_from_pmc(struct pmc *pm);
 u_int pmu_group_inherit(struct pmc_process *ppold, struct pmc_process *ppnew,
-    u_int *nmissed);
+    struct pmc **missed_leaders, u_int missed_capacity, u_int *nmissed);
+bool pmu_group_follows_fork(pmu_group_t *pg);
 void pmu_group_disinherit(struct pmc_process *pp);
+struct pmu_group_target *pmu_group_target_alloc(pmu_group_t *pg,
+    struct pmc_process *pp, bool explicit, int malloc_flags);
+void pmu_group_target_publish(struct pmu_group_target *pgt);
+void pmu_group_target_discard(struct pmu_group_target *pgt);
+void pmu_group_target_remove(struct pmu_group_target *pgt);
 void pmu_event_save_residual(struct pmc *pm, struct pmc_process *pp, int ri);
 void pmu_event_set_residual(struct pmc *pm, pmc_value_t residual);
 void pmu_event_restore_thread_residual(struct pmc *pm,
     struct pmc_process *pp, int ri);
 pmc_value_t pmu_event_restore_residual(struct pmc *pm);
+void pmu_thread_residual_remove(struct pmc_process *pp, lwpid_t tid);
+#ifdef HWPMC_DEBUG
+int pmu_event_get_thread_residual(struct pmc *pm, struct pmc_process *pp,
+    lwpid_t tid, pmc_value_t *value, uint8_t *state);
+int pmu_event_set_thread_residual(struct pmc *pm, struct pmc_process *pp,
+    lwpid_t tid, pmc_value_t value, uint8_t state);
+#endif
 
 int pmu_group_on_allocate(struct pmc *pm, const struct pmc_op_pmcallocate *pa);
 int pmu_group_on_attach(struct pmc *pm, struct proc *p);
@@ -230,6 +331,7 @@ void pmu_sys_group_pre_release(struct pmc *pm);
 void pmu_pp_init(struct pmc_process *pp);
 void pmu_pp_destroy(struct pmc_process *pp);
 void pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp);
+void pmu_group_detach_inherited_target(pmu_group_t *pg, struct pmc_process *pp);
 void pmu_pp_kick_after_exec(struct pmc_process *pp);
 
 /*
@@ -243,9 +345,16 @@ void hwpmc_pmu_force_context_switch(void);
 /*
  * Rotation helper functions (hwpmc_mod.c).
  */
+void pmc_rotation_drain_set(struct pmc *pm, bool drain);
 void pmc_rotation_drain(struct pmc *pm);
+void pmc_rotation_drain_cpu(struct pmc *pm, int cpu);
 void pmc_rotation_detach(struct pmc *pm, struct pmc_process *pp);
 void pmc_rotation_attach(struct pmc *pm, struct pmc_process *pp);
+struct pmc_target *pmc_target_object_alloc(int malloc_flags,
+    bool inject_failure);
+void pmc_target_object_free(struct pmc_target *pt);
+void pmc_link_target_process_preallocated(struct pmc *pm,
+    struct pmc_process *pp, struct pmc_target *pt);
 
 #endif /* _KERNEL */
 

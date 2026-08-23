@@ -168,6 +168,40 @@ pmcstat_events_per_window(void)
 	    PMCSTAT_MAX_EVENTS_PER_CYCLE);
 }
 
+static void
+pmcstat_warn_long_sampling_periods(uint64_t events_per_window)
+{
+	struct pmc_group_times times;
+	struct pmcstat_ev *ev, *leader;
+	uint32_t nmembers;
+
+	if (events_per_window == 0)
+		return;
+	STAILQ_FOREACH(leader, &args.pa_events, ev_next) {
+		if (leader->ev_groupid == 0 || !leader->ev_is_leader ||
+		    !PMC_IS_SAMPLING_MODE(leader->ev_mode))
+			continue;
+		nmembers = 0;
+		if (pmc_group_read(leader->ev_pmcid, &nmembers, NULL,
+		    &times) != 0 ||
+		    times.pgt_enabled == 0 ||
+		    times.pgt_running >= times.pgt_enabled)
+			continue;
+
+		STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
+			if (ev->ev_groupid != leader->ev_groupid ||
+			    !PMC_IS_SAMPLING_MODE(ev->ev_mode) ||
+			    (uint64_t)ev->ev_count <= events_per_window)
+				continue;
+			warnx(
+"WARNING: \"%s\" samples every %ju events in a multiplexed group, more than\n"
+"one kern.hwpmc.mux_period_ms rotation window can retire; expect few samples\n"
+"or none.  Lower -n, or drop the braces to stop multiplexing.",
+			    ev->ev_name, (uintmax_t)ev->ev_count);
+		}
+	}
+}
+
 /*
  * How many times a fork could not carry its group to the child.  A kernel
  * counter nobody reads is not observability, so -d compares this across
@@ -1406,21 +1440,6 @@ main(int argc, char **argv)
 		if (ev->ev_groupid > 0 && ev->ev_is_leader)
 			ev->ev_flags |= PMC_F_GROUP_MUX;
 
-		/*
-		 * A multiplexed group holds hardware for one rotation window
-		 * at a time.  Say so when a member's period is longer than a
-		 * window could ever retire: it will deliver sparsely, and the
-		 * remedy is a smaller -n or no grouping.
-		 */
-		if (ev->ev_groupid > 0 && PMC_IS_SAMPLING_MODE(ev->ev_mode) &&
-		    events_per_window != 0 &&
-		    (uint64_t)ev->ev_count > events_per_window)
-			warnx(
-"WARNING: \"%s\" samples every %ju events, more than one\n"
-"kern.hwpmc.mux_period_ms rotation window can retire; expect few samples or\n"
-"none.  Lower -n, or drop the braces to stop multiplexing.",
-			    ev->ev_name, (uintmax_t)ev->ev_count);
-
 		if (ev->ev_groupid > 0)
 			rc = pmc_allocate_group(ev->ev_spec, ev->ev_mode,
 			    ev->ev_flags, ev->ev_cpu, &ev->ev_pmcid,
@@ -1759,6 +1778,8 @@ main(int argc, char **argv)
 		}
 
 	} while (runstate != PMCSTAT_FINISHED);
+
+	pmcstat_warn_long_sampling_periods(events_per_window);
 
 	if ((args.pa_flags & FLAG_DO_TOP) && args.pa_toptty) {
 		pmcstat_topexit();

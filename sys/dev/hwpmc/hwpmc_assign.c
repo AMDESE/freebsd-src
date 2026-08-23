@@ -89,9 +89,10 @@ pmu_class_supports_grouping(enum pmc_class class)
  * Assign one event to a hardware row.
  */
 static int
-pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
+pmu_assign_one(pmu_group_t *pg, pmu_event_t *pe, struct proc *p, int cpu,
     uint32_t *used_mask, bool dry_run, uint64_t evictable_rows)
 {
+	struct pmu_group_target *pgt;
 	struct pmc *pm;
 	struct pmc_classdep *pcd;
 	enum pmc_mode mode;
@@ -134,10 +135,29 @@ pmu_assign_one(pmu_event_t *pe, struct proc *p, int cpu,
 		if (adjri >= pcd->pcd_num)
 			goto skip;
 		n = pcd->pcd_ri + adjri;
-		if (p != NULL && (!hwpmc_can_allocate_row(n, mode) ||
-		    !hwpmc_can_allocate_rowindex(p, n, idcpu)) &&
-		    (n >= 64 || (evictable_rows & (1ULL << n)) == 0))
-			goto skip;
+		if (p != NULL) {
+			if (!hwpmc_can_allocate_row(n, mode) &&
+			    (n >= 64 ||
+			    (evictable_rows & (1ULL << n)) == 0))
+				goto skip;
+			if (LIST_EMPTY(&pg->pg_targets)) {
+				if (!hwpmc_can_allocate_rowindex(p, n, idcpu) &&
+				    (n >= 64 ||
+				    (evictable_rows & (1ULL << n)) == 0))
+					goto skip;
+			} else {
+				LIST_FOREACH(pgt, &pg->pg_targets,
+				    pgt_group_next) {
+					if (hwpmc_can_allocate_rowindex(
+					    pgt->pgt_pp->pp_proc, n, idcpu))
+						continue;
+					if (n < 64 &&
+					    (evictable_rows & (1ULL << n)) != 0)
+						continue;
+					goto skip;
+				}
+			}
+		}
 		/* Check system row occupancy. */
 		if (sys && p != NULL && !hwpmc_row_is_unallocated(cpu, n) &&
 		    (n >= 64 || (evictable_rows & (1ULL << n)) == 0))
@@ -260,7 +280,7 @@ pmu_group_probe(pmu_group_t *pg, struct proc *p, int cpu,
 	used_mask = 0;
 	error = 0;
 	for (i = 0; i < pg->pg_nevents; i++) {
-		error = pmu_assign_one(order[i], p, cpu, &used_mask, true,
+		error = pmu_assign_one(pg, order[i], p, cpu, &used_mask, true,
 		    evictable_rows);
 		if (error != 0)
 			break;
@@ -324,7 +344,8 @@ pmu_assign_group(pmu_group_t *pg, struct proc *p, int cpu)
 	used_mask = 0;
 	error = 0;
 	for (i = 0; i < pg->pg_nevents; i++) {
-		error = pmu_assign_one(order[i], p, cpu, &used_mask, false, 0);
+		error = pmu_assign_one(pg, order[i], p, cpu, &used_mask, false,
+		    0);
 		if (error != 0)
 			break;
 	}

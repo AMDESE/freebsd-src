@@ -21,7 +21,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd August 15, 2026
+.Dd August 22, 2026
 .Dt PMCLOG 3
 .Os
 .Sh NAME
@@ -93,6 +93,7 @@ struct pmclog_ev {
 		struct pmclog_ev_pmcallocatedyn	pl_ad;
 		struct pmclog_ev_pmcattach   pl_t;
 		struct pmclog_ev_pmcdetach   pl_d;
+		struct pmclog_ev_pmcgroupinheritmiss pl_gim;
 		struct pmclog_ev_proccsw     pl_c;
 		struct pmclog_ev_procexec    pl_x;
 		struct pmclog_ev_procexit    pl_e;
@@ -201,6 +202,10 @@ A record describing a PMC allocation operation.
 A record describing a PMC attach operation.
 .It Dv PMCLOG_TYPE_PMCDETACH
 A record describing a PMC detach operation.
+.It Dv PMCLOG_TYPE_PMCGROUPINHERITMISS
+A record identifying a failed grouped descendant-inheritance operation.
+The record contains the stable group-leader PMC handle and the PID of the
+child for which no group-target edge was published.
 .It Dv PMCLOG_TYPE_PROCCSW
 A record describing a PMC reading at the time of a process context switch.
 .It Dv PMCLOG_TYPE_PROCEXEC

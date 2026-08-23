@@ -21,6 +21,7 @@
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/sx.h>
+#include <sys/taskqueue.h>
 #include <sys/unistd.h>
 
 #include "hwpmc_pmu.h"
@@ -33,6 +34,9 @@ extern struct mtx_pool *pmc_mtxpool;
 
 LIST_HEAD(pmu_group_cpu_list, pmu_group_cpu_state);
 static struct pmu_group_cpu_list pmu_group_cpu_active[MAXCPU];
+static LIST_HEAD(, pmu_thread_residual) pmu_residual_freelist;
+static struct mtx pmu_residual_freelist_mtx;
+static struct task pmu_residual_free_task;
 
 SYSCTL_DECL(_kern_hwpmc);
 
@@ -61,8 +65,18 @@ static int pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg);
 static void pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
     bool drain_samples);
 static void pmu_pp_kick_rotate(struct pmc_process *pp);
+static void pmu_pp_unlink_group(pmu_group_t *pg, struct pmc_process *pp);
 static void pmu_group_attach_siblings(pmu_group_t *pg,
     struct pmc_process *pp);
+static void pmu_event_remove_target_residuals(pmu_event_t *pe,
+    struct pmc_process *pp);
+static int pmu_event_set_thread_residual_impl(struct pmc *pm,
+    struct pmc_process *pp, lwpid_t tid, pmc_value_t value, uint8_t state);
+static struct pmu_thread_residual *pmu_thread_residual_find_locked(
+    struct pmc_process *pp, pmu_event_t *pe, lwpid_t tid);
+static bool pmu_thread_exists_locked(struct pmc_process *pp, lwpid_t tid);
+static void pmu_thread_residual_defer_free(struct pmu_thread_residual *ptr);
+static void pmu_thread_residual_free_task_fn(void *arg, int pending);
 
 /*
  * State for system-mode (PMC_MODE_SC) multiplexing.
@@ -80,6 +94,7 @@ static struct pmu_syscpu pmu_syscpu[MAXCPU];
 static void pmu_syscpu_rotate_thread(void *arg);
 static int pmu_sys_schedule_in(int cpu, pmu_group_t *pg);
 static void pmu_sys_schedule_out(int cpu, pmu_group_t *pg);
+static void pmu_sys_stop_rows(int cpu, pmu_group_t *pg, u_int nmembers);
 static void pmu_syscpu_kick_rotate(int cpu);
 static void pmu_syscpu_rotate_one(int cpu);
 
@@ -90,6 +105,11 @@ pmu_group_accounting_initialize(void)
 
 	for (cpu = 0; cpu < MAXCPU; cpu++)
 		LIST_INIT(&pmu_group_cpu_active[cpu]);
+	LIST_INIT(&pmu_residual_freelist);
+	mtx_init(&pmu_residual_freelist_mtx, "pmu-residuals", "pmc-leaf",
+	    MTX_SPIN);
+	TASK_INIT(&pmu_residual_free_task, 0, pmu_thread_residual_free_task_fn,
+	    NULL);
 }
 
 void
@@ -100,6 +120,11 @@ pmu_group_accounting_finalize(void)
 	for (cpu = 0; cpu < MAXCPU; cpu++)
 		KASSERT(LIST_EMPTY(&pmu_group_cpu_active[cpu]),
 		    ("[pmu] active accounting markers on CPU %u", cpu));
+	taskqueue_drain(taskqueue_fast, &pmu_residual_free_task);
+	pmu_thread_residual_free_task_fn(NULL, 0);
+	KASSERT(LIST_EMPTY(&pmu_residual_freelist),
+	    ("[pmu] deferred residual frees remain"));
+	mtx_destroy(&pmu_residual_freelist_mtx);
 }
 
 static void
@@ -368,7 +393,7 @@ pmu_pp_link_group(pmu_group_t *pg, struct pmc_process *pp)
  * leader-only and governs the whole group, and commit has already
  * rejected it on a system group.
  */
-static bool
+bool
 pmu_group_follows_fork(pmu_group_t *pg)
 {
 
@@ -377,69 +402,198 @@ pmu_group_follows_fork(pmu_group_t *pg)
 	    (pg->pg_leader->pe_alloc.pm_flags & PMC_F_DESCENDANTS) != 0);
 }
 
-/* Is pp a target this group already follows? */
-static bool
-pmu_group_has_target(pmu_group_t *pg, struct pmc_process *pp)
+/* Find the authoritative edge for pp, if this group already follows it. */
+static struct pmu_group_target *
+pmu_group_find_target(pmu_group_t *pg, struct pmc_process *pp)
 {
 	struct pmu_group_target *pgt;
 
-	if (pg->pg_pp == pp)
-		return (true);
-	LIST_FOREACH(pgt, &pg->pg_inherited, pgt_next) {
+	LIST_FOREACH(pgt, &pg->pg_targets, pgt_group_next) {
 		if (pgt->pgt_pp == pp)
-			return (true);
+			return (pgt);
 	}
-	return (false);
+	return (NULL);
 }
 
 /*
- * Record a target the group reached through fork.  Only the explicit
- * target carries the group on its pp_pmu_groups list -- pg_proc_next is a
- * single link, so the group cannot be on two of those at once -- and that
- * target keeps anchoring rotation, placement and release.  An inherited
- * target is reached through this list instead; its threads count toward
- * the same member totals through the per-CPU state, which is keyed by CPU
- * rather than by process.
- *
- * Returns false if the record could not be allocated.  The caller must
- * surface that: the child then goes unmonitored (spec §3.9).
+ * Select a surviving authoritative target for a scheduling-anchor handoff.
+ * Prefer the explicit edge if it still exists; otherwise any inherited edge
+ * is equivalent.  pmc_sx exclusive serializes target removal and process
+ * descriptor destruction while the returned edge is used.
+ */
+static struct pmu_group_target *
+pmu_group_replacement_target(pmu_group_t *pg, struct pmc_process *old_pp)
+{
+	struct pmu_group_target *pgt, *replacement;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	replacement = NULL;
+	LIST_FOREACH(pgt, &pg->pg_targets, pgt_group_next) {
+		if (pgt->pgt_pp == old_pp)
+			continue;
+		if (pgt->pgt_explicit)
+			return (pgt);
+		if (replacement == NULL)
+			replacement = pgt;
+	}
+	return (replacement);
+}
+
+static bool
+pmu_group_has_target(pmu_group_t *pg, struct pmc_process *pp)
+{
+
+	return (pmu_group_find_target(pg, pp) != NULL);
+}
+
+/*
+ * Allocate an unpublished authoritative target edge.  Publication is kept
+ * separate so multi-process attach can complete every fallible allocation
+ * and authorization check before making any edge visible.
+ */
+struct pmu_group_target *
+pmu_group_target_alloc(pmu_group_t *pg, struct pmc_process *pp, bool explicit,
+    int malloc_flags)
+{
+	struct pmu_group_target *pgt;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	KASSERT(pg != NULL && pp != NULL,
+	    ("[pmu] invalid target allocation pg=%p pp=%p", pg, pp));
+	if (pmc_test_should_fail(PMC_TEST_FAIL_GROUP_TARGET_ALLOC))
+		return (NULL);
+	pgt = malloc(sizeof(*pgt), M_PMU, malloc_flags | M_ZERO);
+	if (pgt == NULL)
+		return (NULL);
+	pmc_test_counter_add(PMC_TEST_LIVE_GROUP_TARGETS, 1);
+	pgt->pgt_pp = pp;
+	pgt->pgt_group = pg;
+	pgt->pgt_explicit = explicit;
+	return (pgt);
+}
+
+void
+pmu_group_target_publish(struct pmu_group_target *pgt)
+{
+	pmu_group_t *pg;
+	struct pmc_process *pp;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	KASSERT(pgt != NULL && pgt->pgt_group != NULL && pgt->pgt_pp != NULL,
+	    ("[pmu] invalid target publication pgt=%p", pgt));
+	pg = pgt->pgt_group;
+	pp = pgt->pgt_pp;
+	KASSERT(!pmu_group_has_target(pg, pp),
+	    ("[pmu] duplicate group %u target pp=%p", pg->pg_id, pp));
+
+	LIST_INSERT_HEAD(&pg->pg_targets, pgt, pgt_group_next);
+	mtx_lock_spin(&pp->pp_pmu_lock);
+	LIST_INSERT_HEAD(&pp->pp_pmu_targets, pgt, pgt_process_next);
+	mtx_unlock_spin(&pp->pp_pmu_lock);
+	if (pgt->pgt_explicit) {
+		KASSERT(pg->pg_explicit_target == NULL && pg->pg_pp == NULL,
+		    ("[pmu] group %u already has an explicit target", pg->pg_id));
+		pg->pg_explicit_target = pgt;
+		pmu_pp_link_group(pg, pp);
+	}
+}
+
+void
+pmu_group_target_discard(struct pmu_group_target *pgt)
+{
+
+	if (pgt == NULL)
+		return;
+	pmc_test_counter_add(PMC_TEST_LIVE_GROUP_TARGETS, -1);
+	free(pgt, M_PMU);
+}
+
+void
+pmu_group_target_remove(struct pmu_group_target *pgt)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	struct pmc_process *pp;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	KASSERT(pgt != NULL && pgt->pgt_group != NULL && pgt->pgt_pp != NULL,
+	    ("[pmu] invalid target removal pgt=%p", pgt));
+	pg = pgt->pgt_group;
+	pp = pgt->pgt_pp;
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+		pmu_event_remove_target_residuals(pe, pp);
+	if (pg->pg_pp == pp)
+		pmu_pp_unlink_group(pg, pp);
+	if (pg->pg_explicit_target == pgt)
+		pg->pg_explicit_target = NULL;
+	mtx_lock_spin(&pp->pp_pmu_lock);
+	LIST_REMOVE(pgt, pgt_process_next);
+	mtx_unlock_spin(&pp->pp_pmu_lock);
+	LIST_REMOVE(pgt, pgt_group_next);
+	pmu_group_target_discard(pgt);
+}
+
+/*
+ * Record a target reached through fork.  Allocation cannot sleep because a
+ * fork cannot be failed; on failure the child is left wholly unmonitored for
+ * this group and the caller records the miss.
  */
 static bool
 pmu_group_add_inherited(pmu_group_t *pg, struct pmc_process *pp)
 {
+	pmu_event_t *pe;
+	struct pmc_target *links[PMC_GROUP_MAX_MEMBERS];
 	struct pmu_group_target *pgt;
+	struct pmc *pm;
+	u_int i, nlinks;
+	int ri;
 
 	if (pmu_group_has_target(pg, pp))
 		return (true);
-	pgt = malloc(sizeof(*pgt), M_PMU, M_NOWAIT | M_ZERO);
+	KASSERT(pg->pg_nevents <= PMC_GROUP_MAX_MEMBERS,
+	    ("[pmu] group %u has too many members", pg->pg_id));
+	memset(links, 0, sizeof(links));
+	nlinks = 0;
+	pgt = pmu_group_target_alloc(pg, pp, false, M_NOWAIT);
 	if (pgt == NULL)
 		return (false);
-	pgt->pgt_pp = pp;
-	pgt->pgt_group = pg;
-	LIST_INSERT_HEAD(&pg->pg_inherited, pgt, pgt_next);
-	mtx_lock_spin(&pp->pp_pmu_lock);
-	LIST_INSERT_HEAD(&pp->pp_pmu_inherited, pgt, pgt_pp_next);
-	mtx_unlock_spin(&pp->pp_pmu_lock);
-	return (true);
-}
 
-/* Drop one inherited target, or all of them when pp is NULL. */
-static void
-pmu_group_drop_inherited(pmu_group_t *pg, struct pmc_process *pp)
-{
-	struct pmu_group_target *pgt, *tmp;
+	if (pg->pg_assigned) {
+		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+			pm = pe->pe_pmc;
+			KASSERT(!PMC_ROW_IS_UNASSIGNED(pm),
+			    ("[pmu] assigned group %u has unassigned member",
+			    pg->pg_id));
+			ri = PMC_TO_ROWINDEX(pm);
+			if (pp->pp_pmcs[ri].pp_pmc != NULL)
+				goto fail;
+			links[nlinks] =
+			    pmc_target_object_alloc(M_NOWAIT, true);
+			if (links[nlinks] == NULL)
+				goto fail;
+			nlinks++;
+		}
 
-	LIST_FOREACH_SAFE(pgt, &pg->pg_inherited, pgt_next, tmp) {
-		if (pp != NULL && pgt->pgt_pp != pp)
-			continue;
-		mtx_lock_spin(&pgt->pgt_pp->pp_pmu_lock);
-		LIST_REMOVE(pgt, pgt_pp_next);
-		mtx_unlock_spin(&pgt->pgt_pp->pp_pmu_lock);
-		LIST_REMOVE(pgt, pgt_next);
-		free(pgt, M_PMU);
-		if (pp != NULL)
-			return;
+		i = 0;
+		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+			pmc_link_target_process_preallocated(pe->pe_pmc, pp,
+			    links[i]);
+			links[i++] = NULL;
+		}
 	}
+
+	/*
+	 * Linearization point: every fallible allocation and every current row
+	 * link is complete before the authoritative target becomes visible.
+	 */
+	pmu_group_target_publish(pgt);
+	return (true);
+
+fail:
+	for (i = 0; i < nlinks; i++)
+		pmc_target_object_free(links[i]);
+	pmu_group_target_discard(pgt);
+	return (false);
 }
 
 /*
@@ -454,33 +608,34 @@ pmu_group_drop_inherited(pmu_group_t *pg, struct pmc_process *pp)
  */
 u_int
 pmu_group_inherit(struct pmc_process *ppold, struct pmc_process *ppnew,
-    u_int *nmissed)
+    struct pmc **missed_leaders, u_int missed_capacity, u_int *nmissed)
 {
-	struct pmu_group_target *pgt;
 	pmu_group_t *pg;
+	struct pmu_group_target *pgt;
 	u_int ninherited, nmiss;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
 	ninherited = 0;
 	nmiss = 0;
 
-	LIST_FOREACH(pg, &ppold->pp_pmu_groups, pg_proc_next) {
-		if (!pmu_group_follows_fork(pg))
-			continue;
-		if (pmu_group_add_inherited(pg, ppnew))
-			ninherited++;
-		else
-			nmiss++;
-	}
-	/* A grandchild inherits through its parent's inherited groups. */
-	LIST_FOREACH(pgt, &ppold->pp_pmu_inherited, pgt_pp_next) {
+	/* Direct and inherited parents use the same authoritative target list. */
+	LIST_FOREACH(pgt, &ppold->pp_pmu_targets, pgt_process_next) {
 		pg = pgt->pgt_group;
 		if (!pmu_group_follows_fork(pg))
 			continue;
-		if (pmu_group_add_inherited(pg, ppnew))
+		if (pmu_group_add_inherited(pg, ppnew)) {
 			ninherited++;
-		else
-			nmiss++;
+			continue;
+		}
+		/*
+		 * Record the exact group that was missed by its leader handle,
+		 * so the caller can log one miss for this group rather than
+		 * reconstruct identity from an aggregate count.
+		 */
+		if (missed_leaders != NULL && nmiss < missed_capacity &&
+		    pg->pg_leader != NULL)
+			missed_leaders[nmiss] = pg->pg_leader->pe_pmc;
+		nmiss++;
 	}
 
 	if (nmissed != NULL)
@@ -488,15 +643,15 @@ pmu_group_inherit(struct pmc_process *ppold, struct pmc_process *ppnew,
 	return (ninherited);
 }
 
-/* Detach every group this process only followed as a descendant. */
+/* Remove every explicit or inherited group-target edge held by this process. */
 void
 pmu_group_disinherit(struct pmc_process *pp)
 {
 	struct pmu_group_target *pgt;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
-	while ((pgt = LIST_FIRST(&pp->pp_pmu_inherited)) != NULL)
-		pmu_group_drop_inherited(pgt->pgt_group, pp);
+	while ((pgt = LIST_FIRST(&pp->pp_pmu_targets)) != NULL)
+		pmu_group_target_remove(pgt);
 }
 
 /* Remove group from process list and update cursor. */
@@ -509,7 +664,6 @@ pmu_pp_unlink_group(pmu_group_t *pg, struct pmc_process *pp)
 		pp->pp_pmu_rot_cursor = LIST_NEXT(pg, pg_proc_next);
 	LIST_REMOVE(pg, pg_proc_next);
 	pg->pg_pp = NULL;
-	pg->pg_attach_proc = NULL;
 	mtx_unlock_spin(&pp->pp_pmu_lock);
 }
 
@@ -550,6 +704,10 @@ pmu_event_destroy(pmu_event_t *pe)
 	if (pe == NULL)
 		return;
 	counter_u64_free(pe->pe_samples);
+#ifdef HWPMC_DEBUG
+	counter_u64_free(pe->pe_samples_emitted);
+	counter_u64_free(pe->pe_samples_dropped);
+#endif
 	free(pe, M_PMU);
 }
 
@@ -566,6 +724,7 @@ pmu_group_create(struct pmc_owner *po, uint32_t *pg_id)
 	pg->pg_id = pmu_next_group_id++;
 	pg->pg_owner = po;
 	TAILQ_INIT(&pg->pg_events);
+	LIST_INIT(&pg->pg_targets);
 	LIST_INSERT_HEAD(&po->po_groups, pg, pg_owner_next);
 	*pg_id = pg->pg_id;
 }
@@ -751,6 +910,7 @@ pmu_group_prepare_release(pmu_group_t *pg, struct pmc **members,
     u_int capacity, struct pmc_process **released_pp)
 {
 	pmu_event_t *pe, *tmp;
+	struct pmu_group_target *pgt;
 	struct pmc_process *held_pp, *pp;
 	bool pp_unhashed;
 	u_int n;
@@ -780,6 +940,7 @@ pmu_group_prepare_release(pmu_group_t *pg, struct pmc **members,
 		if (held_pp != NULL) {
 			mtx_lock_spin(&held_pp->pp_pmu_lock);
 			held_pp->pp_pmu_refs++;
+			pmc_test_counter_add(PMC_TEST_LIVE_ROTATION_REFS, 1);
 			mtx_unlock_spin(&held_pp->pp_pmu_lock);
 			pmu_pp_stop_rotate(held_pp, "muxrel");
 		}
@@ -801,6 +962,7 @@ pmu_group_prepare_release(pmu_group_t *pg, struct pmc **members,
 			KASSERT(held_pp->pp_pmu_refs > 0,
 			    ("[pmu] process reference underflow"));
 			held_pp->pp_pmu_refs--;
+			pmc_test_counter_add(PMC_TEST_LIVE_ROTATION_REFS, -1);
 			pp_unhashed = held_pp->pp_pmu_unhashed;
 			mtx_unlock_spin(&held_pp->pp_pmu_lock);
 			wakeup(&held_pp->pp_pmu_refs);
@@ -818,6 +980,8 @@ pmu_group_prepare_release(pmu_group_t *pg, struct pmc **members,
 		    ("[pmu] group %u release member overflow", pg->pg_id));
 		KASSERT(PMC_ROW_IS_UNASSIGNED(pe->pe_pmc),
 		    ("[pmu] group %u member still assigned", pg->pg_id));
+		LIST_FOREACH(pgt, &pg->pg_targets, pgt_group_next)
+			pmu_event_remove_target_residuals(pe, pgt->pgt_pp);
 		members[n++] = pe->pe_pmc;
 		TAILQ_REMOVE(&pg->pg_events, pe, pe_sibling);
 		pe->pe_group = NULL;
@@ -841,8 +1005,10 @@ pmu_group_release(pmu_group_t *pg)
 		return;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
-	/* Stop following every target this group reached through fork. */
-	pmu_group_drop_inherited(pg, NULL);
+	KASSERT(LIST_EMPTY(&pg->pg_targets),
+	    ("[pmu] freeing group %u with live targets", pg->pg_id));
+	KASSERT(pg->pg_explicit_target == NULL,
+	    ("[pmu] freeing group %u with explicit target", pg->pg_id));
 	KASSERT(TAILQ_EMPTY(&pg->pg_events) && pg->pg_nevents == 0 &&
 	    pg->pg_leader == NULL,
 	    ("[pmu] freeing non-empty group %u", pg->pg_id));
@@ -877,6 +1043,10 @@ pmu_group_on_allocate(struct pmc *pm, const struct pmc_op_pmcallocate *pa)
 	pe = malloc(sizeof(*pe), M_PMU, M_WAITOK | M_ZERO);
 	pe->pe_pmc = pm;
 	pe->pe_samples = counter_u64_alloc(M_WAITOK);
+#ifdef HWPMC_DEBUG
+	pe->pe_samples_emitted = counter_u64_alloc(M_WAITOK);
+	pe->pe_samples_dropped = counter_u64_alloc(M_WAITOK);
+#endif
 	pe->pe_alloc = *pa;
 	pm->pm_pmu = pe;
 	return (0);
@@ -887,6 +1057,7 @@ pmu_group_on_attach(struct pmc *pm, struct proc *p)
 {
 	pmu_event_t *pe;
 	pmu_group_t *pg;
+	struct pmu_group_target *pgt;
 	struct pmc_process *pp;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
@@ -894,15 +1065,20 @@ pmu_group_on_attach(struct pmc *pm, struct proc *p)
 	if (pe == NULL || pe->pe_group == NULL)
 		return (0);
 	pg = pe->pe_group;
-	if (pg->pg_attach_proc != NULL && pg->pg_attach_proc != p)
+	if (pg->pg_explicit_target != NULL &&
+	    pg->pg_explicit_target->pgt_pp->pp_proc != p)
 		return (EBUSY);
 	pp = pmc_find_process_descriptor_pmu(p, PMC_FLAG_ALLOCATE);
 	if (pp == NULL)
 		return (ENOMEM);
 	if (pg->pg_pp != NULL && pg->pg_pp != pp)
 		return (EBUSY);
-	pg->pg_attach_proc = p;
-	pmu_pp_link_group(pg, pp);
+	if (pmu_group_has_target(pg, pp))
+		return (0);
+	pgt = pmu_group_target_alloc(pg, pp, true, M_WAITOK);
+	if (pgt == NULL)
+		return (ENOMEM);
+	pmu_group_target_publish(pgt);
 	return (0);
 }
 
@@ -912,21 +1088,9 @@ pmu_group_on_attach(struct pmc *pm, struct proc *p)
 static struct proc *
 pmu_group_target_proc(pmu_group_t *pg)
 {
-	pmu_event_t *pe;
-	struct pmc_target *ptgt;
-
-	if (pg == NULL)
+	if (pg == NULL || pg->pg_pp == NULL)
 		return (NULL);
-	if (pg->pg_attach_proc != NULL)
-		return (pg->pg_attach_proc);
-	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-		if (pe->pe_pmc == NULL)
-			continue;
-		ptgt = LIST_FIRST(&pe->pe_pmc->pm_targets);
-		if (ptgt != NULL && ptgt->pt_process != NULL)
-			return (ptgt->pt_process->pp_proc);
-	}
-	return (NULL);
+	return (pg->pg_pp->pp_proc);
 }
 
 int
@@ -961,9 +1125,6 @@ pmu_group_on_start(struct pmc *pm)
 		pp = pmc_find_process_descriptor_pmu(p, PMC_FLAG_ALLOCATE);
 	if (pp == NULL)
 		return (ENOMEM);
-
-	if (pg->pg_attach_proc == NULL)
-		pg->pg_attach_proc = p;
 
 	pmu_pp_link_group(pg, pp);
 
@@ -1000,6 +1161,7 @@ pmu_group_on_start(struct pmc *pm)
 	pg->pg_account_placement_admit = pg->pg_assigned;
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 
+	(void)pmc_test_group_hold_resident(pg);
 	pmu_pp_kick_rotate(pp);
 	return (0);
 }
@@ -1075,20 +1237,16 @@ void
 pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
 {
 	struct pmu_group_target *pgt;
-	pmu_group_t *pg;
 	uint64_t now;
 	int cpu;
 
 	/* Check lists without lock. */
-	if (LIST_EMPTY(&pp->pp_pmu_groups) &&
-	    LIST_EMPTY(&pp->pp_pmu_inherited))
+	if (LIST_EMPTY(&pp->pp_pmu_targets))
 		return;
 	cpu = PCPU_GET(cpuid);
 	now = cpu_ticks();
 	mtx_lock_spin(&pp->pp_pmu_lock);
-	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next)
-		pmu_group_csw_in_one(pg, td, cpu, now);
-	LIST_FOREACH(pgt, &pp->pp_pmu_inherited, pgt_pp_next)
+	LIST_FOREACH(pgt, &pp->pp_pmu_targets, pgt_process_next)
 		pmu_group_csw_in_one(pgt->pgt_group, td, cpu, now);
 	mtx_unlock_spin(&pp->pp_pmu_lock);
 }
@@ -1241,41 +1399,181 @@ pmu_group_on_release(struct pmc *pm)
 }
 
 /*
- * Save a sampling member's progress toward its next sample, so that the
- * next placement resumes from it instead of restarting the climb.  Without
- * this a member whose period exceeds one residency window never reaches an
- * overflow and delivers no samples at all.
- *
- * The per-thread counts live in pt_pmcs[], which is indexed by hardware
- * row, and a member does not keep its row across a rotation, so the value
- * is stashed on the member.  A multithreaded target has one count per
- * thread; keep the smallest, which is the thread nearest its next sample.
- * That never overshoots a period, so no sample is skipped.
+ * Find saved sampling progress while pp_tdslock protects both the thread list
+ * and the process-local residual list.
+ */
+static struct pmu_thread_residual *
+pmu_thread_residual_find_locked(struct pmc_process *pp, pmu_event_t *pe,
+    lwpid_t tid)
+{
+	struct pmu_thread_residual *ptr;
+
+	mtx_assert(pp->pp_tdslock, MA_OWNED);
+	LIST_FOREACH(ptr, &pp->pp_pmu_residuals, ptr_next) {
+		if (ptr->ptr_event == pe && ptr->ptr_tid == tid)
+			return (ptr);
+	}
+	return (NULL);
+}
+
+static bool
+pmu_thread_exists_locked(struct pmc_process *pp, lwpid_t tid)
+{
+	struct pmc_thread *pt;
+
+	mtx_assert(pp->pp_tdslock, MA_OWNED);
+	LIST_FOREACH(pt, &pp->pp_tds, pt_next) {
+		if (pt->pt_td->td_tid == tid)
+			return (true);
+	}
+	return (false);
+}
+
+/*
+ * Publish or replace one saved value.  Candidate allocation occurs before
+ * pp_tdslock because it is a spin lock.  Removing the thread descriptor first
+ * on thread exit prevents a concurrent save from recreating stale state.
+ */
+static int
+pmu_event_set_thread_residual_impl(struct pmc *pm, struct pmc_process *pp,
+    lwpid_t tid, pmc_value_t value, uint8_t state)
+{
+	struct pmu_thread_residual *discard, *ptr;
+	pmu_event_t *pe;
+	bool keep;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || value > pm->pm_sc.pm_reloadcount)
+		return (EINVAL);
+
+	/*
+	 * A saved entry is kept when there is progress to preserve: a partial
+	 * count, or a pending overflow.  UNINITIALIZED means "no saved
+	 * progress" and removes any existing entry.  Value and state are
+	 * validated together so a zero count cannot masquerade as an overflow
+	 * or vice versa.
+	 */
+	switch (state) {
+	case PMU_RESIDUAL_UNINITIALIZED:
+		if (value != 0)
+			return (EINVAL);
+		keep = false;
+		break;
+	case PMU_RESIDUAL_COUNT_VALID:
+		if (value == 0)
+			return (EINVAL);
+		keep = true;
+		break;
+	case PMU_RESIDUAL_OVERFLOW_PENDING:
+		if (value != 0)
+			return (EINVAL);
+		keep = true;
+		break;
+	default:
+		return (EINVAL);
+	}
+
+	ptr = keep ? malloc(sizeof(*ptr), M_PMU, M_WAITOK | M_ZERO) : NULL;
+	discard = NULL;
+	mtx_lock_spin(pp->pp_tdslock);
+	if (!pmu_thread_exists_locked(pp, tid)) {
+		mtx_unlock_spin(pp->pp_tdslock);
+		free(ptr, M_PMU);
+		return (ESRCH);
+	}
+
+	discard = pmu_thread_residual_find_locked(pp, pe, tid);
+	if (!keep) {
+		if (discard != NULL) {
+			LIST_REMOVE(discard, ptr_next);
+			pmc_test_counter_add(PMC_TEST_LIVE_RESIDUAL_ENTRIES, -1);
+		}
+	} else if (discard != NULL) {
+		discard->ptr_value = value;
+		discard->ptr_state = state;
+		discard = ptr;
+		ptr = NULL;
+	} else {
+		ptr->ptr_event = pe;
+		ptr->ptr_tid = tid;
+		ptr->ptr_value = value;
+		ptr->ptr_state = state;
+		LIST_INSERT_HEAD(&pp->pp_pmu_residuals, ptr, ptr_next);
+		pmc_test_counter_add(PMC_TEST_LIVE_RESIDUAL_ENTRIES, 1);
+		ptr = NULL;
+	}
+	mtx_unlock_spin(pp->pp_tdslock);
+
+	if (discard != NULL)
+		free(discard, M_PMU);
+	return (0);
+}
+
+/*
+ * Save each target thread's progress independently.  Snapshot the transient
+ * row-indexed values under pp_tdslock, then allocate stable entries after
+ * dropping the spin lock.
  */
 void
 pmu_event_save_residual(struct pmc *pm, struct pmc_process *pp, int ri)
 {
+	struct pmu_thread_residual_snapshot {
+		lwpid_t tid;
+		pmc_value_t value;
+	} *snapshot;
 	pmu_event_t *pe;
 	struct pmc_thread *pt;
-	pmc_value_t least, v;
+	u_int capacity, i, nthreads;
+	bool retry;
+	int error __diagused;
 
+	sx_assert(&pmc_sx, SX_XLOCKED);
 	pe = pmu_event_from_pmc(pm);
 	if (pe == NULL)
 		return;
 
-	least = 0;
-	mtx_lock_spin(pp->pp_tdslock);
-	LIST_FOREACH(pt, &pp->pp_tds, pt_next) {
-		v = pt->pt_pmcs[ri].pt_pmcval;
-		if (v > 0 && (least == 0 || v < least))
-			least = v;
-	}
-	mtx_unlock_spin(pp->pp_tdslock);
+	for (;;) {
+		capacity = 0;
+		mtx_lock_spin(pp->pp_tdslock);
+		LIST_FOREACH(pt, &pp->pp_tds, pt_next)
+			capacity++;
+		mtx_unlock_spin(pp->pp_tdslock);
+		if (capacity == 0)
+			return;
 
-	if (least == 0)
-		least = pp->pp_pmcs[ri].pp_pmcval;
-	if (least > 0 && least <= pm->pm_sc.pm_reloadcount)
-		pe->pe_residual = least;
+		snapshot = mallocarray(capacity, sizeof(*snapshot), M_PMU,
+		    M_WAITOK);
+		nthreads = 0;
+		retry = false;
+		mtx_lock_spin(pp->pp_tdslock);
+		LIST_FOREACH(pt, &pp->pp_tds, pt_next) {
+			if (nthreads == capacity) {
+				retry = true;
+				break;
+			}
+			snapshot[nthreads].tid = pt->pt_td->td_tid;
+			snapshot[nthreads].value = pt->pt_pmcs[ri].pt_pmcval;
+			nthreads++;
+		}
+		mtx_unlock_spin(pp->pp_tdslock);
+		if (!retry)
+			break;
+		free(snapshot, M_PMU);
+	}
+
+	for (i = 0; i < nthreads; i++) {
+		if (snapshot[i].value == 0 ||
+		    snapshot[i].value > pm->pm_sc.pm_reloadcount)
+			continue;
+		error = pmu_event_set_thread_residual_impl(pm, pp,
+		    snapshot[i].tid, snapshot[i].value,
+		    PMU_RESIDUAL_COUNT_VALID);
+		KASSERT(error == 0 || error == ESRCH,
+		    ("[pmu] residual save failed for tid %d: %d",
+		    snapshot[i].tid, error));
+	}
+	free(snapshot, M_PMU);
 }
 
 /*
@@ -1306,13 +1604,27 @@ void
 pmu_event_restore_thread_residual(struct pmc *pm, struct pmc_process *pp,
     int ri)
 {
+	struct pmu_thread_residual *ptr;
+	pmu_event_t *pe;
 	struct pmc_thread *pt;
-	pmc_value_t v;
 
-	v = pmu_event_restore_residual(pm);
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL)
+		return;
 	mtx_lock_spin(pp->pp_tdslock);
-	LIST_FOREACH(pt, &pp->pp_tds, pt_next)
-		pt->pt_pmcs[ri].pt_pmcval = v;
+	LIST_FOREACH(pt, &pp->pp_tds, pt_next) {
+		ptr = pmu_thread_residual_find_locked(pp, pe,
+		    pt->pt_td->td_tid);
+		/*
+		 * A partial count resumes from where it left off.  A pending
+		 * overflow and a thread with no saved progress both reload a
+		 * full period: the overflow already produced its sample, so the
+		 * next window starts a fresh climb.
+		 */
+		pt->pt_pmcs[ri].pt_pmcval =
+		    (ptr != NULL && ptr->ptr_state == PMU_RESIDUAL_COUNT_VALID) ?
+		    ptr->ptr_value : pm->pm_sc.pm_reloadcount;
+	}
 	mtx_unlock_spin(pp->pp_tdslock);
 }
 
@@ -1332,23 +1644,148 @@ pmu_event_restore_residual(struct pmc *pm)
 	return (pe->pe_residual);
 }
 
+#ifdef HWPMC_DEBUG
+int
+pmu_event_get_thread_residual(struct pmc *pm, struct pmc_process *pp,
+    lwpid_t tid, pmc_value_t *value, uint8_t *state)
+{
+	struct pmu_thread_residual *ptr;
+	pmu_event_t *pe;
+	int error;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || value == NULL || state == NULL)
+		return (EINVAL);
+
+	error = 0;
+	mtx_lock_spin(pp->pp_tdslock);
+	if (!pmu_thread_exists_locked(pp, tid))
+		error = ESRCH;
+	else {
+		ptr = pmu_thread_residual_find_locked(pp, pe, tid);
+		if (ptr != NULL) {
+			*value = ptr->ptr_value;
+			*state = ptr->ptr_state;
+		} else {
+			*value = 0;
+			*state = PMU_RESIDUAL_UNINITIALIZED;
+		}
+	}
+	mtx_unlock_spin(pp->pp_tdslock);
+	return (error);
+}
+
+int
+pmu_event_set_thread_residual(struct pmc *pm, struct pmc_process *pp,
+    lwpid_t tid, pmc_value_t value, uint8_t state)
+{
+
+	return (pmu_event_set_thread_residual_impl(pm, pp, tid, value, state));
+}
+#endif
+
+static void
+pmu_thread_residual_free_task_fn(void *arg __unused, int pending __unused)
+{
+	struct pmu_thread_residual *ptr;
+	LIST_HEAD(, pmu_thread_residual) tmplist;
+
+	LIST_INIT(&tmplist);
+	mtx_lock_spin(&pmu_residual_freelist_mtx);
+	while ((ptr = LIST_FIRST(&pmu_residual_freelist)) != NULL) {
+		LIST_REMOVE(ptr, ptr_next);
+		LIST_INSERT_HEAD(&tmplist, ptr, ptr_next);
+	}
+	mtx_unlock_spin(&pmu_residual_freelist_mtx);
+
+	while ((ptr = LIST_FIRST(&tmplist)) != NULL) {
+		LIST_REMOVE(ptr, ptr_next);
+		free(ptr, M_PMU);
+	}
+}
+
+static void
+pmu_thread_residual_defer_free(struct pmu_thread_residual *ptr)
+{
+
+	mtx_lock_spin(&pmu_residual_freelist_mtx);
+	LIST_INSERT_HEAD(&pmu_residual_freelist, ptr, ptr_next);
+	taskqueue_enqueue(taskqueue_fast, &pmu_residual_free_task);
+	mtx_unlock_spin(&pmu_residual_freelist_mtx);
+}
+
+void
+pmu_thread_residual_remove(struct pmc_process *pp, lwpid_t tid)
+{
+	struct pmu_thread_residual *ptr;
+
+	for (;;) {
+		mtx_lock_spin(pp->pp_tdslock);
+		LIST_FOREACH(ptr, &pp->pp_pmu_residuals, ptr_next) {
+			if (ptr->ptr_tid == tid)
+				break;
+		}
+		if (ptr != NULL) {
+			LIST_REMOVE(ptr, ptr_next);
+			pmc_test_counter_add(PMC_TEST_LIVE_RESIDUAL_ENTRIES, -1);
+		}
+		mtx_unlock_spin(pp->pp_tdslock);
+		if (ptr == NULL)
+			break;
+		pmu_thread_residual_defer_free(ptr);
+	}
+}
+
+static void
+pmu_event_remove_target_residuals(pmu_event_t *pe, struct pmc_process *pp)
+{
+	struct pmu_thread_residual *ptr;
+
+	for (;;) {
+		mtx_lock_spin(pp->pp_tdslock);
+		LIST_FOREACH(ptr, &pp->pp_pmu_residuals, ptr_next) {
+			if (ptr->ptr_event == pe)
+				break;
+		}
+		if (ptr != NULL) {
+			LIST_REMOVE(ptr, ptr_next);
+			pmc_test_counter_add(PMC_TEST_LIVE_RESIDUAL_ENTRIES, -1);
+		}
+		mtx_unlock_spin(pp->pp_tdslock);
+		if (ptr == NULL)
+			break;
+		free(ptr, M_PMU);
+	}
+}
+
 /*
  * Attach all sibling events of a group to the process descriptor.
  */
 static void
-pmu_group_attach_siblings(pmu_group_t *pg, struct pmc_process *pp)
+pmu_group_attach_siblings(pmu_group_t *pg, struct pmc_process *anchor_pp)
 {
 	pmu_event_t *pe;
 	struct pmc *pm;
+	struct pmc_process *pp;
+	struct pmu_group_target *pgt;
 
-	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-		pm = pe->pe_pmc;
-		KASSERT(!PMC_ROW_IS_UNASSIGNED(pm),
-		    ("[pmu] attach_siblings: gid=%u pm_id=0x%jx unassigned",
-		    pg->pg_id, (uintmax_t)pm->pm_id));
-		if (pp->pp_pmcs[PMC_TO_ROWINDEX(pm)].pp_pmc == pm)
-			continue;	/* Skip if already attached. */
-		pmc_rotation_attach(pm, pp);
+	KASSERT(anchor_pp == pg->pg_pp,
+	    ("[pmu] group %u anchor mismatch", pg->pg_id));
+	LIST_FOREACH(pgt, &pg->pg_targets, pgt_group_next) {
+		pp = pgt->pgt_pp;
+		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+			pm = pe->pe_pmc;
+			KASSERT(!PMC_ROW_IS_UNASSIGNED(pm),
+			    ("[pmu] attach_siblings: gid=%u pm_id=0x%jx "
+			    "unassigned", pg->pg_id, (uintmax_t)pm->pm_id));
+			if (pp->pp_pmcs[PMC_TO_ROWINDEX(pm)].pp_pmc == pm)
+				continue;	/* Already attached at this placement. */
+			KASSERT(pp->pp_pmcs[PMC_TO_ROWINDEX(pm)].pp_pmc == NULL,
+			    ("[pmu] group %u target pp=%p row=%d busy",
+			    pg->pg_id, pp, PMC_TO_ROWINDEX(pm)));
+			pmc_rotation_attach(pm, pp);
+		}
 	}
 }
 
@@ -1364,6 +1801,8 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 
 	if (pg == NULL || pg->pg_assigned)
 		return (0);
+	if (pmc_test_group_hold_evicted(pg))
+		return (ENOSPC);
 	/* Target process only. */
 	p = pmu_group_target_proc(pg);
 	if (p == NULL)
@@ -1395,6 +1834,8 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 	pg->pg_account_placement_admit = true;
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 	pmu_group_kick_placement(pg);
+	if (pg->pg_running)
+		(void)pmc_test_group_hold_resident(pg);
 	return (0);
 }
 
@@ -1406,6 +1847,8 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
     bool drain_samples)
 {
 	pmu_event_t *pe;
+	struct pmc_process *target_pp;
+	struct pmu_group_target *pgt;
 
 	if (pg == NULL || !pg->pg_assigned)
 		return;
@@ -1418,8 +1861,7 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
 	/* Phase 1: stop sibling events. */
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 		if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pe->pe_pmc))) {
-			atomic_store_rel_int(&pe->pe_pmc->pm_rotation_drain,
-			    drain_samples);
+			pmc_rotation_drain_set(pe->pe_pmc, drain_samples);
 			wmb();
 		}
 		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
@@ -1432,19 +1874,25 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
 		pmc_rotation_drain(pe->pe_pmc);
 
-	/* Phase 3: detach siblings from target. */
-	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-		struct pmc *pm = pe->pe_pmc;
+	/* Phase 3: remove every transient row link from every stable target. */
+	KASSERT(pp == pg->pg_pp,
+	    ("[pmu] group %u schedule-out anchor mismatch", pg->pg_id));
+	LIST_FOREACH(pgt, &pg->pg_targets, pgt_group_next) {
+		target_pp = pgt->pgt_pp;
+		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+			struct pmc *pm = pe->pe_pmc;
 
-		KASSERT(!PMC_ROW_IS_UNASSIGNED(pm),
-		    ("[pmu] schedule_out: gid=%u pm_id=0x%jx unassigned",
-		    pg->pg_id, (uintmax_t)pm->pm_id));
-		if (pp->pp_pmcs[PMC_TO_ROWINDEX(pm)].pp_pmc == pm)
-			pmc_rotation_detach(pm, pp);
+			KASSERT(!PMC_ROW_IS_UNASSIGNED(pm),
+			    ("[pmu] schedule_out: gid=%u pm_id=0x%jx "
+			    "unassigned", pg->pg_id, (uintmax_t)pm->pm_id));
+			if (target_pp->pp_pmcs[PMC_TO_ROWINDEX(pm)].pp_pmc == pm)
+				pmc_rotation_detach(pm, target_pp);
+		}
 	}
 
 	/* Phase 4: release hardware rows. */
 	pmu_unassign_group(pg, 0);
+	(void)pmc_test_group_hold_evicted(pg);
 }
 
 /*
@@ -1453,7 +1901,11 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
 static void
 pmu_pp_release_all(struct pmc_process *pp)
 {
+	pmu_event_t *pe;
 	pmu_group_t *pg;
+	struct pmc_process *replacement_pp;
+	struct pmu_group_target *departing, *replacement;
+	bool was_running;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
 
@@ -1477,10 +1929,40 @@ pmu_pp_release_all(struct pmc_process *pp)
 		mtx_unlock_spin(&pp->pp_pmu_lock);
 		if (pg == NULL)
 			break;
+
+		departing = pmu_group_find_target(pg, pp);
+		KASSERT(departing != NULL,
+		    ("[pmu] group %u anchor has no target edge", pg->pg_id));
+		replacement = pmu_group_replacement_target(pg, pp);
+		replacement_pp = replacement != NULL ? replacement->pgt_pp : NULL;
+		mtx_pool_lock_spin(pmc_mtxpool, pg);
+		was_running = pg->pg_running;
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
 		pmu_group_accounting_drain(pg, true);
 		if (pg->pg_assigned)
 			pmu_pp_schedule_out(pp, pg, false);
 		pmu_pp_unlink_group(pg, pp);
+		pmu_group_target_remove(departing);
+		if (replacement_pp == NULL)
+			continue;
+
+		/*
+		 * pmc_sx serializes target-list mutations and process teardown.
+		 * Change the old and new pp_pmu_groups lists separately so their
+		 * spin locks are never held together.
+		 */
+		pmu_pp_link_group(pg, replacement_pp);
+		if (was_running) {
+			TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+				pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
+		}
+		mtx_pool_lock_spin(pmc_mtxpool, pg);
+		if (was_running)
+			pmu_group_running_start_locked(pg, cpu_ticks());
+		pg->pg_account_placement_admit = pg->pg_assigned;
+		pg->pg_account_blocked = false;
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+		pmu_pp_backfill(replacement_pp);
 	}
 }
 
@@ -1491,6 +1973,8 @@ pmu_pp_init(struct pmc_process *pp)
 
 	mtx_init(&pp->pp_pmu_lock, "pmc-pmu-groups", "pmc-pmu", MTX_SPIN);
 	LIST_INIT(&pp->pp_pmu_groups);
+	LIST_INIT(&pp->pp_pmu_targets);
+	LIST_INIT(&pp->pp_pmu_residuals);
 }
 
 /* Destroy PMU state in process descriptor. */
@@ -1498,9 +1982,11 @@ void
 pmu_pp_destroy(struct pmc_process *pp)
 {
 
-	/* Stop being a target of any group this process only inherited. */
-	pmu_group_disinherit(pp);
 	pmu_pp_release_all(pp);
+	/* Remove every authoritative edge after anchored groups are stopped. */
+	pmu_group_disinherit(pp);
+	KASSERT(LIST_EMPTY(&pp->pp_pmu_residuals),
+	    ("[pmu] pp %p destroyed with saved residuals", pp));
 	KASSERT(pp->pp_pmu_refs == 0 && pp->pp_pmu_rot_quiesce == 0 &&
 	    pp->pp_pmu_rot_td == NULL,
 	    ("[pmu] pp %p destroyed while referenced", pp));
@@ -1511,12 +1997,16 @@ void
 pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp)
 {
 	pmu_event_t *pe;
+	struct pmu_group_target *pgt;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
 	KASSERT(pg != NULL && pp != NULL && pg->pg_pp == pp,
 	    ("[pmu] invalid group target detach"));
 	KASSERT(!pg->pg_releasing,
 	    ("[pmu] group %u detach already active", pg->pg_id));
+	pgt = pmu_group_find_target(pg, pp);
+	KASSERT(pgt != NULL && pgt->pgt_explicit,
+	    ("[pmu] group %u explicit target edge missing", pg->pg_id));
 
 	pg->pg_releasing = true;
 	mtx_lock_spin(&pp->pp_pmu_lock);
@@ -1529,7 +2019,7 @@ pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp)
 	if (pg->pg_assigned)
 		pmu_pp_schedule_out(pp, pg, false);
 
-	pmu_pp_unlink_group(pg, pp);
+	pmu_group_target_remove(pgt);
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 		pe->pe_pmc->pm_flags &= ~(PMC_F_ATTACH_DONE |
 		    PMC_F_ATTACHED_TO_OWNER | PMC_F_NEEDS_LOGFILE);
@@ -1538,6 +2028,78 @@ pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp)
 	wakeup(&pg->pg_releasing);
 
 	pmu_pp_backfill(pp);
+}
+
+/*
+ * Detach one inherited (non-anchor) target from a group that stays alive for
+ * its other targets.  Used when a credential-changing exec revokes one
+ * descendant's authorization: the group is still owned by the same owner and
+ * still monitors the anchor and any sibling descendants, so only this process's
+ * edge and its transient row links are removed.
+ *
+ * The group is briefly scheduled out from its real anchor so every target's row
+ * links (including this one's) are dropped, this edge is removed, and the group
+ * is placed again at the surviving anchor.
+ */
+void
+pmu_group_detach_inherited_target(pmu_group_t *pg, struct pmc_process *pp)
+{
+	pmu_event_t *pe;
+	struct pmc_process *anchor_pp;
+	struct pmu_group_target *pgt;
+	bool was_running, was_assigned;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	KASSERT(pg != NULL && pp != NULL && pg->pg_pp != pp,
+	    ("[pmu] inherited detach on anchor pp=%p", pp));
+	KASSERT(!pg->pg_releasing,
+	    ("[pmu] group %u detach already active", pg->pg_id));
+	pgt = pmu_group_find_target(pg, pp);
+	KASSERT(pgt != NULL && !pgt->pgt_explicit,
+	    ("[pmu] group %u inherited target edge missing", pg->pg_id));
+
+	anchor_pp = pg->pg_pp;
+	pg->pg_releasing = true;
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	was_running = pg->pg_running;
+	was_assigned = pg->pg_assigned;
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+
+	/*
+	 * Quiesce the group at its anchor and drop every target's transient row
+	 * links, so removing this edge cannot strand a row-indexed reference.
+	 */
+	if (anchor_pp != NULL) {
+		pmu_group_accounting_block(pg);
+		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+			pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
+		pmu_group_accounting_drain(pg, false);
+		pmu_pp_stop_rotate(anchor_pp, "muxreauth");
+		if (was_assigned)
+			pmu_pp_schedule_out(anchor_pp, pg, false);
+	}
+
+	pmu_group_target_remove(pgt);
+
+	/*
+	 * Restore the group for its remaining targets.  pmu_group_target_remove
+	 * cleared pg_pp only if this edge had been the anchor, which it was not,
+	 * so the group is still linked at anchor_pp and can run again.
+	 */
+	if (was_running) {
+		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+			pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
+	}
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	if (was_running)
+		pmu_group_running_start_locked(pg, cpu_ticks());
+	pg->pg_account_placement_admit = pg->pg_assigned;
+	pg->pg_account_blocked = false;
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+	pg->pg_releasing = false;
+	wakeup(&pg->pg_releasing);
+	if (anchor_pp != NULL)
+		pmu_pp_backfill(anchor_pp);
 }
 
 /* Return true if a running MUX group is unassigned. */
@@ -1631,7 +2193,8 @@ pmu_list_next_victim(struct pmu_group_list *gl, pmu_group_t **vpg,
 			pg = LIST_FIRST(gl);
 		(*vseen)++;
 		*vpg = LIST_NEXT(pg, pg_proc_next);
-		if (pg->pg_assigned && pg->pg_defer_ok)
+		if (pg->pg_assigned && pg->pg_defer_ok &&
+		    !pmc_test_group_hold_resident(pg))
 			return (pg);
 	}
 	return (NULL);
@@ -1794,9 +2357,12 @@ pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
 	pmu_event_t *pe;
 	struct proc *owner;
 	int error;
+	u_int nstarted;
 
 	if (pg == NULL || pg->pg_assigned)
 		return (0);
+	if (pmc_test_group_hold_evicted(pg))
+		return (ENOSPC);
 
 	/* Check owner process allocation permission. */
 	owner = pg->pg_owner != NULL ? pg->pg_owner->po_owner : NULL;
@@ -1822,27 +2388,27 @@ pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
 	 * can fail would otherwise leave a row running unpublished, which is
 	 * the occupancy hole of §5.4 in per-class form.
 	 */
+	nstarted = 0;
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
-		error = hwpmc_pmu_sys_start_row(cpu, pe->pe_pmc);
+		if (pmc_test_should_fail(PMC_TEST_FAIL_SYSTEM_START))
+			error = EIO;
+		else
+			error = hwpmc_pmu_sys_start_row(cpu, pe->pe_pmc);
 		if (error != 0) {
-			pmu_event_t *started;
-
 			PMCDBG3(PMC, OPS, 1,
 			    "sys_schedule_in: start gid=%u cpu=%d err=%d",
 			    pg->pg_id, cpu, error);
-			TAILQ_FOREACH(started, &pg->pg_events, pe_sibling) {
-				if (started == pe)
-					break;
-				hwpmc_pmu_sys_stop_row(cpu, started->pe_pmc);
-				started->pe_pmc->pm_state = PMC_STATE_STOPPED;
-			}
-			pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
+			pmu_sys_stop_rows(cpu, pg, nstarted);
 			pmu_unassign_group(pg, cpu);
 			return (error);
 		}
+		nstarted++;
+		pmc_test_system_start_pause(pg, nstarted);
 	}
 	pmu_sys_residency_mark(pg, true);
+	if (pg->pg_sys_listed)
+		(void)pmc_test_group_hold_resident(pg);
 	PMCDBG3(PMC, OPS, 4, "sys_schedule_in: gid=%u cpu=%d nevents=%u IN",
 	    pg->pg_id, cpu, pg->pg_nevents);
 	return (0);
@@ -1867,19 +2433,79 @@ pmu_group_has_sampling(pmu_group_t *pg)
  * is reused or a member released (spec §6.7).
  */
 static void
-pmu_sys_group_drain_samples(pmu_group_t *pg)
+pmu_sys_group_prepare_drain(pmu_group_t *pg, u_int nmembers)
 {
 	pmu_event_t *pe;
+	u_int member;
+	bool marked;
 
-	if (!pmu_group_has_sampling(pg))
-		return;
+	marked = false;
+	member = 0;
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (member == nmembers)
+			break;
+		if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pe->pe_pmc))) {
+			pmc_rotation_drain_set(pe->pe_pmc, true);
+			marked = true;
+		}
+		member++;
+	}
+	KASSERT(member == nmembers,
+	    ("[pmu] group %u drain member mismatch %u/%u", pg->pg_id,
+	    member, nmembers));
+	if (marked)
+		wmb();
+}
+
+static void
+pmu_sys_group_drain_samples(int cpu, pmu_group_t *pg, u_int nmembers)
+{
+	pmu_event_t *pe;
+	u_int member;
+
 	if (pg->pg_owner != NULL &&
 	    (pg->pg_owner->po_flags & PMC_PO_OWNS_LOGFILE) != 0)
 		(void)pmclog_flush(pg->pg_owner, 1);
+	member = 0;
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (member == nmembers)
+			break;
 		if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pe->pe_pmc)))
-			pmc_rotation_drain(pe->pe_pmc);
+			pmc_rotation_drain_cpu(pe->pe_pmc, cpu);
+		member++;
 	}
+	KASSERT(member == nmembers,
+	    ("[pmu] group %u drained member mismatch %u/%u", pg->pg_id,
+	    member, nmembers));
+}
+
+/*
+ * Stop and drain the first nmembers rows before any row is unpublished or
+ * reused.  This is shared by normal eviction and partial-start rollback.
+ * pmc_sx remains held throughout, while the drain marker permits already
+ * accepted samples to complete after the hardware row has stopped.
+ */
+static void
+pmu_sys_stop_rows(int cpu, pmu_group_t *pg, u_int nmembers)
+{
+	pmu_event_t *pe;
+	u_int member;
+
+	pmu_sys_group_prepare_drain(pg, nmembers);
+	member = 0;
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (member == nmembers)
+			break;
+		hwpmc_pmu_sys_stop_row(cpu, pe->pe_pmc);
+		member++;
+	}
+	KASSERT(member == nmembers,
+	    ("[pmu] group %u stopped member mismatch %u/%u", pg->pg_id,
+	    member, nmembers));
+
+	if (nmembers != 0)
+		pmc_test_sample_schedule_out(pg);
+	pmu_sys_group_drain_samples(cpu, pg, nmembers);
 }
 
 /*
@@ -1888,19 +2514,13 @@ pmu_sys_group_drain_samples(pmu_group_t *pg)
 static void
 pmu_sys_schedule_out(int cpu, pmu_group_t *pg)
 {
-	pmu_event_t *pe;
-
 	if (pg == NULL || !pg->pg_assigned)
 		return;
 
-	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
-		hwpmc_pmu_sys_stop_row(cpu, pe->pe_pmc);
-		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
-	}
-
-	pmu_sys_group_drain_samples(pg);
+	pmu_sys_stop_rows(cpu, pg, pg->pg_nevents);
 	pmu_sys_residency_mark(pg, false);
 	pmu_unassign_group(pg, cpu);
+	(void)pmc_test_group_hold_evicted(pg);
 	PMCDBG2(PMC, OPS, 4, "sys_schedule_out: gid=%u cpu=%d OUT",
 	    pg->pg_id, cpu);
 }
@@ -1925,7 +2545,8 @@ pmu_sys_group_on_start(struct pmc *pm)
 {
 	pmu_event_t *pe;
 	pmu_group_t *pg;
-	bool was_running;
+	enum pmc_state prior_state;
+	bool added_sscount, was_running;
 	int cpu;
 
 	pe = pmu_event_from_pmc(pm);
@@ -1943,6 +2564,8 @@ pmu_sys_group_on_start(struct pmc *pm)
 	if (!pmc_cpu_is_active(cpu))
 		return (ENXIO);
 
+	prior_state = pm->pm_state;
+	added_sscount = false;
 	mtx_pool_lock_spin(pmc_mtxpool, pg);
 	if (pg->pg_account_blocked) {
 		mtx_pool_unlock_spin(pmc_mtxpool, pg);
@@ -1954,6 +2577,17 @@ pmu_sys_group_on_start(struct pmc *pm)
 	if (!was_running) {
 		int sin_err;
 
+		/*
+		 * Publish system-sampling ownership before hardware can accept
+		 * the first sample.  Kernel mappings are emitted by pmc_start()
+		 * before this group-layer dispatch.
+		 */
+		if (!pg->pg_sscounted && pmu_group_has_sampling(pg) &&
+		    pg->pg_owner != NULL) {
+			hwpmc_sscount_add(pg->pg_owner);
+			pg->pg_sscounted = true;
+			added_sscount = true;
+		}
 		sin_err = pmu_sys_schedule_in(cpu, pg);
 		PMCDBG3(PMC, OPS, 2,
 		    "sys_on_start: gid=%u cpu=%d schedule_in=%d",
@@ -1963,6 +2597,10 @@ pmu_sys_group_on_start(struct pmc *pm)
 			mtx_pool_lock_spin(pmc_mtxpool, pg);
 			pmu_group_running_stop_locked(pg, cpu_ticks());
 			mtx_pool_unlock_spin(pmc_mtxpool, pg);
+			if (added_sscount)
+				pmu_sys_group_sscount_drop(pg);
+			TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+				pe->pe_pmc->pm_state = prior_state;
 			return (sin_err);
 		}
 	}
@@ -1977,21 +2615,11 @@ pmu_sys_group_on_start(struct pmc *pm)
 		pg->pg_sys_listed = true;
 	}
 
-	/*
-	 * A sampling member puts its owner on the system-sampling owner
-	 * list, which is what gates kernel-mapping records.  This is done
-	 * here rather than at row assignment because a deferred member has
-	 * no row yet (spec §6.5).
-	 */
-	if (!pg->pg_sscounted && pmu_group_has_sampling(pg) &&
-	    pg->pg_owner != NULL) {
-		hwpmc_sscount_add(pg->pg_owner);
-		pg->pg_sscounted = true;
-	}
-
+	/* Publish the successful logical start for every stable group member. */
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
 		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
 
+	(void)pmc_test_group_hold_resident(pg);
 	pmu_syscpu_kick_rotate(cpu);
 	return (0);
 }
@@ -2071,8 +2699,10 @@ pmu_sys_group_pre_release(struct pmc *pm)
 
 	if (pg->pg_assigned)
 		pmu_sys_schedule_out(cpu, pg);
-	else
-		pmu_sys_group_drain_samples(pg);
+	else {
+		pmu_sys_group_prepare_drain(pg, pg->pg_nevents);
+		pmu_sys_group_drain_samples(cpu, pg, pg->pg_nevents);
+	}
 	mtx_pool_lock_spin(pmc_mtxpool, pg);
 	pmu_group_running_stop_locked(pg, cpu_ticks());
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);

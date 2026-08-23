@@ -82,9 +82,6 @@ ATF_TC_BODY(committed_release, tc)
 	    "pmc_group_commit failed: %s", strerror(errno));
 
 	errno = 0;
-	ATF_CHECK_EQ(pmc_release(sibling), -1);
-	ATF_CHECK_EQ(errno, EBUSY);
-	errno = 0;
 	ATF_CHECK_EQ(pmc_detach(leader, getpid()), -1);
 	ATF_CHECK_EQ(errno, EBUSY);
 	errno = 0;
@@ -111,6 +108,50 @@ ATF_TC_BODY(committed_release, tc)
 	ATF_CHECK_EQ(pmc_group_add(groupid, fresh, 1), -1);
 	ATF_CHECK_EQ(errno, EINVAL);
 	ATF_REQUIRE(pmc_release(fresh) == 0);
+}
+
+ATF_TC_WITHOUT_HEAD(committed_nonleader_errno_contract);
+ATF_TC_BODY(committed_nonleader_errno_contract, tc)
+{
+	pmc_id_t leader, sibling;
+	uint32_t groupid;
+	int error;
+
+	require_hwpmc();
+	leader = allocate_grouped();
+	sibling = allocate_grouped();
+	ATF_REQUIRE_MSG(pmc_group_create(&groupid) == 0,
+	    "pmc_group_create failed: %s", strerror(errno));
+	ATF_REQUIRE_MSG(pmc_group_add(groupid, leader, 1) == 0,
+	    "leader add failed: %s", strerror(errno));
+	ATF_REQUIRE_MSG(pmc_group_add(groupid, sibling, 0) == 0,
+	    "sibling add failed: %s", strerror(errno));
+	ATF_REQUIRE_MSG(pmc_group_commit(groupid) == 0,
+	    "pmc_group_commit failed: %s", strerror(errno));
+
+	errno = 0;
+	error = pmc_attach(sibling, getpid());
+	ATF_CHECK_MSG(error == -1 && errno == ENOTTY,
+	    "non-leader pmc_attach returned %d, errno %d (%s), expected "
+	    "-1/ENOTTY", error, errno, strerror(errno));
+	errno = 0;
+	error = pmc_start(sibling);
+	ATF_CHECK_MSG(error == -1 && errno == ENOTTY,
+	    "non-leader pmc_start returned %d, errno %d (%s), expected "
+	    "-1/ENOTTY", error, errno, strerror(errno));
+	errno = 0;
+	error = pmc_stop(sibling);
+	ATF_CHECK_MSG(error == -1 && errno == ENOTTY,
+	    "non-leader pmc_stop returned %d, errno %d (%s), expected "
+	    "-1/ENOTTY", error, errno, strerror(errno));
+	errno = 0;
+	error = pmc_release(sibling);
+	ATF_CHECK_MSG(error == -1 && errno == ENOTTY,
+	    "non-leader pmc_release returned %d, errno %d (%s), expected "
+	    "-1/ENOTTY", error, errno, strerror(errno));
+
+	ATF_REQUIRE_MSG(pmc_release(leader) == 0,
+	    "leader cleanup release failed: %s", strerror(errno));
 }
 
 ATF_TC_WITHOUT_HEAD(uncommitted_release);
@@ -209,6 +250,7 @@ ATF_TP_ADD_TCS(tp)
 {
 
 	ATF_TP_ADD_TC(tp, committed_release);
+	ATF_TP_ADD_TC(tp, committed_nonleader_errno_contract);
 	ATF_TP_ADD_TC(tp, owner_exit);
 	ATF_TP_ADD_TC(tp, uncommitted_release);
 	ATF_TP_ADD_TC(tp, uncommitted_nonleader_release);

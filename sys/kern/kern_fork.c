@@ -36,6 +36,7 @@
 
 #include "opt_ktrace.h"
 #include "opt_kstack_pages.h"
+#include "opt_hwpmc_hooks.h"
 
 #define EXTERR_CATEGORY	EXTERR_CAT_FORK
 #include <sys/systm.h>
@@ -85,6 +86,10 @@
 #ifdef KDTRACE_HOOKS
 #include <sys/dtrace_bsd.h>
 dtrace_fork_func_t	dtrace_fasttrap_fork;
+#endif
+
+#ifdef HWPMC_HOOKS
+#include <sys/pmckern.h>
 #endif
 
 SDT_PROVIDER_DECLARE(proc);
@@ -1210,6 +1215,20 @@ fork_exit(void (*callout)(void *, struct trapframe *), void *arg,
 		thread_stash(dtd);
 	}
 	thread_unlock(td);
+
+#ifdef HWPMC_HOOKS
+	/*
+	 * A new thread reaches the CPU for the first time through fork_exit()
+	 * rather than sched_switch(), so the context-switch-in hook that
+	 * sched_switch() runs is skipped here.  Without it an inherited
+	 * (PMC_F_DESCENDANTS) PMC is never programmed onto hardware until the
+	 * child's first real context switch, so a short-lived child's work is
+	 * uncounted.  Program its PMCs now, mirroring the mi_switch() path this
+	 * comment block above notes fork_exit() must emulate.
+	 */
+	if (PMC_PROC_IS_USING_PMCS(p))
+		PMC_SWITCH_CONTEXT(td, PMC_FN_CSW_IN);
+#endif
 
 	/*
 	 * cpu_fork_kthread_handler intercepts this function call to

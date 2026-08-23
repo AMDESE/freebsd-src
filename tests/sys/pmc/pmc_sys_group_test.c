@@ -29,6 +29,7 @@
 #include <pmc.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -41,14 +42,32 @@
 #define	CHILD_OK		0	/* Second owner handled correctly. */
 #define	CHILD_BUG_PLACED	10	/* Given a row already live. */
 #define	CHILD_BUG_REJECTED	11	/* Refused a genuinely free row. */
-#define	CHILD_ERR_COMMIT	2
-#define	CHILD_ERR_START		3
+#define	CHILD_ERR_ALLOCATE	2
+#define	CHILD_ERR_CREATE	3
+#define	CHILD_ERR_ADD		4
+#define	CHILD_ERR_COMMIT	5
+#define	CHILD_ERR_START		6
+#define	CHILD_ERR_UNGROUPED	7
 
 struct sys_group {
 	uint32_t	sg_groupid;
 	pmc_id_t	sg_ids[PMC_GROUP_MAX_MEMBERS];
 	u_int		sg_nmembers;
 	bool		sg_started;
+};
+
+enum group_build_operation {
+	GROUP_BUILD_NONE,
+	GROUP_BUILD_ALLOCATE,
+	GROUP_BUILD_CREATE,
+	GROUP_BUILD_ADD,
+	GROUP_BUILD_COMMIT
+};
+
+struct group_build_failure {
+	enum group_build_operation	gbf_operation;
+	u_int				gbf_member;
+	int				gbf_errno;
 };
 
 static bool
@@ -110,24 +129,102 @@ group_teardown(struct sys_group *g)
  * member 0 as the leader.  Returns 0, or -1 with errno set.
  */
 static int
-group_build(struct sys_group *g, int cpu, u_int nmembers)
+group_build(struct sys_group *g, int cpu, u_int nmembers,
+    struct group_build_failure *failure)
 {
 	u_int i;
 
+	failure->gbf_operation = GROUP_BUILD_NONE;
+	failure->gbf_member = 0;
+	failure->gbf_errno = 0;
 	group_init(g);
 	g->sg_nmembers = nmembers;
 	for (i = 0; i < nmembers; i++) {
 		if (pmc_allocate_group(TEST_EVENT, PMC_MODE_SC, 0, cpu,
-		    &g->sg_ids[i], 0) != 0)
+		    &g->sg_ids[i], 0) != 0) {
+			failure->gbf_operation = GROUP_BUILD_ALLOCATE;
+			failure->gbf_member = i;
+			failure->gbf_errno = errno;
 			return (-1);
+		}
 	}
-	if (pmc_group_create(&g->sg_groupid) != 0)
+	if (pmc_group_create(&g->sg_groupid) != 0) {
+		failure->gbf_operation = GROUP_BUILD_CREATE;
+		failure->gbf_errno = errno;
 		return (-1);
-	for (i = 0; i < nmembers; i++) {
-		if (pmc_group_add(g->sg_groupid, g->sg_ids[i], i == 0) != 0)
-			return (-1);
 	}
-	return (pmc_group_commit(g->sg_groupid));
+	for (i = 0; i < nmembers; i++) {
+		if (pmc_group_add(g->sg_groupid, g->sg_ids[i], i == 0) != 0) {
+			failure->gbf_operation = GROUP_BUILD_ADD;
+			failure->gbf_member = i;
+			failure->gbf_errno = errno;
+			return (-1);
+		}
+	}
+	if (pmc_group_commit(g->sg_groupid) != 0) {
+		failure->gbf_operation = GROUP_BUILD_COMMIT;
+		failure->gbf_errno = errno;
+		return (-1);
+	}
+	return (0);
+}
+
+static const char *
+group_build_operation_name(enum group_build_operation operation)
+{
+
+	switch (operation) {
+	case GROUP_BUILD_ALLOCATE:
+		return ("pmc_allocate_group");
+	case GROUP_BUILD_CREATE:
+		return ("pmc_group_create");
+	case GROUP_BUILD_ADD:
+		return ("pmc_group_add");
+	case GROUP_BUILD_COMMIT:
+		return ("pmc_group_commit");
+	case GROUP_BUILD_NONE:
+	default:
+		return ("unknown operation");
+	}
+}
+
+static void
+format_group_build_failure(char *buffer, size_t size, const char *description,
+    const struct group_build_failure *failure)
+{
+	const char *operation;
+
+	operation = group_build_operation_name(failure->gbf_operation);
+	if (failure->gbf_operation == GROUP_BUILD_ALLOCATE ||
+	    failure->gbf_operation == GROUP_BUILD_ADD) {
+		snprintf(buffer, size,
+		    "%s failed at %s for member %u: errno %d (%s)",
+		    description, operation, failure->gbf_member,
+		    failure->gbf_errno, strerror(failure->gbf_errno));
+	} else {
+		snprintf(buffer, size, "%s failed at %s: errno %d (%s)",
+		    description, operation, failure->gbf_errno,
+		    strerror(failure->gbf_errno));
+	}
+}
+
+static int
+child_group_build_error(const struct group_build_failure *failure)
+{
+
+	switch (failure->gbf_operation) {
+	case GROUP_BUILD_ALLOCATE:
+		return (CHILD_ERR_ALLOCATE);
+	case GROUP_BUILD_CREATE:
+		return (CHILD_ERR_CREATE);
+	case GROUP_BUILD_ADD:
+		return (CHILD_ERR_ADD);
+	case GROUP_BUILD_COMMIT:
+		return (CHILD_ERR_COMMIT);
+	case GROUP_BUILD_NONE:
+	default:
+		return (CHILD_ERR_COMMIT);
+	}
 }
 
 /*
@@ -138,15 +235,26 @@ group_build(struct sys_group *g, int cpu, u_int nmembers)
 static u_int
 probe_group_capacity(int cpu)
 {
+	struct group_build_failure failure;
 	struct sys_group probe;
+	char description[128], message[256];
 	u_int n;
 
 	for (n = PMC_GROUP_MAX_MEMBERS; n > 0; n--) {
-		if (group_build(&probe, cpu, n) == 0) {
+		if (group_build(&probe, cpu, n, &failure) == 0) {
 			group_teardown(&probe);
 			return (n);
 		}
 		group_teardown(&probe);
+		snprintf(description, sizeof(description),
+		    "capacity probe for %u members", n);
+		if (failure.gbf_operation != GROUP_BUILD_COMMIT ||
+		    failure.gbf_errno != ENOSPC) {
+			format_group_build_failure(message, sizeof(message),
+			    description, &failure);
+			atf_tc_fail("%s; expected pmc_group_commit to fail with "
+			    "ENOSPC while reducing the probe size", message);
+		}
 	}
 	return (0);
 }
@@ -165,6 +273,21 @@ check_child(int status)
 		    "for the first owner");
 	case CHILD_BUG_REJECTED:
 		atf_tc_fail("second owner was refused a free row");
+	case CHILD_ERR_ALLOCATE:
+		atf_tc_fail("second owner setup failed at pmc_allocate_group");
+	case CHILD_ERR_CREATE:
+		atf_tc_fail("second owner setup failed at pmc_group_create");
+	case CHILD_ERR_ADD:
+		atf_tc_fail("second owner setup failed at pmc_group_add");
+	case CHILD_ERR_COMMIT:
+		atf_tc_fail("second owner setup failed at pmc_group_commit; "
+		    "commit must ignore current occupancy");
+	case CHILD_ERR_START:
+		atf_tc_fail("second owner pmc_start failed with an errno other "
+		    "than ENOSPC");
+	case CHILD_ERR_UNGROUPED:
+		atf_tc_fail("ungrouped pmc_allocate failed with an errno other "
+		    "than EINVAL");
 	default:
 		atf_tc_fail("second owner setup failed, exit %d",
 		    WEXITSTATUS(status));
@@ -175,12 +298,12 @@ check_child(int status)
 static int
 child_full_collision(u_int cap)
 {
+	struct group_build_failure failure;
 	struct sys_group owner_b;
 	int rc;
 
-	if (group_build(&owner_b, TEST_CPU, cap) != 0) {
-		/* Refusing at commit is already the right answer. */
-		rc = errno == ENOSPC ? CHILD_OK : CHILD_ERR_COMMIT;
+	if (group_build(&owner_b, TEST_CPU, cap, &failure) != 0) {
+		rc = child_group_build_error(&failure);
 		group_teardown(&owner_b);
 		return (rc);
 	}
@@ -200,8 +323,9 @@ child_ungrouped_alloc(u_int cap __unused)
 {
 	pmc_id_t id;
 
+	errno = 0;
 	if (pmc_allocate(TEST_EVENT, PMC_MODE_SC, 0, TEST_CPU, &id, 0) != 0)
-		return (CHILD_OK);
+		return (errno == EINVAL ? CHILD_OK : CHILD_ERR_UNGROUPED);
 	(void)pmc_release(id);
 	return (CHILD_BUG_PLACED);
 }
@@ -210,11 +334,12 @@ child_ungrouped_alloc(u_int cap __unused)
 static int
 child_single_member(u_int cap __unused)
 {
+	struct group_build_failure failure;
 	struct sys_group owner_b;
 	int rc;
 
-	if (group_build(&owner_b, TEST_CPU, 1) != 0)
-		rc = CHILD_BUG_REJECTED;
+	if (group_build(&owner_b, TEST_CPU, 1, &failure) != 0)
+		rc = child_group_build_error(&failure);
 	else if (pmc_start(owner_b.sg_ids[0]) != 0)
 		rc = CHILD_BUG_REJECTED;
 	else {
@@ -232,12 +357,18 @@ child_single_member(u_int cap __unused)
 static void
 run_second_owner(u_int nrows, int (*fn)(u_int), u_int arg)
 {
+	struct group_build_failure failure;
 	struct sys_group owner_a;
+	char message[256];
 	pid_t pid;
 	int status;
 
-	ATF_REQUIRE_MSG(group_build(&owner_a, TEST_CPU, nrows) == 0,
-	    "first owner commit failed: %s", strerror(errno));
+	if (group_build(&owner_a, TEST_CPU, nrows, &failure) != 0) {
+		format_group_build_failure(message, sizeof(message),
+		    "first owner setup", &failure);
+		group_teardown(&owner_a);
+		atf_tc_fail("%s", message);
+	}
 	ATF_REQUIRE_MSG(pmc_start(owner_a.sg_ids[0]) == 0,
 	    "first owner start failed: %s", strerror(errno));
 	owner_a.sg_started = true;

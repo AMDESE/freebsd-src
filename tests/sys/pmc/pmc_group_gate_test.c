@@ -77,22 +77,24 @@ commit_with_flags(enum pmc_mode mode, int cpu, uint32_t leader_flags,
 	int error, rv;
 
 	leader = member = PMC_ID_INVALID;
-	rv = -1;
-	if (pmc_allocate_group(TEST_EVENT, mode, leader_flags, cpu, &leader,
-	    count) != 0)
-		goto out;
-	if (pmc_allocate_group(TEST_EVENT, mode, member_flags, cpu, &member,
-	    count) != 0)
-		goto out;
-	if (pmc_group_create(&gid) != 0)
-		goto out;
-	if (pmc_group_add(gid, leader, 1) != 0)
-		goto out;
-	if (pmc_group_add(gid, member, 0) != 0)
-		goto out;
+	ATF_REQUIRE_MSG(pmc_allocate_group(TEST_EVENT, mode, leader_flags, cpu,
+	    &leader, count) == 0,
+	    "leader pmc_allocate_group failed: errno %d (%s)", errno,
+	    strerror(errno));
+	ATF_REQUIRE_MSG(pmc_allocate_group(TEST_EVENT, mode, member_flags, cpu,
+	    &member, count) == 0,
+	    "member pmc_allocate_group failed: errno %d (%s)", errno,
+	    strerror(errno));
+	ATF_REQUIRE_MSG(pmc_group_create(&gid) == 0,
+	    "pmc_group_create failed: errno %d (%s)", errno, strerror(errno));
+	ATF_REQUIRE_MSG(pmc_group_add(gid, leader, 1) == 0,
+	    "leader pmc_group_add failed: errno %d (%s)", errno,
+	    strerror(errno));
+	ATF_REQUIRE_MSG(pmc_group_add(gid, member, 0) == 0,
+	    "member pmc_group_add failed: errno %d (%s)", errno,
+	    strerror(errno));
 	rv = pmc_group_commit(gid);
 
-out:
 	error = errno;
 	if (leader != PMC_ID_INVALID)
 		(void)pmc_release(leader);

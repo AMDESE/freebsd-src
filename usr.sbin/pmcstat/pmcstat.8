@@ -389,6 +389,12 @@ A CPU whose group is evicted produces no samples at all for that window,
 and nothing reconstructs them: the profile is of the time the group was
 resident, not of the whole run.
 Sample counts are therefore never scaled.
+At the end of a run,
+.Nm
+warns when a sampling group was actually multiplexed and a member's
+sampling period is longer than a generous estimate of the events one
+rotation window can retire.
+A group that remained fully resident does not produce this warning.
 .It Fl c Ar cpu-spec
 Set the cpus for subsequent system mode PMCs specified on the
 command line to

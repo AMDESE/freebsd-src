@@ -1,7 +1,7 @@
 # Build the hwpmc grouping/multiplex regression tests.
 #
 # Usage from this directory:
-#	make                 # builds all three test binaries
+#	make                 # builds all test binaries and support objects
 #	make check           # userland-only test (no root needed)
 #	make check-root      # in-kernel tests (need hwpmc(4) + root)
 #	make clean
@@ -17,22 +17,34 @@
 .OBJDIR: ${.CURDIR}
 
 CC?=		cc
+CXX?=		c++
 
 # Auto-detects when this directory still lives at tools/regression/pmc
 # in a FreeBSD source tree; override on the command line if copied.
 SRCROOT?=	${.CURDIR}/../../..
 
+LIBPMC_SRC=	${SRCROOT}/lib/libpmc
+LIBPMC_INC=	-I${LIBPMC_SRC} -I${SRCROOT}/sys
+# Force the current log ABI without letting source sys headers shadow
+# installed headers reached through the C++ standard library.
+CURRENT_PMCLOG_INC=	-include ${SRCROOT}/sys/sys/pmclog.h
 LIBPMCSTAT_SRC=	${SRCROOT}/lib/libpmcstat
 LIBPMCSTAT_INC=	-I${LIBPMCSTAT_SRC}
 
 CFLAGS+=	-O -g -Wall
+CXXFLAGS+=	-O -g -Wall
 
 # Kernel ABI tests (need hwpmc(4) loaded and root to run).
 KTESTS=		pmc_group_test pmc_mux_test pmc_mux_works_test \
 		pmc_mux_drain_test pmc_mux_rotation_test pmc_group_fuzz
 
-# Userland-only test (parser unit test, no PMU access).
-UTESTS=		test_libpmcstat_group
+# Userland-only tests (no PMU access).
+UTESTS=		test_libpmcstat_group test_pmclog_group_inherit_miss \
+		test_pmclog_group_inherit_miss_json \
+		pmcstat_group_inherit_miss_fixture \
+		pmcstat_mux_warning_shim.so
+
+PMCSTAT?=	/usr/sbin/pmcstat
 
 ALL=		${KTESTS} ${UTESTS}
 
@@ -66,9 +78,36 @@ test_libpmcstat_group: ${.CURDIR}/test_libpmcstat_group.c \
 		${LIBPMCSTAT_SRC}/libpmcstat_group.c
 	${CC} ${CFLAGS} ${LIBPMCSTAT_INC} -o ${.TARGET} ${.ALLSRC} -lpmc
 
-# Userland-only check: brace-list parser, no PMU.
-check: test_libpmcstat_group
+test_pmclog_group_inherit_miss: \
+		${.CURDIR}/test_pmclog_group_inherit_miss.c \
+		${LIBPMC_SRC}/pmclog.c
+	${CC} ${CFLAGS} -Wno-pointer-sign ${LIBPMC_INC} -o ${.TARGET} ${.ALLSRC}
+
+test_pmclog_group_inherit_miss_json: \
+		${.CURDIR}/test_pmclog_group_inherit_miss_json.cc \
+		${LIBPMC_SRC}/libpmc_json.cc
+	${CXX} ${CXXFLAGS} -I${LIBPMC_SRC} ${CURRENT_PMCLOG_INC} \
+	    -o ${.TARGET} ${.ALLSRC}
+
+pmcstat_group_inherit_miss_fixture: \
+		${.CURDIR}/pmcstat_group_inherit_miss_fixture.c
+	${CC} ${CFLAGS} ${CURRENT_PMCLOG_INC} -o ${.TARGET} ${.ALLSRC}
+
+pmcstat_mux_warning_shim.so: ${.CURDIR}/pmcstat_mux_warning_shim.c
+	${CC} ${CFLAGS} -fPIC -shared ${LIBPMCSTAT_INC} \
+	    -I${SRCROOT}/sys -o ${.TARGET} ${.ALLSRC}
+
+# Userland-only checks: parsers and pmcstat warning policy.
+check: ${UTESTS}
 	./test_libpmcstat_group
+	./test_pmclog_group_inherit_miss
+	./test_pmclog_group_inherit_miss_json
+	PMCSTAT=${PMCSTAT} \
+	    PMCGROUP_MISS_FIXTURE=${.CURDIR}/pmcstat_group_inherit_miss_fixture \
+	    sh ${.CURDIR}/pmcstat_group_inherit_miss_test.sh
+	PMCSTAT=${PMCSTAT} \
+	    PMCSTAT_WARNING_SHIM=${.CURDIR}/pmcstat_mux_warning_shim.so \
+	    sh ${.CURDIR}/pmcstat_mux_warning_test.sh
 
 # In-kernel check: requires `kldload hwpmc` and root.
 check-root: ${KTESTS}

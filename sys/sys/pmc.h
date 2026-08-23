@@ -818,6 +818,7 @@ typedef struct pmu_event pmu_event_t;
 typedef struct pmu_group pmu_group_t;
 LIST_HEAD(pmu_group_list, pmu_group);
 LIST_HEAD(pmu_group_target_list, pmu_group_target);
+LIST_HEAD(pmu_thread_residual_list, pmu_thread_residual);
 #endif
 
 struct pmc {
@@ -960,14 +961,15 @@ struct pmc_process {
 	uint32_t	pp_flags;		/* flags PMC_PP_* */
 	struct proc	*pp_proc;		/* target process */
 #ifdef _KERNEL
-	struct pmu_group_list pp_pmu_groups;	/* attached PMU groups (FIFO) */
+	struct pmu_group_list pp_pmu_groups;	/* groups anchored here (FIFO) */
 	/*
-	 * Groups this process follows only because it descends from a
-	 * target.  A group has a single pp_pmu_groups link, held by its
-	 * explicit target, so inherited targets reach it from here.
+	 * Authoritative group-target edges.  Every explicitly attached or
+	 * inherited group targeting this process has one entry here.
 	 */
-	struct pmu_group_target_list pp_pmu_inherited;
-	struct mtx	pp_pmu_lock;		/* protects pp_pmu_groups */
+	struct pmu_group_target_list pp_pmu_targets;
+	struct mtx	pp_pmu_lock;		/* protects PMU group/target lists */
+	struct pmu_thread_residual_list pp_pmu_residuals;
+						/* saved event/TID progress */
 	/*
 	 * Multiplex rotation thread. Rotates groups when total events
 	 * exceed available hardware counters.
