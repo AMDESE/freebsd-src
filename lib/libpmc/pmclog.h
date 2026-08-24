@@ -114,6 +114,11 @@ struct pmclog_ev_pmcdetach {
 	pid_t		pl_pid;
 };
 
+struct pmclog_ev_pmcgroupinheritmiss {
+	pmc_id_t	pl_pmcid;
+	pid_t		pl_pid;
+};
+
 struct pmclog_ev_proccsw {
 	pid_t		pl_pid;
 	pid_t		pl_tid;
@@ -187,6 +192,7 @@ struct pmclog_ev {
 		struct pmclog_ev_pmcallocatedyn	pl_ad;
 		struct pmclog_ev_pmcattach	pl_t;
 		struct pmclog_ev_pmcdetach	pl_d;
+		struct pmclog_ev_pmcgroupinheritmiss pl_gim;
 		struct pmclog_ev_proccsw	pl_c;
 		struct pmclog_ev_proccreate	pl_pc;
 		struct pmclog_ev_procexec	pl_x;

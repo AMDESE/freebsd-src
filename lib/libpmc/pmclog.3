@@ -21,7 +21,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd March 26, 2006
+.Dd August 22, 2026
 .Dt PMCLOG 3
 .Os
 .Sh NAME
@@ -93,6 +93,7 @@ struct pmclog_ev {
 		struct pmclog_ev_pmcallocatedyn	pl_ad;
 		struct pmclog_ev_pmcattach   pl_t;
 		struct pmclog_ev_pmcdetach   pl_d;
+		struct pmclog_ev_pmcgroupinheritmiss pl_gim;
 		struct pmclog_ev_proccsw     pl_c;
 		struct pmclog_ev_procexec    pl_x;
 		struct pmclog_ev_procexit    pl_e;
@@ -201,6 +202,9 @@ A record describing a PMC allocation operation.
 A record describing a PMC attach operation.
 .It Dv PMCLOG_TYPE_PMCDETACH
 A record describing a PMC detach operation.
+.It Dv PMCLOG_TYPE_PMCGROUPINHERITMISS
+This record shows a failed group inheritance.
+The record gives the group-leader PMC and the child PID that missed it.
 .It Dv PMCLOG_TYPE_PROCCSW
 A record describing a PMC reading at the time of a process context switch.
 .It Dv PMCLOG_TYPE_PROCEXEC
@@ -221,6 +225,15 @@ owning system-wide sampling PMCs.
 .It Dv PMCLOG_TYPE_USERDATA
 A record containing user data.
 .El
+.Pp
+PMC-specific identifier fields contain the stable handle returned when the
+PMC was allocated.
+For a grouped PMC, this handle remains unchanged when multiplexing moves the
+PMC between hardware rows; consumers must not interpret it as the current
+hardware row.
+Records not associated with one PMC may instead use a record-defined sentinel
+such as
+.Dv PMC_ID_INVALID .
 .Pp
 Function
 .Fn pmclog_feed

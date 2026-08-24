@@ -378,6 +378,17 @@ Start (stop) a software PMC.
 .It Fn pmc_set
 Set the reload value for a sampling PMC.
 .El
+.It "PMC Grouping"
+.Bl -tag -width 6n -compact
+.It Fn pmc_allocate_group
+Allocate a PMC that will join a group.
+.It Fn pmc_group_create , Fn pmc_group_add , Fn pmc_group_commit
+Create a group, add members to it, and freeze its membership.
+.It Fn pmc_group_read
+Read every member of a committed group in one consistent snapshot.
+.It Fn pmc_read_pair
+Read one PMC together with the times that scale it.
+.El
 .It "Queries"
 .Bl -tag -width 6n -compact
 .It Fn pmc_capabilities
@@ -408,6 +419,96 @@ Applications may then use the x86
 instruction to directly read the contents of the PMC.
 .El
 .El
+.Ss PMC Groups
+Events measured separately are measured at different times, so their
+ratios are not trustworthy.
+A group is a set of PMCs the hardware programs together: every member
+counts over exactly the same interval, or none of them does.
+.Pp
+Members are allocated with
+.Fn pmc_allocate_group ,
+which defers the choice of hardware counter, then collected with
+.Fn pmc_group_create
+and
+.Fn pmc_group_add
+and frozen by
+.Fn pmc_group_commit .
+One member is designated the leader, and it stands for the group
+thereafter:
+.Fn pmc_attach ,
+.Fn pmc_start ,
+.Fn pmc_stop
+and
+.Fn pmc_release
+act on the whole group through it, and the same call on another member
+fails with
+.Er ENOTTY .
+.Pp
+When more events are requested than the hardware can hold at once, a
+group may be multiplexed: it holds counters for part of the time and is
+evicted for the rest.
+.Fn pmc_group_read
+therefore returns, alongside the member values, the time the group was
+enabled and the time it was actually running.
+A caller scales a raw count by
+.Va enabled Ns / Ns Va running
+to estimate what the count would have been with the group resident
+throughout.
+Such a value is an estimate, and should be presented as one.
+Sample counts must never be scaled: a multiplexed sampling member simply
+does not observe what happens while it is evicted.
+.Ss Probing For Group Support
+There is no operation that asks whether grouping is available.
+A program probes by attempting the allocation it intended to perform
+anyway, and treating
+.Er EOPNOTSUPP
+from
+.Fn pmc_allocate_group
+as
+.Dq this kernel cannot group these events ,
+falling back to ungrouped allocation.
+A throwaway probe is a poor idea, since each one consumes a deferred
+handle and a group slot.
+.Pp
+An
+.Er EINVAL
+from
+.Fn pmc_group_commit
+is never a probe.
+It reports a usage error with several possible causes \(em no leader,
+two leaders, mixed virtual and system modes, system members bound to
+different CPUs, or a leader-only flag on another member \(em and should
+be shown to the user rather than treated as absent support.
+.Ss Deferred Handle Budget
+A grouped PMC keeps a stable identifier from allocation until release,
+even as multiplexing moves it between hardware counters.
+These identifiers come from a pool of 32 per owning process per CPU.
+.Pp
+Process-scope groups are not bound to a CPU, so all of an owner's
+process-scope members draw from a single pool of 32, however many groups
+they belong to.
+One maximum-size group therefore exhausts the entire process-scope
+budget, and a further allocation fails with
+.Er EMFILE
+until that group is released.
+System-scope groups draw from a separate pool for each CPU they are
+bound to.
+.Ss Reading A Group
+.Fn pmc_group_read
+fills a caller-supplied array.
+Pass a count of zero to ask how many members the group has; the call
+succeeds and reports the count without touching the array.
+Passing a nonzero count smaller than the membership fails with
+.Er E2BIG ,
+and again reports the required count, so a caller can size its array in
+one retry.
+.Pp
+.Fn pmc_read_pair
+reads a single PMC with the times that scale it.
+It allocates internally, so it may fail for reasons unrelated to the
+PMC, and it applies only to a group leader:
+on any other member it fails with
+.Er EOPNOTSUPP .
 .Ss Signal Handling Requirements
 Applications using PMCs are required to handle the following signals:
 .Bl -tag -width ".Dv SIGBUS"

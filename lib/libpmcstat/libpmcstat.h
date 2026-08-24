@@ -75,6 +75,11 @@ struct pmcstat_ev {
 	pmc_id_t	ev_pmcid; /* allocated ID */
 	pmc_value_t	ev_saved; /* for incremental counts */
 	char	       *ev_spec;  /* event specification */
+	int		ev_groupid; /* 0 = no group, >0 = syntactic group id */
+	int		ev_is_leader; /* 1 if leader of its group */
+	uint64_t	ev_prev_enabled; /* leader: prior snapshot times */
+	uint64_t	ev_prev_running;
+	uint64_t	ev_scaled_sum; /* -C: sum of interval estimates */
 };
 
 struct pmcstat_target {
@@ -108,6 +113,7 @@ struct pmcstat_args {
 #define	FLAG_SKIP_TOP_FN_RES		0x00200000	/* -A */
 #define	FLAG_FILTER_THREAD_ID		0x00400000	/* -L */
 #define	FLAG_SHOW_OFFSET		0x00800000	/* -I */
+#define	FLAG_DO_GROUPING		0x01000000	/* -b */
 
 	int	pa_required;		/* required features */
 	int	pa_pplugin;		/* pre-processing plugin */
@@ -379,6 +385,16 @@ int pmcstat_analyze_log(struct pmcstat_args *args,
 
 int pmcstat_open_log(const char *_p, int _mode);
 int pmcstat_close_log(struct pmcstat_args *args);
+
+/*
+ * Parse a brace-delimited event group {a,b,c}.
+ * Returns 0 on success, 1 if spec is a single event, -1 on error.
+ */
+int pmcstat_parse_event_group(const char *spec, char ***out_events,
+    size_t *n_out);
+void pmcstat_free_event_group(char **events, size_t n);
+struct pmcstat_ev *pmcstat_add_one_event(int option, const char *spec,
+    struct pmcstat_args *pa, int groupid, int is_leader);
 
 __END_DECLS
 

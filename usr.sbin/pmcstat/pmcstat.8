@@ -248,6 +248,15 @@ field will be zero.
 Allocate a system mode sampling PMC measuring hardware events
 specified in
 .Ar event-spec .
+A system mode PMC is bound to a single CPU: the lowest-numbered one in
+the set given by
+.Fl c ,
+or in the process's root CPU set if
+.Fl c
+was not given.
+To profile several CPUs, run one
+.Nm
+per CPU.
 .It Fl T
 Use a
 .Xr top 1 Ns -like
@@ -309,6 +318,83 @@ option to read in samples that were previously collected and
 saved with the
 .Fl O
 option.
+.It Fl b
+Enable PMU event grouping.
+When this flag is set, an argument to
+.Fl p ,
+.Fl P ,
+.Fl s
+or
+.Fl S
+may be a brace-list of the form
+.Sq Brq Ar ev1 , Ar ev2 , Ar ev3 :
+all listed events are programmed atomically as a single PMU group, so
+the counter values for siblings are read at consistent program points.
+Every brace-mode group leader is allocated with
+.Dv PMC_F_GROUP_MUX
+set, which has no effect on groups that fit in hardware but lets the
+kernel transparently time-multiplex any group that overflows the
+.Em remaining
+hardware counter budget.
+For example, on a 6-counter Zen3 the invocation
+.Bd -literal -offset indent
+pmcstat -b -p '{instructions,unhalted-cycles}' \\
+    -p '{ls_alloc_mab_count,ls_not_halted_cyc,ls_dispatch.all}' \\
+    -p '{ls_smi_rx,ls_int_taken,instructions}' sleep 60
+.Ed
+.Pp
+attaches three groups (2+3+3 = 8 events) to one target.
+The first two groups consume 5 of 6 counters, leaving 1.
+The third group is then committed in multiplex mode so its 3 events
+rotate through the remaining slot rather than failing with
+.Er ENOSPC .
+.Pp
+While a group is being multiplexed its counting-mode columns show
+.Em scaled estimates
+(interval count scaled by the group's enabled/running time ratio),
+and the group's hardware residency for the interval is appended in a
+trailing
+.Ql res%
+column that stays blank while the group is fully resident:
+.Bd -literal -offset indent
+# p/instructions p/unhalted-cycles p/branches    res%
+        24000210          51003001      92010   50.2%
+   <not counted>     <not counted> <not counted>   0.0%
+        23890110          50700323      91500
+.Ed
+.Pp
+An interval in which the group never reached hardware prints
+.Ql <not counted>
+for every member; when residency falls below 1/10
+.Pq Dv PMC_SCALE_MAX
+the raw interval count is shown instead of an extrapolated estimate.
+With
+.Fl C ,
+cumulative values are running sums of the per-interval estimates.
+.Pp
+A scaled value is an estimate of what the count would have been had the
+group stayed on hardware, obtained by assuming the events the group did
+not see resemble the ones it did.
+Over a short interval that assumption is weak: a group that was resident
+for one rotation window in three has sampled the interval three times,
+and the resulting estimate is correspondingly rough.
+Choose a display interval spanning at least about twenty rotation
+periods \(em with the default
+.Va kern.hwpmc.mux_period_ms
+of 50, roughly one second \(em before reading much into a scaled number.
+.Pp
+For system-wide sampling, multiplexing costs coverage rather than
+accuracy.
+A CPU whose group is evicted produces no samples at all for that window,
+and nothing reconstructs them: the profile is of the time the group was
+resident, not of the whole run.
+Sample counts are therefore never scaled.
+At the end of a run,
+.Nm
+sends this warning if a multiplexed group has a sampling period that is
+longer than the event budget of one rotation window.
+.Nm
+does not send this warning for a fully resident group.
 .It Fl c Ar cpu-spec
 Set the cpus for subsequent system mode PMCs specified on the
 command line to
@@ -326,11 +412,32 @@ process' current and future children or only measuring events for
 the target process.
 The default is to measure events for the target process alone.
 (it has to be passed in the command line prior to
-.Fl p ,
-.Fl s ,
-.Fl P ,
+.Fl p
 or
-.Fl S ) .
+.Fl P ) .
+.Pp
+A system mode PMC is bound to a CPU and has no process target to follow
+through a fork, so combining
+.Fl d
+with
+.Fl s
+or
+.Fl S
+is rejected.
+.Pp
+With
+.Fl b ,
+a brace-list group follows a fork as a whole: every member attaches to
+the child, or none does.
+If the kernel cannot attach the group to a new child \(em a fork cannot
+be failed, so under memory pressure the child is simply not measured \(em
+its work is missing from the totals, which otherwise look complete.
+.Nm
+reports that at the end of the run:
+.Bd -literal -offset indent
+pmcstat: WARNING: 2 descendant attaches failed; their contributions
+are not in these totals.
+.Ed
 .It Fl e
 Specify that the gprof profile files will use a wide history counter.
 These files are produced in a format compatible with

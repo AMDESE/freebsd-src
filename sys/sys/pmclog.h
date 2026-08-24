@@ -71,7 +71,8 @@ enum pmclog_type {
 	 */
 	PMCLOG_TYPE_THR_CREATE = 18,
 	PMCLOG_TYPE_THR_EXIT = 19,
-	PMCLOG_TYPE_PROC_CREATE = 20
+	PMCLOG_TYPE_PROC_CREATE = 20,
+	PMCLOG_TYPE_PMCGROUPINHERITMISS = 21
 };
 
 /*
@@ -194,6 +195,12 @@ struct pmclog_pmcdetach {
 	uint32_t		pl_pid;
 } __packed;
 
+struct pmclog_pmcgroupinheritmiss {
+	PMCLOG_ENTRY_HEADER
+	uint32_t		pl_pmcid;
+	uint32_t		pl_pid;
+} __packed;
+
 struct pmclog_proccsw {
 	PMCLOG_ENTRY_HEADER
 	uint64_t		pl_value;	/* keep 8 byte aligned */
@@ -281,6 +288,7 @@ union pmclog_entry {		/* only used to size scratch areas */
 	struct pmclog_pmcallocatedyn	pl_ad;
 	struct pmclog_pmcattach		pl_t;
 	struct pmclog_pmcdetach		pl_d;
+	struct pmclog_pmcgroupinheritmiss	pl_gim;
 	struct pmclog_proccsw		pl_c;
 	struct pmclog_proccreate	pl_pc;
 	struct pmclog_procexec		pl_x;
@@ -316,16 +324,21 @@ int	pmclog_close(struct pmc_owner *_po);
 void	pmclog_initialize(void);
 int	pmclog_proc_create(struct thread *td, void **handlep);
 void	pmclog_proc_ignite(void *handle, struct pmc_owner *po);
-void	pmclog_process_callchain(struct pmc *_pm, struct pmc_sample *_ps);
+bool	pmclog_process_callchain(struct pmc *_pm, struct pmc_sample *_ps);
 void	pmclog_process_closelog(struct pmc_owner *po);
 void	pmclog_process_dropnotify(struct pmc_owner *po);
 void	pmclog_process_map_in(struct pmc_owner *po, pid_t pid,
     uintfptr_t start, const char *path);
+void	pmclog_process_map_in_nowakeup(struct pmc_owner *po, pid_t pid,
+    uintfptr_t start, const char *path);
 void	pmclog_process_map_out(struct pmc_owner *po, pid_t pid,
+    uintfptr_t start, uintfptr_t end);
+void	pmclog_process_map_out_nowakeup(struct pmc_owner *po, pid_t pid,
     uintfptr_t start, uintfptr_t end);
 void	pmclog_process_pmcallocate(struct pmc *_pm);
 void	pmclog_process_pmcattach(struct pmc *_pm, pid_t _pid, char *_path);
 void	pmclog_process_pmcdetach(struct pmc *_pm, pid_t _pid);
+void	pmclog_process_pmcgroupinheritmiss(struct pmc *_pm, pid_t _pid);
 void	pmclog_process_proccsw(struct pmc *_pm, struct pmc_process *_pp,
     pmc_value_t _v, struct thread *);
 void	pmclog_process_procexec(struct pmc_owner *_po, pmc_id_t _pmid, pid_t _pid,

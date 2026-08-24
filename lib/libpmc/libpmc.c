@@ -1351,6 +1351,149 @@ out:
 }
 
 int
+pmc_allocate_group(const char *ctrspec, enum pmc_mode mode, uint32_t flags,
+    int cpu, pmc_id_t *pmcid, uint64_t count)
+{
+	return (pmc_allocate(ctrspec, mode, flags | PMC_F_GROUP_DEFER, cpu,
+	    pmcid, count));
+}
+
+int
+pmc_group_create(uint32_t *groupid)
+{
+	struct pmc_op_pmcgroupcreate args;
+	int rv;
+
+	if (groupid == NULL) {
+		errno = EINVAL;
+		return (-1);
+	}
+	bzero(&args, sizeof(args));
+	rv = PMC_CALL(PMC_OP_PMCGROUPCREATE, &args);
+	if (rv == 0)
+		*groupid = args.pm_groupid;
+	return (rv);
+}
+
+int
+pmc_group_add(uint32_t groupid, pmc_id_t pmcid, int leader)
+{
+	struct pmc_op_pmcgroupadd args;
+
+	bzero(&args, sizeof(args));
+	args.pm_groupid = groupid;
+	args.pm_pmcid = pmcid;
+	if (leader)
+		args.pm_flags = PMC_GROUP_F_LEADER;
+	return (PMC_CALL(PMC_OP_PMCGROUPADD, &args));
+}
+
+int
+pmc_group_commit(uint32_t groupid)
+{
+	struct pmc_op_pmcgroupcommit args;
+
+	bzero(&args, sizeof(args));
+	args.pm_groupid = groupid;
+	return (PMC_CALL(PMC_OP_PMCGROUPCOMMIT, &args));
+}
+
+int
+pmc_group_read(pmc_id_t leader, uint32_t *nmembers,
+    struct pmc_group_member *members, struct pmc_group_times *times)
+{
+	struct pmc_op_pmcgroupread *snapshot;
+	size_t snapshot_size;
+	uint32_t capacity;
+	int error, rv;
+
+	if (nmembers == NULL) {
+		errno = EINVAL;
+		return (-1);
+	}
+	capacity = *nmembers;
+	if (capacity > PMC_GROUP_MAX_MEMBERS ||
+	    (capacity != 0 && members == NULL)) {
+		errno = EINVAL;
+		return (-1);
+	}
+
+	snapshot_size = sizeof(*snapshot) +
+	    capacity * sizeof(snapshot->pm_members[0]);
+	snapshot = calloc(1, snapshot_size);
+	if (snapshot == NULL)
+		return (-1);
+	snapshot->pm_leader = leader;
+	snapshot->pm_nmembers = capacity;
+	rv = PMC_CALL(PMC_OP_PMCGROUPREAD, snapshot);
+	if (rv == 0) {
+		*nmembers = snapshot->pm_nmembers;
+		if (capacity != 0) {
+			memcpy(members, snapshot->pm_members,
+			    snapshot->pm_nmembers * sizeof(members[0]));
+		}
+		/* A size query also returns group times. */
+		if (times != NULL) {
+			times->pgt_enabled = snapshot->pm_enabled;
+			times->pgt_running = snapshot->pm_running;
+			times->pgt_enabled_wall = snapshot->pm_enabled_wall;
+			times->pgt_wall = snapshot->pm_wall;
+			times->pgt_flags = snapshot->pm_gflags;
+		}
+	} else if (errno == E2BIG) {
+		*nmembers = snapshot->pm_nmembers;
+	}
+	error = errno;
+	free(snapshot);
+	if (rv != 0)
+		errno = error;
+	return (rv);
+}
+
+/*
+ * Read group leader value and execution times.
+ */
+int
+pmc_read_pair(pmc_id_t pmc, pmc_value_t *value, uint64_t *enabled,
+    uint64_t *running)
+{
+	struct pmc_group_member *members;
+	struct pmc_group_times times;
+	pmc_value_t result;
+	uint32_t n;
+	int error;
+
+	if (value == NULL) {
+		errno = EINVAL;
+		return (-1);
+	}
+	n = 0;
+	if (pmc_group_read(pmc, &n, NULL, NULL) != 0) {
+		if (errno == ENOTTY)
+			errno = EOPNOTSUPP;
+		return (-1);
+	}
+	members = calloc(n, sizeof(*members));
+	if (members == NULL)
+		return (-1);
+	if (pmc_group_read(pmc, &n, members, &times) != 0) {
+		error = errno;
+		free(members);
+		errno = error == ENOTTY ? EOPNOTSUPP : error;
+		return (-1);
+	}
+	result = members[0].pm_value;
+	free(members);
+
+	*value = result;
+	if (enabled != NULL)
+		*enabled = times.pgt_enabled;
+	if (running != NULL)
+		*running = times.pgt_running;
+	return (0);
+}
+
+int
 pmc_attach(pmc_id_t pmc, pid_t pid)
 {
 	struct pmc_op_pmcattach pmc_attach_args;
@@ -1617,8 +1760,8 @@ pmc_init(void)
 	if (PMC_CALL(PMC_OP_GETMODULEVERSION, &abi_version) < 0)
 		return (pmc_syscall = -1);
 
-	/* ignore patch & minor numbers for the comparison */
-	if ((abi_version & 0xFF000000) != (PMC_VERSION & 0xFF000000)) {
+	/* Ignore patch number in version check. */
+	if ((abi_version & 0xFFFF0000) != (PMC_VERSION & 0xFFFF0000)) {
 		errno  = EPROGMISMATCH;
 		return (pmc_syscall = -1);
 	}
