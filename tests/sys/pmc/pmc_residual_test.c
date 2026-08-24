@@ -686,9 +686,9 @@ ATF_TC_BODY(long_period_under_mux, tc)
 }
 
 /*
- * Saved residual state must retain identity independently of its numeric
- * value.  In particular, an overflow pending at schedule-out and an
- * uninitialized event both carry value zero but are not the same state.
+ * Saved residual state must keep its identity, no matter the value.
+ * An overflow-pending event and an uninitialized event both read zero.
+ * But they are not the same state.
  */
 ATF_TC_WITH_CLEANUP(residual_state_identity);
 ATF_TC_HEAD(residual_state_identity, tc)
@@ -764,10 +764,7 @@ ATF_TC_BODY(residual_state_identity, tc)
 			    cases[i].name, query_errno, strerror(query_errno));
 			break;
 		}
-		/*
-		 * ptrq_assigned reports the group's current row assignment,
-		 * not whether saved residual state exists.
-		 */
+		/* ptrq_assigned shows the row assignment.  It does not show if a residual exists. */
 	}
 
 	group_teardown_required(&g, "residual-state group");
@@ -798,9 +795,9 @@ ATF_TC_CLEANUP(residual_state_identity, tc)
 }
 
 /*
- * A thread created while a sampling event is evicted has no saved progress for
- * that event.  It must start with a full period when the event is placed again,
- * rather than inheriting an older thread's residual.
+ * A thread can start while an event is evicted.  This thread has no
+ * saved progress.  It must start with a full period.  It must not use
+ * an older thread's residual.
  */
 ATF_TC_WITH_CLEANUP(thread_residual_new_thread_starts_full_period);
 ATF_TC_HEAD(thread_residual_new_thread_starts_full_period, tc)
@@ -832,10 +829,10 @@ ATF_TC_BODY(thread_residual_new_thread_starts_full_period, tc)
 	    errno, strerror(errno));
 
 	/*
-	 * The "old" thread exists before eviction and carries a distinct
-	 * residual.  It is parked in pthread_cond_wait so its injected
-	 * per-thread value is not overwritten by a normal context-switch-out
-	 * before eviction snapshots it.
+	 * The "old" thread starts before eviction and has its own residual.
+	 * Park it in pthread_cond_wait.
+	 * This stops the injected value from being overwritten before
+	 * eviction takes its snapshot.
 	 */
 	residual_workers_start(&old_gate, old_threads, old_args, 1);
 
@@ -878,9 +875,9 @@ ATF_TC_BODY(thread_residual_new_thread_starts_full_period, tc)
 	    PMC_TEST_RESIDUAL_GET_SAVED, &saved);
 
 	/*
-	 * The "new" thread is created while the event is evicted, so it has no
-	 * saved progress for it.  When the group is placed again it must start
-	 * from a full period rather than inherit the old thread's residual.
+	 * The "new" thread starts while the event is evicted.
+	 * It must start from a full period.
+	 * It must not inherit the old thread's residual.
 	 */
 	residual_workers_start(&new_gate, new_threads, new_args, 1);
 	require_test_sysctl_write(TEST_HOLD_GROUP_RESIDENT, a.g_id);
@@ -931,9 +928,9 @@ ATF_TC_CLEANUP(thread_residual_new_thread_starts_full_period, tc)
 }
 
 /*
- * A saved residual belongs to one stable event/TID pair.  When that thread
- * exits, its saved entry must be reclaimed even while the group remains
- * attached to the process.
+ * A saved residual belongs to one event/TID pair.
+ * When that thread exits, the system must reclaim its entry.
+ * This is true even while the group stays attached.
  */
 ATF_TC_WITH_CLEANUP(thread_residual_thread_exit_reclaims_state);
 ATF_TC_HEAD(thread_residual_thread_exit_reclaims_state, tc)
@@ -1015,11 +1012,12 @@ ATF_TC_CLEANUP(thread_residual_thread_exit_reclaims_state, tc)
 }
 
 /*
- * A sampling event has independent progress for each target thread.  Inject
- * two distinct live residuals, force a real eviction and re-entry, and require
- * each TID to retain its own value.  The current event-wide minimum model
- * returns and restores one common value, so at least one exact assertion must
- * fail for both the saved and restored snapshots.
+ * Each target thread has independent progress on a sampling event.
+ * Inject two live residuals.  Force eviction, then force re-entry.
+ * Each TID must keep its own value.
+ * The current event-wide minimum model does not do this.  It collapses
+ * to one shared value instead.  Because of this, an exact assertion
+ * must fail here.
  */
 ATF_TC_WITH_CLEANUP(per_thread_residuals_survive_eviction);
 ATF_TC_HEAD(per_thread_residuals_survive_eviction, tc)

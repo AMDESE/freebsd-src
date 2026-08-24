@@ -1681,8 +1681,9 @@ pmc_target_object_free(struct pmc_target *pt)
 }
 
 /*
- * Publish a preallocated row-indexed target link.  All fallible work must be
- * complete before this helper is used by a multi-target group transaction.
+ * This function publishes a preallocated row-indexed target link.
+ * Use this function only after all fallible work in a multi-target group
+ * transaction is complete.
  */
 void
 pmc_link_target_process_preallocated(struct pmc *pm, struct pmc_process *pp,
@@ -1834,9 +1835,9 @@ pmc_rotation_drain(struct pmc *pm)
 }
 
 /*
- * Drain a system PMC from its known bound CPU.  The hardware stop path clears
- * pps_cpustate before queued samples are consumed, so rediscovering the CPU
- * through that transient residency bit is not valid here.
+ * This function drains a system PMC from its known bound CPU.
+ * The system clears pps_cpustate before it drains samples.
+ * Do not use pps_cpustate to find the CPU again here.
  */
 void
 pmc_rotation_drain_cpu(struct pmc *pm, int cpu)
@@ -2139,24 +2140,19 @@ pmc_group_log_inherit(struct pmc_process *ppnew, struct proc *p1,
 }
 
 /*
- * Upper bound on missed group leaders recorded per fork.  Beyond this the
- * driver statistic (the always-available floor) still counts every miss; only
- * the per-group stream records are capped, which keeps the fork path off the
- * heap without losing the aggregate accounting.
+ * This is the upper limit for missed group leaders recorded per fork.
+ * Above this limit, the system still caps the per-group stream records.
+ * The driver statistic still counts every miss.
  */
 #define	PMC_FORK_MISS_LOG_MAX	PMC_GROUP_MAX_MEMBERS
 
 /*
- * Report a child a group could not follow.  The driver statistic is the
- * always-available floor; with a logfile the miss is also placed in the
- * stream beside the fork, so that -R analysis can account for the gap
- * instead of reading the totals as complete (spec §3.9).  Each missed group
- * is named by its leader handle in a dedicated PMCGROUPINHERITMISS record: a
- * PMCDETACH would falsely assert that an attached edge was torn down, and
- * re-walking the process group list cannot distinguish the failed group from
- * the ones that inherited cleanly.  The exact missed leaders come straight
- * from pmu_group_inherit, which is the only place that knows which group
- * could not be recorded.
+ * This function reports a child that a group could not follow.
+ * The driver statistic is always available as the floor value.
+ * If a logfile exists, the system also logs the miss beside the fork.
+ * The system logs the miss as a PMCGROUPINHERITMISS record with the
+ * leader name.  This lets -R analysis show the real gap.  Without this
+ * record, -R analysis would show a total that looks complete but is not.
  */
 static void
 pmc_group_log_inherit_miss(struct pmc **missed_leaders, u_int nmissed,
@@ -2287,10 +2283,7 @@ fail:
 	return (error);
 }
 
-/*
- * Return the next process in a depth-first walk rooted at top.
- * The caller holds proctree_lock shared, so parent/child links are stable.
- */
+/* This function returns the next process in a depth-first walk from top. */
 static struct proc *
 pmc_next_descendant(struct proc *top, struct proc *p)
 {
@@ -2314,9 +2307,10 @@ struct pmc_group_attach_target {
 };
 
 /*
- * Attach a committed virtual group to one process or one stable process-tree
- * snapshot.  All authorization checks and allocations complete before the
- * first authoritative edge or transient row link is published.
+ * This function attaches a committed virtual group to one process, or to
+ * one stable process-tree snapshot.
+ * The function completes all checks and allocations first.
+ * Only then does it publish an edge or a row link.
  */
 static int
 pmc_attach_group_processes(struct proc *top, struct pmc *pm)
@@ -2791,13 +2785,11 @@ pmc_process_exec(struct thread *td, struct pmckern_procexec *pk)
 	 * than before, allow it to be the target of a PMC only if
 	 * the PMC's owner has sufficient privilege.
 	 *
-	 * Iterate the authoritative target set (pp_pmu_targets), which covers
-	 * both groups anchored here and groups inherited through fork, so an
-	 * inherited descendant cannot keep an unauthorized group merely because
-	 * the group happened to be anchored at another process.  Reauthorize by
-	 * the group leader and detach any group the new credential is not
-	 * allowed to be a target of, using the anchor-aware or inherited path as
-	 * appropriate.
+	 * Walk pp_pmu_targets.  This list covers both anchored and inherited
+	 * groups.  Because of this, an inherited group cannot survive with an
+	 * unauthorized credential just because it is anchored elsewhere.
+	 * Detach any group that the new credential may not target.  Use the
+	 * anchor-aware path or the inherited path, as needed.
 	 */
 	for (;;) {
 		struct pmu_group_target *pgt;
@@ -5232,9 +5224,9 @@ pmc_find_pmc_descriptor_in_process(struct pmc_owner *po, pmc_id_t pmcid)
 }
 
 /*
- * Find the owner of a grouped PMC held by a descendant.  The authoritative
- * target list is stable across placement, unlike pp_pmcs[], and the leader's
- * PMC_F_DESCENDANTS policy governs every sibling.
+ * This function finds the owner of a grouped PMC held by a descendant.
+ * The function uses the target list.  This list stays stable across
+ * placement.  pp_pmcs[] does not.
  */
 static struct pmc_owner *
 pmc_find_group_owner_in_process(struct pmc_process *pp, pmc_id_t pmcid)
@@ -5281,11 +5273,7 @@ pmc_find_pmc(pmc_id_t pmcid, struct pmc **pmc)
 		    PMC_FLAG_NONE);
 		if (pp == NULL)
 			return (ESRCH);
-		/*
-		 * A grouped member is always reached through the stable target
-		 * model.  This also authorizes siblings at the leader/group level
-		 * and makes lookup independent of current residency.
-		 */
+		/* You reach a grouped member through the stable target model. */
 		po = pmc_find_group_owner_in_process(pp, pmcid);
 		if (po == NULL) {
 			if (PMC_ID_TO_ROWINDEX(pmcid) == PMC_ROW_UNASSIGNED ||
@@ -7003,10 +6991,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		}
 
 		if (pg != NULL && pg->pg_committed) {
-			/*
-			 * A committed group's user-visible running state is
-			 * independent of whether its members currently own rows.
-			 */
+			/* The running state of a committed group does not depend on row ownership. */
 			if (pg->pg_running)
 				break;
 		} else {
@@ -7061,10 +7046,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 			PMC_DOWNGRADE_SX();
 
 		if (pg != NULL && pg->pg_committed) {
-			/*
-			 * Eviction may leave every member stopped in hardware while
-			 * the group remains logically running.
-			 */
+			/* Eviction can stop every member.  The group can stay logically running. */
 			if (!pg->pg_running)
 				break;
 		} else {
@@ -7492,9 +7474,9 @@ pmc_add_sample(ring_type_t ring, struct pmc *pm, struct trapframe *tf,
 	 */
 	cpu = curcpu;
 	/*
-	 * Once the selected test group has accepted one sample, make the next
-	 * interrupt take the normal buffer-full/stalled path.  This keeps the
-	 * queue at exactly one accepted entry while its worker is paused.
+	 * The test group accepts one sample.  After that, force the next
+	 * interrupt down the buffer-full/stalled path.  This holds the queue
+	 * at one entry while the worker for this group is paused.
 	 */
 	if (pmc_test_sample_worker_paused(pm)) {
 		pm->pm_pcpu_state[cpu].pps_stalled = 1;
@@ -7925,14 +7907,11 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 	    p->p_comm);
 
 	/*
-	 * is_using_hwpmcs was sampled from P_HWPMC before pmc_sx was held.  A
-	 * group attach transaction publishes its edges and sets P_HWPMC under
-	 * pmc_sx, so a target that exits while such a transaction is paused can
-	 * pass that lock-free snapshot as "not monitored" and then have an edge
-	 * published onto it after this point.  The lock-serialized process
-	 * descriptor is the authoritative signal: if one exists, this process is
-	 * a live target and must run the full cleanup below, otherwise the edge
-	 * would be stranded on an exiting process.
+	 * The system read is_using_hwpmcs without a lock, before pmc_sx.
+	 * Because of this, a paused attach transaction can publish P_HWPMC
+	 * after that snapshot.  Do not trust is_using_hwpmcs.  Trust the
+	 * process descriptor instead.  If the descriptor exists, run full
+	 * cleanup.  If you skip this cleanup, the edge is stranded.
 	 */
 	if (!is_using_hwpmcs &&
 	    pmc_find_process_descriptor(p, PMC_FLAG_NONE) == NULL)
@@ -8197,7 +8176,7 @@ pmc_process_fork(void *arg __unused, struct proc *p1, struct proc *newproc,
 		goto done;
 	}
 
-	/* Publish process tracking only after at least one inheritance succeeds. */
+	/* Publish process tracking only after inheritance succeeds. */
 	PROC_LOCK(newproc);
 	newproc->p_flag |= P_HWPMC;
 	PROC_UNLOCK(newproc);

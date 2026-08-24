@@ -801,9 +801,9 @@ group_teardown(struct group *g)
 }
 
 /*
- * A system group bound to TEST_CPU whose leader samples.  The second
- * member counts, which also exercises §3.4's new rule that a system group
- * may mix PMC_MODE_SC and PMC_MODE_SS.
+ * This is a system group on TEST_CPU.
+ * The leader samples.  The second member counts.
+ * §3.4 allows this mix of PMC_MODE_SC and PMC_MODE_SS.
  */
 static int
 group_build_n(struct group *g, u_int nmembers, bool sampling_leader,
@@ -936,9 +936,10 @@ read_group_snapshot(const struct group *g, struct group_snapshot *snapshot)
 }
 
 /*
- * A system-mode group only sees what runs on the CPU it is bound to, so
- * the load has to be put there or the test measures whatever the
- * scheduler happened to place on TEST_CPU instead.
+ * A system-mode group sees only its bound CPU.
+ * Pin the load to that CPU.
+ * If you do not pin the load, the test measures whatever the
+ * scheduler placed on TEST_CPU instead.
  */
 static void
 pin_to_test_cpu(void)
@@ -998,9 +999,10 @@ spin_until_test_ack(const char *name, u_int expected)
 }
 
 /*
- * A grouped SS member samples, and reports the count through pm_value.
- * The members keep their allocated handles, which is what correlates a
- * sample record with the allocation that produced it (§3.6).
+ * A grouped SS member samples.  It reports the count in pm_value.
+ * Members keep their allocated handles.
+ * Use these handles to match a sample record to the allocation that
+ * made it (§3.6).
  */
 ATF_TC_WITHOUT_HEAD(grouped_system_sampling);
 ATF_TC_BODY(grouped_system_sampling, tc)
@@ -1041,11 +1043,10 @@ ATF_TC_BODY(grouped_system_sampling, tc)
 	ATF_CHECK_MSG(m[0].pm_value > 0,
 	    "the grouped system-sampling member delivered no samples");
 	/*
-	 * Both members watch the same event on the same CPU, so the sample
-	 * count should track the counted total over the period.  Allow a
-	 * wide margin -- the two are read at slightly different points and
-	 * the sampler is stopped around each overflow -- but catch a member
-	 * that delivers a token sample and then stops.
+	 * Both members watch the same event and the same CPU.
+	 * The sample count should track the counted total.
+	 * Allow a wide margin for read timing and for stop-on-overflow.
+	 * But still catch a member that sends one token sample and then stops.
 	 */
 	if (m[1].pm_value > 4 * SAMPLE_PERIOD) {
 		ATF_CHECK_MSG(m[0].pm_value >=
@@ -1061,9 +1062,10 @@ ATF_TC_BODY(grouped_system_sampling, tc)
 }
 
 /*
- * Starting the group joins this owner to the system-sampling owner list, and
- * stopping it removes this owner.  Exact fork records in this owner's logfile
- * prove both transitions without relying on a global statistic.
+ * Start the group.  This adds this owner to the system-sampling owner list.
+ * Stop the group.  This removes this owner from that list.
+ * Use exact fork records in this owner's logfile to check this.
+ * Do not use a global statistic.
  */
 ATF_TC_WITHOUT_HEAD(grouped_system_sampling_accounting);
 ATF_TC_BODY(grouped_system_sampling_accounting, tc)
@@ -1739,8 +1741,9 @@ ATF_TC_BODY(system_release_while_running_evicted, tc)
 
 /*
  * Grouped system sampling has the same no-log contract as a standalone
- * PMC_MODE_SS allocation.  The failed start must not consume the group: after
- * configuring a logfile, the same handles must start, stop, and release.
+ * PMC_MODE_SS allocation.
+ * A failed start must not consume the group.
+ * Configure a logfile.  Then the same handles must start, stop, and release.
  */
 ATF_TC_WITHOUT_HEAD(grouped_system_sampling_requires_log);
 ATF_TC_BODY(grouped_system_sampling_requires_log, tc)
@@ -1780,9 +1783,10 @@ ATF_TC_BODY(grouped_system_sampling_requires_log, tc)
 }
 
 /*
- * System-sampling accounting and initial kernel mappings must be published
- * before the first group member starts.  A later-member failure must restore
- * the committed group to its reusable pre-start state.
+ * The system must publish system-sampling accounting and the initial
+ * kernel mappings before the first member starts.
+ * A later member can fail.  This failure must restore the committed
+ * group to its reusable pre-start state.
  */
 ATF_TC_WITHOUT_HEAD(grouped_system_sampling_start_rollback_after_preflight);
 ATF_TC_BODY(grouped_system_sampling_start_rollback_after_preflight, tc)
@@ -2137,10 +2141,11 @@ cleanup:
 }
 
 /*
- * A sample accepted by the first member before a later member fails must enter
- * the same drain protocol used for normal system-group eviction.  The sample
- * must then be emitted or explicitly counted as dropped before rollback
- * returns.
+ * A sample can be accepted before a later member fails.
+ * This sample must enter the same drain protocol as normal
+ * system-group eviction.
+ * Before rollback returns, the system must emit the sample, or count
+ * it as dropped.
  */
 ATF_TC_WITHOUT_HEAD(grouped_system_sampling_partial_start_rollback_drains);
 ATF_TC_BODY(grouped_system_sampling_partial_start_rollback_drains, tc)
@@ -2515,9 +2520,10 @@ cleanup:
 }
 
 /*
- * One sample accepted before a normal system-group eviction must be emitted
- * before the row is reused.  Holding the worker after queue publication makes
- * the accepted entry and the eviction boundary deterministic.
+ * A normal system-group eviction can happen after the system accepts
+ * one sample.  The system must emit that sample before it reuses the row.
+ * Hold the worker after queue publication.
+ * This makes the accepted entry and the eviction boundary deterministic.
  */
 ATF_TC_WITHOUT_HEAD(system_sampling_drain_one_queued_sample);
 ATF_TC_BODY(system_sampling_drain_one_queued_sample, tc)
@@ -2901,13 +2907,16 @@ cleanup:
 }
 
 /*
- * Supplemental low-rate, many-rotation drain stress (F-06).  The deterministic
- * single-sample case proves one queued sample survives one forced eviction;
- * this case proves the per-handle accounting stays lossless across many natural
- * rotations under load.  Two full-size MUX groups oversubscribe the PMU on one
- * CPU so neither is resident continuously, a bounded workload drives samples
- * over many short rotation windows, and the sampling handle must reconcile with
- * accepted == emitted + dropped and no leaked run reference.
+ * This is a supplemental low-rate, many-rotation drain stress test (F-06).
+ * The deterministic single-sample case proves that one queued sample
+ * survives one forced eviction.
+ * This test proves that accounting stays lossless across many natural
+ * rotations under load.
+ * Two full-size MUX groups oversubscribe one CPU's PMU.  Because of
+ * this, neither group stays resident.
+ * A bounded workload drives samples over many rotations.
+ * The handle must reconcile: accepted must equal emitted plus dropped.
+ * The test must not leak any run reference.
  */
 ATF_TC_WITHOUT_HEAD(system_sampling_drain_stress);
 ATF_TC_BODY(system_sampling_drain_stress, tc)
@@ -2950,8 +2959,9 @@ ATF_TC_BODY(system_sampling_drain_stress, tc)
 	read_live_target_counts(&baseline);
 
 	/*
-	 * Shorten the rotation window so a bounded workload crosses many
-	 * eviction boundaries.  Restore the original value during cleanup.
+	 * Shorten the rotation window.
+	 * This makes the workload cross many eviction boundaries.
+	 * Restore the window during cleanup.
 	 */
 	mux_len = sizeof(mux_saved);
 	if (sysctlbyname("kern.hwpmc.mux_period_ms", &mux_saved, &mux_len,
@@ -3038,9 +3048,9 @@ ATF_TC_BODY(system_sampling_drain_stress, tc)
 	}
 
 	/*
-	 * The lossless invariant: every accepted sample is either emitted to the
-	 * log or explicitly dropped, and no run reference is leaked across the
-	 * many evictions this workload forced.
+	 * This is the lossless invariant.
+	 * The system must emit every accepted sample, or drop it explicitly.
+	 * The system must not leak any run reference across evictions.
 	 */
 	if (final_samples.ptsc_handle != sampling.g_ids[0] ||
 	    final_samples.ptsc_accepted !=
@@ -3114,8 +3124,9 @@ cleanup:
 }
 
 /*
- * A callchain record that cannot reserve log space was accepted by the sample
- * ring but was not emitted.  It must be attributed as an explicit drop.
+ * A callchain record can fail to reserve log space.
+ * The sample ring already accepted this record, but did not emit it.
+ * The system must count this record as an explicit drop.
  */
 ATF_TC_WITHOUT_HEAD(callchain_log_reservation_failure_is_dropped);
 ATF_TC_BODY(callchain_log_reservation_failure_is_dropped, tc)
@@ -3360,9 +3371,11 @@ cleanup:
 }
 
 /*
- * Eviction changes residency, not the user-visible started state.  Stopping
- * an evicted group must clear the logical running and system-sampling state,
- * and the stopped group must not return when another group occupies the rows.
+ * Eviction changes residency.  It does not change the user-visible
+ * started state.
+ * When you stop an evicted group, the system must clear the logical
+ * running state and the system-sampling state.
+ * The stopped group must not return when another group occupies the rows.
  */
 ATF_TC_WITHOUT_HEAD(system_stop_while_evicted);
 ATF_TC_BODY(system_stop_while_evicted, tc)
@@ -3486,8 +3499,9 @@ ATF_TC_BODY(system_stop_while_evicted, tc)
 		goto fail_cleanup;
 	}
 	/*
-	 * The resident gate has one request slot.  Replacing sampling.g_id with
-	 * competitor.g_id releases the first group and holds the replacement.
+	 * The resident gate has one request slot.
+	 * Replace sampling.g_id with competitor.g_id.
+	 * This releases the first group and holds the other group.
 	 */
 	if (sysctl_write_u32(TEST_HOLD_GROUP_RESIDENT, competitor.g_id) != 0) {
 		saved_errno = errno;
@@ -3743,9 +3757,11 @@ ATF_TC_BODY(system_stop_while_evicted, tc)
 
 fail_cleanup:
 	/*
-	 * On the expected pre-fix failure, the sampling group is still logically
-	 * running.  Release every group before closing the logfile so cleanup
-	 * cannot turn the intended state mismatch into an sscount assertion.
+	 * On the expected pre-fix failure, the sampling group is still
+	 * logically running.
+	 * Release every group before you close the logfile.
+	 * If you do not do this, cleanup can hide the mismatch as an
+	 * sscount assertion instead.
 	 */
 	reset_system_stop_test_hooks();
 	group_teardown(&fresh);

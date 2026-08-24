@@ -1218,13 +1218,9 @@ fork_exit(void (*callout)(void *, struct trapframe *), void *arg,
 
 #ifdef HWPMC_HOOKS
 	/*
-	 * A new thread reaches the CPU for the first time through fork_exit()
-	 * rather than sched_switch(), so the context-switch-in hook that
-	 * sched_switch() runs is skipped here.  Without it an inherited
-	 * (PMC_F_DESCENDANTS) PMC is never programmed onto hardware until the
-	 * child's first real context switch, so a short-lived child's work is
-	 * uncounted.  Program its PMCs now, mirroring the mi_switch() path this
-	 * comment block above notes fork_exit() must emulate.
+	 * fork_exit() does not run the context-switch-in hook from
+	 * sched_switch().  Program the inherited PMCs here.  If you do not
+	 * do this, hwpmc does not count the work of a short-lived child.
 	 */
 	if (PMC_PROC_IS_USING_PMCS(p))
 		PMC_SWITCH_CONTEXT(td, PMC_FN_CSW_IN);

@@ -203,9 +203,8 @@ A record describing a PMC attach operation.
 .It Dv PMCLOG_TYPE_PMCDETACH
 A record describing a PMC detach operation.
 .It Dv PMCLOG_TYPE_PMCGROUPINHERITMISS
-A record identifying a failed grouped descendant-inheritance operation.
-The record contains the stable group-leader PMC handle and the PID of the
-child for which no group-target edge was published.
+This record shows a failed group inheritance.
+The record gives the group-leader PMC and the child PID that missed it.
 .It Dv PMCLOG_TYPE_PROCCSW
 A record describing a PMC reading at the time of a process context switch.
 .It Dv PMCLOG_TYPE_PROCEXEC

@@ -52,9 +52,9 @@
 #define	FORK_LOG_NGROUPS	2
 #define	FORK_LOG_NMEMBERS	2
 /*
- * The no-install test build uses the host's installed libpmc headers. Keep the
- * source-tree append-only record number local until that userland is installed
- * or linked directly.
+ * The no-install build uses the host's libpmc headers.
+ * Keep this record number local until you install that userland, or
+ * link it directly.
  */
 #define	TEST_PMCLOG_TYPE_GROUP_INHERIT_MISS	21
 
@@ -404,8 +404,8 @@ scan_fork_inherit_log(const char *path, pid_t parent_pid, pid_t child_pid,
 }
 
 /*
- * Read the source-tree wire format directly so this kernel test does not depend
- * on the host's installed libpmc recognizing the new append-only record.
+ * Read the wire format directly.
+ * The host's libpmc may not recognize this new append-only record.
  */
 static int
 scan_inherited_fork_miss_log(const char *path, pid_t inherited_parent_pid,
@@ -706,8 +706,9 @@ row_occupancy_init(struct row_occupancy *occupancy)
 }
 
 /*
- * Reserve every row that can host TEST_EVENT.  The current ungrouped no-row
- * contract is EINVAL; any other failure is a setup error, not a reason to skip.
+ * Reserve every row that can host TEST_EVENT.
+ * For an ungrouped PMC with no free row, the error is EINVAL.
+ * Treat any other failure as a setup error.  Do not skip the test for it.
  */
 static void
 row_occupancy_fill_required(struct row_occupancy *occupancy)
@@ -826,8 +827,9 @@ write_full(int fd, const void *buffer, size_t length)
 }
 
 /*
- * A timeout is only a deadlock guard.  EOF is the synchronization condition:
- * exit1() runs the hwpmc process-exit hook before closing file descriptors.
+ * The timeout is only a deadlock guard.
+ * EOF is the real synchronization condition.
+ * exit1() runs the hwpmc exit hook before it closes the file descriptors.
  */
 static void
 require_pipe_eof(int fd, const char *description)
@@ -880,14 +882,15 @@ gated_child(int command_fd, int ack_fd)
 		if (write_byte(ack_fd, command) != 0)
 			_exit(6);
 	}
-	/* The parent exits on an assertion failure, closing the command pipe. */
+	/* The parent exits on an assertion failure.  This closes the command pipe. */
 	_exit(0);
 }
 
 /*
- * Become an explicit group target, fork one descendant on command, and then
- * exit before that descendant.  The descendant is driven by a separate pipe
- * so its no-work and work phases remain deterministic after this process exits.
+ * This function becomes an explicit group target.
+ * On command, it forks one descendant, then exits before the descendant.
+ * The descendant uses a separate pipe.  This keeps the descendant's phases
+ * deterministic after this process exits.
  */
 static void
 target_parent_with_child(int parent_command_fd, int child_command_fd,
@@ -1139,10 +1142,10 @@ ATF_TC_BODY(descendants_whole_group, tc)
 }
 
 /*
- * A resident grouped fork must publish all member links together.  Reading the
- * leader first proves that the child reached the inheritance path; the sibling
- * read then distinguishes a whole-group publication from the old leader-only
- * row link.
+ * A resident grouped fork must publish all member links together.
+ * The leader read proves that the child reached inheritance.
+ * The sibling read proves that the child did not just get the old
+ * leader-only link.
  */
 ATF_TC_WITHOUT_HEAD(descendants_child_reads_whole_group);
 ATF_TC_BODY(descendants_child_reads_whole_group, tc)
@@ -1364,9 +1367,10 @@ fork_inherit_alloc_failure_atomic(const char *failpoint_name, u_int fail_after,
 }
 
 /*
- * If the authoritative inherited edge cannot be allocated, no transient
- * leader link or child process descriptor may survive.  The child stays alive
- * while the parent checks the exact object-count baseline.
+ * The authoritative inherited edge may fail to allocate.
+ * If it fails, no transient leader link and no child process descriptor
+ * may survive.  The child stays alive while the parent checks the
+ * object-count baseline.
  */
 ATF_TC_WITH_CLEANUP(descendants_fork_inherit_alloc_failure_atomic);
 ATF_TC_HEAD(descendants_fork_inherit_alloc_failure_atomic, tc)
@@ -1387,9 +1391,10 @@ ATF_TC_CLEANUP(descendants_fork_inherit_alloc_failure_atomic, tc)
 }
 
 /*
- * A later member-link allocation failure must roll back the already allocated
- * first link and the authoritative edge.  With two members, allowing one
- * allocation before failure proves that the failpoint reached the second link.
+ * A later member-link allocation can fail.
+ * This failure must roll back the first link, which already allocated,
+ * and the authoritative edge.  Use two members and allow one allocation.
+ * This proves that the failpoint reached the second link.
  */
 ATF_TC_WITH_CLEANUP(descendants_fork_inherit_link_alloc_failure_atomic);
 ATF_TC_HEAD(descendants_fork_inherit_link_alloc_failure_atomic, tc)
@@ -1410,12 +1415,15 @@ ATF_TC_CLEANUP(descendants_fork_inherit_link_alloc_failure_atomic, tc)
 }
 
 /*
- * A fork-inheritance miss is not a detach: the failed group's child edge was
- * never published.  Allow exactly one of two descendants groups to inherit,
- * then use child-side handle lookup to identify the successful and missed
- * groups independently of list order.  The logfile must contain one PROCFORK
- * for this owner and child, one PMCATTACH per successful member, and no
- * PMCATTACH or PMCDETACH for any missed member before the marker.
+ * A fork-inheritance miss is not a detach.
+ * The child edge was never published.
+ * Allow one of two descendants groups to inherit.
+ * Then use a child-side handle lookup to identify the success and the
+ * miss.  This method does not depend on list order.
+ * The log must show one PROCFORK record.
+ * The log must show one PMCATTACH record for each successful member.
+ * The log must not show PMCATTACH or PMCDETACH for any missed member
+ * before the marker.
  */
 ATF_TC_WITH_CLEANUP(descendants_fork_miss_has_no_false_detach);
 ATF_TC_HEAD(descendants_fork_miss_has_no_false_detach, tc)
@@ -1734,10 +1742,12 @@ ATF_TC_CLEANUP(descendants_fork_miss_has_no_false_detach, tc)
 }
 
 /*
- * Repeat the partial-inheritance case when the forking process is itself an
- * inherited target.  The first fork's handle-scoped attach records prove that
- * both groups reached the intermediate process.  The second fork must identify
- * its one failed group with a distinct leader-handle/child-pid record.
+ * Repeat the partial-inheritance case, but the forking process is
+ * itself an inherited target.
+ * The attach records from the first fork prove that both groups reached
+ * the intermediate process.
+ * The second fork must identify its one failed group.  Use the
+ * leader handle and the child PID to identify it.
  */
 ATF_TC_WITH_CLEANUP(descendants_inherited_parent_fork_miss_is_identified);
 ATF_TC_HEAD(descendants_inherited_parent_fork_miss_is_identified, tc)
@@ -2133,9 +2143,10 @@ ATF_TC_CLEANUP(descendants_inherited_parent_fork_miss_is_identified, tc)
 }
 
 /*
- * Fail a later target in an existing process-tree attachment after the root
- * target has already been prepared.  Nothing may be published, and the same
- * group must remain reusable after the transaction rolls back.
+ * Fail a later target in an existing process-tree attachment.
+ * Do this after the root target is prepared.
+ * The system must not publish anything.
+ * The group must stay reusable after the rollback.
  */
 static void
 descendants_attach_failure_atomic(const char *failpoint_name,
@@ -2246,9 +2257,10 @@ ATF_TC_CLEANUP(descendants_attach_authorization_rollback, tc)
 }
 
 /*
- * Hold attachment after the target-tree snapshot while the only enumerated
- * target attempts to fork.  The process-tree lock makes that fork linearize
- * after publication, so the new child must inherit the complete group.
+ * Take the target-tree snapshot.  Then hold the attachment while the
+ * only enumerated target forks.
+ * The process-tree lock puts that fork after publication in order.
+ * Because of this, the new child must inherit the whole group.
  */
 ATF_TC_WITH_CLEANUP(descendants_attach_race_fork);
 ATF_TC_HEAD(descendants_attach_race_fork, tc)
@@ -2382,10 +2394,11 @@ ATF_TC_CLEANUP(descendants_attach_race_fork, tc)
 }
 
 /*
- * Hold attachment after enumerating the owner and one parked child.  Make the
- * child enter pmc_process_exit() and snapshot P_HWPMC before publication, then
- * release the transaction.  Exit cleanup must still remove the child's newly
- * published edge while leaving the owner's edge intact.
+ * Enumerate the owner and one parked child.  Then hold the attachment.
+ * Make the child take a snapshot of P_HWPMC in pmc_process_exit().
+ * Take this snapshot before publication.  Then release the attachment.
+ * Exit cleanup must remove the child's new edge.
+ * Exit cleanup must leave the owner's edge in place.
  */
 ATF_TC_WITH_CLEANUP(descendants_attach_race_exit);
 ATF_TC_HEAD(descendants_attach_race_exit, tc)
@@ -2447,15 +2460,16 @@ ATF_TC_BODY(descendants_attach_race_exit, tc)
 	read_live_target_counts(&after_exit);
 
 	/*
-	 * The committed non-MUX group is assigned at commit, so the still-attached
-	 * owner holds one ordinary row-link per member.  Capture that count before
-	 * teardown clears g.g_n for the after_exit assertion below.
+	 * The system assigns a committed non-MUX group at commit time.
+	 * Because of this, the owner holds one row-link for each member.
+	 * Capture this count before teardown clears g.g_n.
 	 */
 	owner_links = g.g_n;
 
 	/*
-	 * Release before waitpid() reaps the child, so a failing implementation
-	 * can remove a stale edge without dereferencing a freed process.
+	 * Release before waitpid() reaps the child.
+	 * This stops a failing implementation from hiding a stale edge
+	 * behind a freed process.
 	 */
 	group_teardown(&g);
 	reset_fork_test_hooks();
@@ -2473,13 +2487,13 @@ ATF_TC_BODY(descendants_attach_race_exit, tc)
 	    "exit-race attach returned rc=%d errno=%d (%s)", attach.atr_rc,
 	    attach.atr_errno, strerror(attach.atr_errno));
 	/*
-	 * Only the owner's edge and descriptor survive the child's exit-race
-	 * cleanup (group_target and process each initial+1).  A committed
-	 * non-MUX group is assigned hardware rows at commit, so the still-attached
-	 * owner legitimately holds one ordinary row-link per member; the child's
-	 * links (the pre-fix leak this case targets) must be gone, leaving exactly
-	 * initial + g.g_n.  A failing implementation that stranded the child's
-	 * links would show initial + 2*g.g_n and still fail here.
+	 * Only the owner's edge and descriptor survive the exit-race
+	 * cleanup.  For each of group_target and process, this is initial+1.
+	 * The owner correctly holds one row-link for each member.
+	 * The child's links must be gone.  These links are the leak that
+	 * this test case targets.
+	 * The result must be exactly initial + g.g_n.
+	 * A stranding bug would instead show initial + 2*g.g_n.
 	 */
 	ATF_CHECK_MSG(
 	    after_exit.ltc_pmc_targets == initial.ltc_pmc_targets + owner_links &&
@@ -2519,12 +2533,14 @@ ATF_TC_CLEANUP(descendants_attach_race_exit, tc)
 }
 
 /*
- * The explicit target is only one member of the authoritative target set.
- * Its exit must not stop a running group while an inherited child remains.
- * Keep the group deterministically evicted through the explicit target's exit
- * so the red test isolates anchor lifetime without exercising stale row links.
- * After a successful handoff, make the group resident and prove that the
- * surviving child contributes.
+ * The explicit target is only one member of the authoritative target
+ * set.
+ * When the explicit target exits, this must not stop a running group
+ * if an inherited child remains.
+ * Keep the group evicted through the exit.
+ * This isolates the anchor lifetime from stale row links.
+ * After a successful handoff, make the group resident.
+ * Then prove that the surviving child contributes.
  */
 ATF_TC_WITH_CLEANUP(descendants_parent_target_exits_before_child);
 ATF_TC_HEAD(descendants_parent_target_exits_before_child, tc)
@@ -2616,11 +2632,10 @@ ATF_TC_BODY(descendants_parent_target_exits_before_child, tc)
 	    "target parent exited abnormally: status %#x", status);
 
 	/*
-	 * Pre-fix, parent exit stops the group and drops its only scheduling
-	 * anchor.  A fresh start sees no attached target plus PMC_F_ATTACH_DONE
-	 * and fails ESRCH at the automatic-attach gate before the group-layer
-	 * target lookup.  With anchor handoff, the group is still logically
-	 * running and start is the documented successful no-op.
+	 * Before the fix: parent exit drops the group's only scheduling
+	 * anchor.  Because of this, a fresh start fails with ESRCH before
+	 * the group-layer lookup.
+	 * With anchor handoff: start is a successful no-op, as documented.
 	 */
 	errno = 0;
 	restart_rc = pmc_start(g.g_ids[0]);
@@ -2830,10 +2845,11 @@ ATF_TC_CLEANUP(descendants_release_running_evicted_with_live_child, tc)
 }
 
 /*
- * A descendants attach is one group-level transaction over the existing
- * process tree.  Park the child before attach, then isolate a no-work control
- * and a child-only work phase while the child remains alive.  Every member
- * must show a substantial work-phase delta above the control noise.
+ * A descendants attach is one group-level transaction over the
+ * existing process tree.
+ * Park the child before the attach.
+ * Isolate a no-work control phase and a child-only work phase.
+ * Every member must show a large work-phase delta above the control noise.
  */
 ATF_TC_WITHOUT_HEAD(descendants_existing_tree_attach_atomic);
 ATF_TC_BODY(descendants_existing_tree_attach_atomic, tc)
@@ -2908,10 +2924,10 @@ ATF_TC_BODY(descendants_existing_tree_attach_atomic, tc)
 }
 
 /*
- * Repeat the existing-tree transaction with no hardware row available at
- * commit or start.  Attachment must publish the full stable target set while
- * the group is deferred, and every member must begin counting the parked child
- * after the group is deterministically admitted.
+ * Repeat the existing-tree transaction.  This time, no hardware row is
+ * available at commit or at start.
+ * The attachment must publish the full target set while it is deferred.
+ * Every member must count the parked child once the group is admitted.
  */
 ATF_TC_WITH_CLEANUP(descendants_existing_tree_attach_deferred);
 ATF_TC_HEAD(descendants_existing_tree_attach_deferred, tc)

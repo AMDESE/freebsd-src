@@ -416,10 +416,9 @@ pmu_group_find_target(pmu_group_t *pg, struct pmc_process *pp)
 }
 
 /*
- * Select a surviving authoritative target for a scheduling-anchor handoff.
- * Prefer the explicit edge if it still exists; otherwise any inherited edge
- * is equivalent.  pmc_sx exclusive serializes target removal and process
- * descriptor destruction while the returned edge is used.
+ * This function selects a surviving target for a scheduling-anchor handoff.
+ * Prefer the explicit edge if it exists.  If not, use any inherited edge.
+ * You must hold pmc_sx exclusive to call this function.
  */
 static struct pmu_group_target *
 pmu_group_replacement_target(pmu_group_t *pg, struct pmc_process *old_pp)
@@ -447,9 +446,9 @@ pmu_group_has_target(pmu_group_t *pg, struct pmc_process *pp)
 }
 
 /*
- * Allocate an unpublished authoritative target edge.  Publication is kept
- * separate so multi-process attach can complete every fallible allocation
- * and authorization check before making any edge visible.
+ * This function allocates a target edge, but does not publish it.
+ * Publication is a separate step.  This lets a multi-process attach finish
+ * every fallible check before any edge becomes visible.
  */
 struct pmu_group_target *
 pmu_group_target_alloc(pmu_group_t *pg, struct pmc_process *pp, bool explicit,
@@ -534,9 +533,10 @@ pmu_group_target_remove(struct pmu_group_target *pgt)
 }
 
 /*
- * Record a target reached through fork.  Allocation cannot sleep because a
- * fork cannot be failed; on failure the child is left wholly unmonitored for
- * this group and the caller records the miss.
+ * This function records a target reached through fork.
+ * The allocation must not sleep.  A fork must not fail.
+ * If the allocation fails, the child is not monitored for this group.
+ * The caller then records the miss.
  */
 static bool
 pmu_group_add_inherited(pmu_group_t *pg, struct pmc_process *pp)
@@ -618,7 +618,7 @@ pmu_group_inherit(struct pmc_process *ppold, struct pmc_process *ppnew,
 	ninherited = 0;
 	nmiss = 0;
 
-	/* Direct and inherited parents use the same authoritative target list. */
+	/* Direct parents and inherited parents share the same target list. */
 	LIST_FOREACH(pgt, &ppold->pp_pmu_targets, pgt_process_next) {
 		pg = pgt->pgt_group;
 		if (!pmu_group_follows_fork(pg))
@@ -627,11 +627,7 @@ pmu_group_inherit(struct pmc_process *ppold, struct pmc_process *ppnew,
 			ninherited++;
 			continue;
 		}
-		/*
-		 * Record the exact group that was missed by its leader handle,
-		 * so the caller can log one miss for this group rather than
-		 * reconstruct identity from an aggregate count.
-		 */
+		/* Record the missed group by its leader handle, for per-group logging. */
 		if (missed_leaders != NULL && nmiss < missed_capacity &&
 		    pg->pg_leader != NULL)
 			missed_leaders[nmiss] = pg->pg_leader->pe_pmc;
@@ -643,7 +639,7 @@ pmu_group_inherit(struct pmc_process *ppold, struct pmc_process *ppnew,
 	return (ninherited);
 }
 
-/* Remove every explicit or inherited group-target edge held by this process. */
+/* Remove every group-target edge held by pp.  This includes explicit and inherited edges. */
 void
 pmu_group_disinherit(struct pmc_process *pp)
 {
@@ -1399,8 +1395,8 @@ pmu_group_on_release(struct pmc *pm)
 }
 
 /*
- * Find saved sampling progress while pp_tdslock protects both the thread list
- * and the process-local residual list.
+ * This function finds saved sampling progress.
+ * pp_tdslock covers both the thread list and the residual list.
  */
 static struct pmu_thread_residual *
 pmu_thread_residual_find_locked(struct pmc_process *pp, pmu_event_t *pe,
@@ -1430,9 +1426,10 @@ pmu_thread_exists_locked(struct pmc_process *pp, lwpid_t tid)
 }
 
 /*
- * Publish or replace one saved value.  Candidate allocation occurs before
- * pp_tdslock because it is a spin lock.  Removing the thread descriptor first
- * on thread exit prevents a concurrent save from recreating stale state.
+ * This function publishes or replaces one saved value.
+ * pp_tdslock is a spin lock.  Allocate memory before you take this lock.
+ * On thread exit, remove the thread descriptor first.  This stops a
+ * concurrent save from creating stale state again.
  */
 static int
 pmu_event_set_thread_residual_impl(struct pmc *pm, struct pmc_process *pp,
@@ -1448,11 +1445,10 @@ pmu_event_set_thread_residual_impl(struct pmc *pm, struct pmc_process *pp,
 		return (EINVAL);
 
 	/*
-	 * A saved entry is kept when there is progress to preserve: a partial
-	 * count, or a pending overflow.  UNINITIALIZED means "no saved
-	 * progress" and removes any existing entry.  Value and state are
-	 * validated together so a zero count cannot masquerade as an overflow
-	 * or vice versa.
+	 * Keep an entry only for a partial count, or for a pending overflow.
+	 * The UNINITIALIZED state removes any existing entry.
+	 * Check the value and the state together.  This stops a zero value
+	 * from looking like an overflow, and stops the opposite case too.
 	 */
 	switch (state) {
 	case PMU_RESIDUAL_UNINITIALIZED:
@@ -1511,9 +1507,9 @@ pmu_event_set_thread_residual_impl(struct pmc *pm, struct pmc_process *pp,
 }
 
 /*
- * Save each target thread's progress independently.  Snapshot the transient
- * row-indexed values under pp_tdslock, then allocate stable entries after
- * dropping the spin lock.
+ * This function saves the progress of each target thread.
+ * First, take a snapshot of the row-indexed values under pp_tdslock.
+ * Then release the lock, and allocate the stable entries.
  */
 void
 pmu_event_save_residual(struct pmc *pm, struct pmc_process *pp, int ri)
@@ -1616,10 +1612,9 @@ pmu_event_restore_thread_residual(struct pmc *pm, struct pmc_process *pp,
 		ptr = pmu_thread_residual_find_locked(pp, pe,
 		    pt->pt_td->td_tid);
 		/*
-		 * A partial count resumes from where it left off.  A pending
-		 * overflow and a thread with no saved progress both reload a
-		 * full period: the overflow already produced its sample, so the
-		 * next window starts a fresh climb.
+		 * A partial count resumes from the saved point.
+		 * The overflow-pending state and the no-saved-progress state
+		 * both reload a full period.
 		 */
 		pt->pt_pmcs[ri].pt_pmcval =
 		    (ptr != NULL && ptr->ptr_state == PMU_RESIDUAL_COUNT_VALID) ?
@@ -2031,15 +2026,15 @@ pmu_group_detach_target(pmu_group_t *pg, struct pmc_process *pp)
 }
 
 /*
- * Detach one inherited (non-anchor) target from a group that stays alive for
- * its other targets.  Used when a credential-changing exec revokes one
- * descendant's authorization: the group is still owned by the same owner and
- * still monitors the anchor and any sibling descendants, so only this process's
- * edge and its transient row links are removed.
+ * This function detaches one inherited target from a group.  This target
+ * is not the anchor.  The group stays alive for its other targets.
+ * For example, use this function when a credential-changing exec revokes
+ * one descendant's authorization.  Only this process's edge and row links
+ * are removed.
  *
- * The group is briefly scheduled out from its real anchor so every target's row
- * links (including this one's) are dropped, this edge is removed, and the group
- * is placed again at the surviving anchor.
+ * The function briefly schedules the group out at its real anchor.  This
+ * drops every target's row links.  The function then removes this edge.
+ * Then the function puts the group back at the surviving anchor.
  */
 void
 pmu_group_detach_inherited_target(pmu_group_t *pg, struct pmc_process *pp)
@@ -2065,10 +2060,7 @@ pmu_group_detach_inherited_target(pmu_group_t *pg, struct pmc_process *pp)
 	was_assigned = pg->pg_assigned;
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 
-	/*
-	 * Quiesce the group at its anchor and drop every target's transient row
-	 * links, so removing this edge cannot strand a row-indexed reference.
-	 */
+	/* First, quiesce the group at the anchor.  Then drop every target's row links. */
 	if (anchor_pp != NULL) {
 		pmu_group_accounting_block(pg);
 		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
@@ -2082,9 +2074,8 @@ pmu_group_detach_inherited_target(pmu_group_t *pg, struct pmc_process *pp)
 	pmu_group_target_remove(pgt);
 
 	/*
-	 * Restore the group for its remaining targets.  pmu_group_target_remove
-	 * cleared pg_pp only if this edge had been the anchor, which it was not,
-	 * so the group is still linked at anchor_pp and can run again.
+	 * Restore the group for the remaining targets.
+	 * This edge was never the anchor, so pg_pp does not change.
 	 */
 	if (was_running) {
 		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
@@ -2480,10 +2471,9 @@ pmu_sys_group_drain_samples(int cpu, pmu_group_t *pg, u_int nmembers)
 }
 
 /*
- * Stop and drain the first nmembers rows before any row is unpublished or
- * reused.  This is shared by normal eviction and partial-start rollback.
- * pmc_sx remains held throughout, while the drain marker permits already
- * accepted samples to complete after the hardware row has stopped.
+ * This function stops and drains the first nmembers rows.
+ * Do this before you unpublish or reuse any row.
+ * Normal eviction and partial-start rollback both use this function.
  */
 static void
 pmu_sys_stop_rows(int cpu, pmu_group_t *pg, u_int nmembers)
@@ -2578,9 +2568,8 @@ pmu_sys_group_on_start(struct pmc *pm)
 		int sin_err;
 
 		/*
-		 * Publish system-sampling ownership before hardware can accept
-		 * the first sample.  Kernel mappings are emitted by pmc_start()
-		 * before this group-layer dispatch.
+		 * Publish system-sampling ownership before the hardware can
+		 * accept a sample.  pmc_start() already sent the kernel mappings.
 		 */
 		if (!pg->pg_sscounted && pmu_group_has_sampling(pg) &&
 		    pg->pg_owner != NULL) {
@@ -2615,7 +2604,7 @@ pmu_sys_group_on_start(struct pmc *pm)
 		pg->pg_sys_listed = true;
 	}
 
-	/* Publish the successful logical start for every stable group member. */
+	/* Publish the logical start for every member of the group. */
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
 		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
 

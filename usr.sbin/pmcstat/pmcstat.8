@@ -391,10 +391,10 @@ resident, not of the whole run.
 Sample counts are therefore never scaled.
 At the end of a run,
 .Nm
-warns when a sampling group was actually multiplexed and a member's
-sampling period is longer than a generous estimate of the events one
-rotation window can retire.
-A group that remained fully resident does not produce this warning.
+sends this warning if a multiplexed group has a sampling period that is
+longer than the event budget of one rotation window.
+.Nm
+does not send this warning for a fully resident group.
 .It Fl c Ar cpu-spec
 Set the cpus for subsequent system mode PMCs specified on the
 command line to

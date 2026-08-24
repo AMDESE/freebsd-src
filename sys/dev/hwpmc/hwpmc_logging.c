@@ -1096,10 +1096,8 @@ pmclog_process_pmcdetach(struct pmc *pm, pid_t pid)
 }
 
 /*
- * Record that a group could not follow a fork.  This is distinct from a
- * detach: the child edge was never attached, so emitting PMCDETACH here would
- * assert a lifecycle transition that never happened.  The leader handle plus
- * the child pid identify exactly which group was missed for which descendant.
+ * Record that a group did not follow a fork.
+ * This is not a detach.  The edge did not attach.  PMCDETACH is wrong here.
  */
 void
 pmclog_process_pmcgroupinheritmiss(struct pmc *pm, pid_t pid)

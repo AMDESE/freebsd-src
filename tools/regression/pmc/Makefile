@@ -25,8 +25,8 @@ SRCROOT?=	${.CURDIR}/../../..
 
 LIBPMC_SRC=	${SRCROOT}/lib/libpmc
 LIBPMC_INC=	-I${LIBPMC_SRC} -I${SRCROOT}/sys
-# Force the current log ABI without letting source sys headers shadow
-# installed headers reached through the C++ standard library.
+# Force the current log ABI.
+# Do not let the sys headers shadow the installed C++ standard library headers.
 CURRENT_PMCLOG_INC=	-include ${SRCROOT}/sys/sys/pmclog.h
 LIBPMCSTAT_SRC=	${SRCROOT}/lib/libpmcstat
 LIBPMCSTAT_INC=	-I${LIBPMCSTAT_SRC}

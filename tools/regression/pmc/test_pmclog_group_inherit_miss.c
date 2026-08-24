@@ -38,9 +38,10 @@ static int n_fail;
 } while (0)
 
 /*
- * pmclog.c references these event-name helpers from an unrelated parse case.
- * The synthetic record never calls them; local stubs keep this test linked to
- * the real parser translation unit without pulling in the rest of libpmc.
+ * These are stubs for event-name helpers.
+ * pmclog.c references these helpers, but this test never calls them.
+ * The stubs let this test link the real parser file without the rest
+ * of libpmc.
  */
 const char *
 _pmc_name_of_event(enum pmc_event event, enum pmc_cputype cpu)

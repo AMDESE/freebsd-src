@@ -1,7 +1,7 @@
 #!/bin/sh
 #
-# Verify that pmcstat warns about a long grouped sampling period only after
-# the group has actually spent enabled time off hardware.
+# Check that pmcstat sends the long-sampling-period warning only after
+# multiplexing starts.
 #
 
 set -u
@@ -60,10 +60,10 @@ run_case()
 	pass=$((pass + 1))
 }
 
-# Mutation caught: warning solely because brace syntax set PMC_F_GROUP_MUX.
+# This case catches a bug: the warning appears only because the braces set PMC_F_GROUP_MUX.
 run_case resident 100 100 0
 
-# Deleting the warning instead of conditioning it must fail this control.
+# This case catches a bug: the code deletes the warning instead of adding a condition to it.
 run_case multiplexed 100 50 2
 
 echo "Results: ${pass} pass, ${fail} fail"

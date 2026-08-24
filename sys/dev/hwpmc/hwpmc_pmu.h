@@ -29,10 +29,7 @@ enum pmc_flags {
 };
 
 #ifdef HWPMC_DEBUG
-/*
- * Test-only live-object and reference counters.  These are internal to the
- * hwpmc module and are exposed only by an HWPMC_DEBUG kernel.
- */
+/* These counters are for tests only.  They exist only in HWPMC_DEBUG builds. */
 enum pmc_test_counter {
 	PMC_TEST_LIVE_PMC_TARGETS,
 	PMC_TEST_LIVE_GROUP_TARGETS,
@@ -111,18 +108,18 @@ struct pmu_event {
 	struct pmc_op_pmcallocate	pe_alloc;
 	pmc_sched_constraint_t		pe_cons;
 	/*
-	 * System-mode progress toward the next sample, kept across eviction.
-	 * Virtual per-thread state is stored in pp_pmu_residuals instead.
-	 * Zero means "start from the reload count".
+	 * This field holds system-mode progress toward the next sample.
+	 * It keeps this value across eviction.
+	 * Virtual per-thread state is in pp_pmu_residuals instead.
+	 * A value of zero means: start from the reload count.
 	 */
 	pmc_value_t			pe_residual;
 };
 
 /*
- * Explicit saved-residual state.  A raw count of zero is ambiguous: a
- * down-counting sampling PMC reads zero both when it has overflowed and when
- * it has no saved progress.  The state is stored separately so the two are
- * never inferred from the value alone.
+ * This is the explicit residual state.
+ * A raw count of zero has two possible meanings: overflow, or no saved
+ * progress.  To remove this ambiguity, track the state in a separate field.
  */
 enum pmu_residual_state {
 	PMU_RESIDUAL_UNINITIALIZED = 0,	/* no saved progress; full reload */
@@ -131,9 +128,9 @@ enum pmu_residual_state {
 };
 
 /*
- * Saved virtual-thread sampling progress.  Hardware rows are transient, so
- * the stable key is the event plus target TID within one process descriptor.
- * The containing process's pp_tdslock protects this list and its entries.
+ * This struct holds saved sampling progress for one virtual thread.
+ * Hardware rows are not permanent, so use the event and the TID as the key.
+ * The process's pp_tdslock protects this data.
  */
 struct pmu_thread_residual {
 	LIST_ENTRY(pmu_thread_residual)	ptr_next;
@@ -144,14 +141,12 @@ struct pmu_thread_residual {
 };
 
 /*
- * One authoritative group-target edge.  Explicit and inherited targets use
- * the same representation.  Hardware-row links are transient and are not
- * stored here.
- *
- * Target-list mutations require pmc_sx exclusive.  When a process-tree
- * snapshot is also needed, lock order is:
- *
- *     pmc_sx -> proctree_lock -> pp_pmu_lock
+ * This struct holds one authoritative group-target edge.
+ * The edge can be explicit or inherited.
+ * This struct does not store hardware-row links.
+ * To change this data, hold pmc_sx exclusive.
+ * If you also need a process-tree snapshot, take the locks in this order:
+ * pmc_sx, then proctree_lock, then pp_pmu_lock.
  */
 struct pmu_group_target {
 	LIST_ENTRY(pmu_group_target)	pgt_group_next;	/* pg_targets */
@@ -197,9 +192,9 @@ struct pmu_group {
 	struct pmu_group_target		*pg_explicit_target;
 	struct pmc_process		*pg_pp;	/* current scheduling anchor */
 	/*
-	 * Authoritative target set.  pg_explicit_target, when non-NULL, points
-	 * to the user-requested edge in this list.  pg_pp is only the current
-	 * scheduling/rotation anchor and may identify an inherited target.
+	 * This is the authoritative target set.
+	 * If pg_explicit_target is not NULL, it is the user-requested edge
+	 * in this list.  pg_pp is only the current anchor.
 	 */
 	LIST_HEAD(, pmu_group_target)	pg_targets;
 	/* Virtual enabled and running times use thread ticks; wall uses TSC. */

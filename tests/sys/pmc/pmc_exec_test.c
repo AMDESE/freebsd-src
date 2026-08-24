@@ -5,12 +5,13 @@
  */
 
 /*
- * Credential-changing exec authorization for grouped process PMCs.
+ * This file tests exec authorization for grouped process PMCs, when the
+ * exec changes the credential.
  *
- * A setgid exec adds a group that is absent from the PMC owner's credential,
- * so pmc_can_attach() must reject the new credential.  A direct target is the
- * control for the exec hook.  The inherited cases prove that reauthorization
- * uses the authoritative group-target set and does not depend on residency.
+ * A setgid exec adds a group.  This group is not in the PMC owner's
+ * credential.  Because of this, pmc_can_attach() must reject the new
+ * credential.  The direct target is the control case.  The inherited
+ * cases prove that reauthorization uses the authoritative group-target set.
  */
 
 #include <sys/types.h>
