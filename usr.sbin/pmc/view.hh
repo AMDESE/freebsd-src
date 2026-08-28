@@ -310,10 +310,6 @@ struct ibsfetchinfo
 	uint64_t			extctl;
 	uint64_t			linaddr;
 	uint64_t			physaddr;
-	/* AMD Zen3 IBS errata overlay */
-	bool				icmiss_valid;      /* #1238 */
-	uint8_t				l1tlb_pgsz;        /* #1347 raw 2-bit code */
-	bool				l1tlb_pgsz_valid;  /* PhysAddrValid set */
 };
 
 struct ibsopinfo
@@ -328,10 +324,6 @@ struct ibsopinfo
 	uint64_t			physaddr;
 	uint64_t			tgtrip;
 	uint64_t			data4;
-	/* AMD Zen3 IBS erratum #1293 overlay */
-	bool				data2_valid;
-	bool				l2miss_valid;
-	bool				openmemreqs_valid;
 };
 
 class pmcview
@@ -409,7 +401,11 @@ protected:
 	std::string				buildid;
 	std::vector<pmcinfox>			extpmcinfo;
 	std::map<uint32_t, cpuidleaf>		cpuid; // x86 Only
-	bool					ibs_zen3_b0_errata = false;
+	// AMD IBS errata, one flag per erratum
+	bool					ibs_errata_1197 = false;
+	bool					ibs_errata_1238 = false;
+	bool					ibs_errata_1293 = false;
+	bool					ibs_errata_1347 = false;
 private:
 	image loadimage(const std::string &path);
 	void mapimage(pid_t pid, const image &im, uint64_t linkaddr);

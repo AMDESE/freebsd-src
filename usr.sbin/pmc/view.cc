@@ -53,23 +53,9 @@
 #include <unordered_set>
 
 #include <dev/hwpmc/hwpmc_ibs.h>
+#include "cpuid.hh"
 #include "util.hh"
 #include "view.hh"
-
-/*
- * CPUID leaf 1 eax decode, copied from machine/specialreg.h.  The values are
- * decoded from the log rather than the host CPU, so detection has to work on
- * any architecture pmc(1) is built for, not just x86.
- */
-#define	IBS_CPUID_VENDOR_AMD	"AuthenticAMD"
-#define	IBS_CPUID_MODEL		0x000000f0
-#define	IBS_CPUID_FAMILY	0x00000f00
-#define	IBS_CPUID_EXT_MODEL	0x000f0000
-#define	IBS_CPUID_EXT_FAMILY	0x0ff00000
-#define	IBS_CPUID_TO_MODEL(id) \
-    ((((id) & IBS_CPUID_MODEL) >> 4) | (((id) & IBS_CPUID_EXT_MODEL) >> 12))
-#define	IBS_CPUID_TO_FAMILY(id) \
-    ((((id) & IBS_CPUID_FAMILY) >> 8) + (((id) & IBS_CPUID_EXT_FAMILY) >> 20))
 
 std::string
 syminfo::to_string(bool show_line)
@@ -242,8 +228,12 @@ pmcview::process_cpuidinfo(int logfd, const pmchdr_infohdr &infohdr)
 		uint32_t sig = leaf1->second.eax;
 		if (strncmp(vstr, IBS_CPUID_VENDOR_AMD, 12) == 0 &&
 		    IBS_CPUID_TO_FAMILY(sig) == 0x19 &&
-		    IBS_CPUID_TO_MODEL(sig) <= 0x0F)
-			ibs_zen3_b0_errata = true;
+		    IBS_CPUID_TO_MODEL(sig) <= 0x0F) {
+			ibs_errata_1197 = true;
+			ibs_errata_1238 = true;
+			ibs_errata_1293 = true;
+			ibs_errata_1347 = true;
+		}
 	}
 
 	return 0;
@@ -791,7 +781,6 @@ pmcview::process(struct pmclog_ev_callchain &p)
 	uintfptr_t *cc = &p.pl_pc[1];
 	ibsfetchinfo ibsf;
 	ibsopinfo ibso;
-	bool trig, inval;
 
 	/*
 	 * Callchain events are always attributed to one of the kernel
@@ -814,13 +803,6 @@ pmcview::process(struct pmclog_ev_callchain &p)
 				ibsf.extctl = cc[PMC_MPIDX_FETCH_EXTCTL];
 				ibsf.linaddr = cc[PMC_MPIDX_FETCH_LINADDR];
 				ibsf.physaddr = cc[PMC_MPIDX_FETCH_PHYSADDR];
-				/* AMD Zen3 IBS errata overlay */
-				ibsf.icmiss_valid =
-				    !ibs_zen3_b0_errata;              /* #1238 */
-				ibsf.l1tlb_pgsz =
-				    IBS_FETCH_CTL_TO_PGSZ(ibsf.ctl);   /* #1347 */
-				ibsf.l1tlb_pgsz_valid =
-				    (ibsf.ctl & IBS_FETCH_CTL_PHYSADDRVALID) != 0;
 				break;
 			case PMC_CC_MULTIPART_IBS_OP:
 				ibso.len = len;
@@ -833,18 +815,6 @@ pmcview::process(struct pmclog_ev_callchain &p)
 				ibso.physaddr = cc[PMC_MPIDX_OP_DC_PHYSADDR];
 				ibso.tgtrip = cc[PMC_MPIDX_OP_TGT_RIP];
 				ibso.data4 = cc[PMC_MPIDX_OP_DATA4];
-				/*
-				 * AMD Zen3 IBS erratum #1293 overlay.  No view
-				 * consumes these flags yet; the first op-side
-				 * view must honour them.
-				 */
-				trig = (ibso.data3 &
-				    (IBS_OP_DATA3_PREFETCH |
-				    IBS_OP_DATA3_DCMISSNOMABALLOC)) != 0;
-				inval = ibs_zen3_b0_errata && trig;
-				ibso.data2_valid = !inval;
-				ibso.l2miss_valid = !inval;
-				ibso.openmemreqs_valid = !inval;
 				break;
 			}
 
@@ -899,12 +869,19 @@ pmcview::process(struct pmclog_ev_callchain &p)
 	// Advanced filters for AMD IBS
 	if (ibsf.len) {
 		/* Erratum #1197: ignore fetch samples with zero linear addr. */
-		if (ibs_zen3_b0_errata && ibsf.linaddr == 0)
+		if (ibs_errata_1197 && ibsf.linaddr == 0)
 			return;
 		if (filter.ibs_ldlat > IBS_FETCH_CTL_TO_LAT(ibsf.ctl))
 			return;
 		callchain(p, ibsf, cc, len);
 	} else if (ibso.len) {
+		/* Erratum #1293: zero fields that are unreliable on Zen3-B0. */
+		if (ibs_errata_1293 && (ibso.data3 & (IBS_OP_DATA3_PREFETCH |
+		    IBS_OP_DATA3_DCMISSNOMABALLOC)) != 0) {
+			ibso.data2 = 0;
+			ibso.data3 &= ~(IBS_OP_DATA3_L2MISS |
+			    IBS_OP_DATA3_OPENMEMREQS_MASK);
+		}
 		if (filter.ibs_oplat > IBS_OP_DATA_TO_COMPTORET(ibso.data))
 			return;
 		if (filter.ibs_ldlat > IBS_OP_DATA3_TO_DCLAT(ibso.data3))

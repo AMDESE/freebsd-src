@@ -220,6 +220,7 @@
 #define IBS_OP_DATA3_PGSZ(_d)		(((_d) >> 4) & 0x3)
 #define IBS_OP_DATA3_TO_TLBREFILLLAT(_c) (((_c) >> 48) & 0x0000ffff)
 #define IBS_OP_DATA3_TO_OPENMEMREQS(_c)	(((_c) >> 26) & 0x003f)
+#define IBS_OP_DATA3_OPENMEMREQS_MASK	(0x003fULL << 26) /* Open Mem Reqs field */
 
 #define IBSOPDATA2_VALIDMASK		(IBS_OP_DATA3_LOAD | IBS_OP_DATA3_DCMISS | IBS_OP_DATA3_L2MISS)
 
