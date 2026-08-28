@@ -401,6 +401,11 @@ protected:
 	std::string				buildid;
 	std::vector<pmcinfox>			extpmcinfo;
 	std::map<uint32_t, cpuidleaf>		cpuid; // x86 Only
+	// AMD IBS errata, one flag per erratum
+	bool					ibs_errata_1197 = false;
+	bool					ibs_errata_1238 = false;
+	bool					ibs_errata_1293 = false;
+	bool					ibs_errata_1347 = false;
 private:
 	image loadimage(const std::string &path);
 	void mapimage(pid_t pid, const image &im, uint64_t linkaddr);
