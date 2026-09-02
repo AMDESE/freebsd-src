@@ -36,10 +36,12 @@ CXXFLAGS+=	-O -g -Wall
 
 # Kernel ABI tests (need hwpmc(4) loaded and root to run).
 KTESTS=		pmc_group_test pmc_mux_test pmc_mux_works_test \
-		pmc_mux_rotation_test pmc_mux_drain_test pmc_group_fuzz
+		pmc_mux_drain_test pmc_mux_rotation_test pmc_group_fuzz
 
 # Userland-only tests (no PMU access).
-UTESTS=		test_libpmcstat_group \
+UTESTS=		test_libpmcstat_group test_pmclog_group_inherit_miss \
+		test_pmclog_group_inherit_miss_json \
+		pmcstat_group_inherit_miss_fixture \
 		pmcstat_mux_warning_shim.so
 
 PMCSTAT?=	/usr/sbin/pmcstat
@@ -59,12 +61,6 @@ pmc_mux_test: ${.CURDIR}/pmc_mux_test.c
 pmc_mux_works_test: ${.CURDIR}/pmc_mux_works_test.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
 
-# libpmcstat is INTERNALLIB. It has no .so file installed. Build the
-# parser TU directly into the test binary.
-test_libpmcstat_group: ${.CURDIR}/test_libpmcstat_group.c \
-		${LIBPMCSTAT_SRC}/libpmcstat_group.c
-	${CC} ${CFLAGS} ${LIBPMCSTAT_INC} -o ${.TARGET} ${.ALLSRC} -lpmc
-
 pmc_mux_rotation_test: ${.CURDIR}/pmc_mux_rotation_test.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
 
@@ -77,6 +73,27 @@ pmc_mux_drain_test: ${.CURDIR}/pmc_mux_drain_test.c
 pmc_group_fuzz: ${.CURDIR}/pmc_group_fuzz.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
 
+# libpmcstat is INTERNALLIB. It has no .so file installed. Build the
+# parser TU directly into the test binary.
+test_libpmcstat_group: ${.CURDIR}/test_libpmcstat_group.c \
+		${LIBPMCSTAT_SRC}/libpmcstat_group.c
+	${CC} ${CFLAGS} ${LIBPMCSTAT_INC} -o ${.TARGET} ${.ALLSRC} -lpmc
+
+test_pmclog_group_inherit_miss: \
+		${.CURDIR}/test_pmclog_group_inherit_miss.c \
+		${LIBPMC_SRC}/pmclog.c
+	${CC} ${CFLAGS} -Wno-pointer-sign ${LIBPMC_INC} -o ${.TARGET} ${.ALLSRC}
+
+test_pmclog_group_inherit_miss_json: \
+		${.CURDIR}/test_pmclog_group_inherit_miss_json.cc \
+		${LIBPMC_SRC}/libpmc_json.cc
+	${CXX} ${CXXFLAGS} -I${LIBPMC_SRC} ${CURRENT_PMCLOG_INC} \
+	    -o ${.TARGET} ${.ALLSRC}
+
+pmcstat_group_inherit_miss_fixture: \
+		${.CURDIR}/pmcstat_group_inherit_miss_fixture.c
+	${CC} ${CFLAGS} ${CURRENT_PMCLOG_INC} -o ${.TARGET} ${.ALLSRC}
+
 pmcstat_mux_warning_shim.so: ${.CURDIR}/pmcstat_mux_warning_shim.c
 	${CC} ${CFLAGS} -fPIC -shared ${LIBPMCSTAT_INC} \
 	    -I${SRCROOT}/sys -o ${.TARGET} ${.ALLSRC}
@@ -84,6 +101,11 @@ pmcstat_mux_warning_shim.so: ${.CURDIR}/pmcstat_mux_warning_shim.c
 # These are userland-only checks: parsers and pmcstat warning policy.
 check: ${UTESTS}
 	./test_libpmcstat_group
+	./test_pmclog_group_inherit_miss
+	./test_pmclog_group_inherit_miss_json
+	PMCSTAT=${PMCSTAT} \
+	    PMCGROUP_MISS_FIXTURE=${.CURDIR}/pmcstat_group_inherit_miss_fixture \
+	    sh ${.CURDIR}/pmcstat_group_inherit_miss_test.sh
 	PMCSTAT=${PMCSTAT} \
 	    PMCSTAT_WARNING_SHIM=${.CURDIR}/pmcstat_mux_warning_shim.so \
 	    sh ${.CURDIR}/pmcstat_mux_warning_test.sh
@@ -102,6 +124,10 @@ check-root: ${KTESTS}
 	./pmc_mux_drain_test
 	@echo "==> pmc_group_fuzz"
 	./pmc_group_fuzz 20000
+	@if [ -r ${.CURDIR}/pmcstat_test.sh ]; then \
+		echo "==> pmcstat(8) shell tests"; \
+		sh ${.CURDIR}/pmcstat_test.sh; \
+	fi
 
 clean:
 	rm -f ${ALL} *.o *.core
