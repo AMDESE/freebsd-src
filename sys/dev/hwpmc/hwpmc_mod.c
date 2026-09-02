@@ -198,6 +198,13 @@ static struct pmc_classdep **pmc_rowindex_to_classdep;
 #ifdef HWPMC_DEBUG
 static int	pmc_debugflags_sysctl_handler(SYSCTL_HANDLER_ARGS);
 static int	pmc_debugflags_parse(char *newstr, char *fence);
+static int	pmc_test_gate_sysctl_handler(SYSCTL_HANDLER_ARGS);
+static int	pmc_test_handle_failpoint_sysctl_handler(SYSCTL_HANDLER_ARGS);
+static int	pmc_test_group_state_sysctl_handler(SYSCTL_HANDLER_ARGS);
+static int	pmc_test_inject_kernel_sample_sysctl_handler(
+		    SYSCTL_HANDLER_ARGS);
+static int	pmc_test_residual_state_sysctl_handler(SYSCTL_HANDLER_ARGS);
+static int	pmc_test_sample_counts_sysctl_handler(SYSCTL_HANDLER_ARGS);
 #endif
 
 static void	pmc_multipart_add(struct pmc_sample *ps, int type,
@@ -338,14 +345,723 @@ SYSCTL_STRING(_kern_hwpmc, OID_AUTO, cpuid, CTLFLAG_RD,
     "cpu version string");
 
 #ifdef HWPMC_DEBUG
+struct pmc_test_gate {
+	u_int	ptg_request;
+	u_int	ptg_ack;
+};
+
+struct pmc_test_handle_failpoint {
+	u_int	pth_request;
+	u_int	pth_ack;
+};
+
+struct pmc_test_sample_counts {
+	uint64_t	ptsc_handle;
+	uint32_t	ptsc_pid;
+	uint32_t	ptsc_tid;
+	uint64_t	ptsc_accepted;
+	uint64_t	ptsc_emitted;
+	uint64_t	ptsc_dropped;
+	uint64_t	ptsc_run_refs;
+};
+
+struct pmc_test_group_state {
+	uint64_t	ptgs_handle;
+	uint32_t	ptgs_running;
+	uint32_t	ptgs_assigned;
+	uint32_t	ptgs_sys_listed;
+	uint32_t	ptgs_sscounted;
+	uint32_t	ptgs_nevents;
+	uint32_t	ptgs_running_members;
+	uint32_t	ptgs_stopped_members;
+	uint32_t	ptgs_allocated_members;
+};
+
+enum pmc_test_residual_operation {
+	PMC_TEST_RESIDUAL_GET_SAVED = 1,
+	PMC_TEST_RESIDUAL_GET_LIVE,
+	PMC_TEST_RESIDUAL_SET_LIVE,
+	PMC_TEST_RESIDUAL_SET_SAVED
+};
+
+enum pmc_test_residual_kind {
+	PMC_TEST_RESIDUAL_UNINITIALIZED,
+	PMC_TEST_RESIDUAL_VALID,
+	PMC_TEST_RESIDUAL_OVERFLOW_PENDING
+};
+
+struct pmc_test_residual_query {
+	uint64_t	ptrq_handle;
+	uint64_t	ptrq_value;
+	uint32_t	ptrq_pid;
+	uint32_t	ptrq_tid;
+	uint32_t	ptrq_operation;
+	uint32_t	ptrq_state;
+	uint32_t	ptrq_assigned;
+	uint32_t	ptrq_reserved;
+};
+
 struct pmc_debugflags pmc_debugflags = PMC_DEBUG_DEFAULT_FLAGS;
 char	pmc_debugstr[PMC_DEBUG_STRSIZE];
+static counter_u64_t pmc_test_counters[PMC_TEST_COUNTER_COUNT];
+static u_int pmc_test_failpoints[PMC_TEST_FAILPOINT_COUNT];
+static struct pmc_test_gate pmc_test_hold_resident;
+static struct pmc_test_gate pmc_test_hold_evicted;
+static struct pmc_test_gate pmc_test_pause_descendants;
+static struct pmc_test_gate pmc_test_descendants_exit;
+static struct pmc_test_gate pmc_test_pause_system_start;
+static struct pmc_test_gate pmc_test_pause_sample;
+static struct pmc_test_handle_failpoint pmc_test_fail_callchain_log;
+static u_int pmc_test_pause_descendants_targets;
+static u_int pmc_test_pause_system_start_count;
+static u_int pmc_test_pause_sample_schedule_out_ack;
+
 TUNABLE_STR(PMC_SYSCTL_NAME_PREFIX "debugflags", pmc_debugstr,
     sizeof(pmc_debugstr));
 SYSCTL_PROC(_kern_hwpmc, OID_AUTO, debugflags,
     CTLTYPE_STRING | CTLFLAG_RWTUN | CTLFLAG_NOFETCH | CTLFLAG_MPSAFE,
     0, 0, pmc_debugflags_sysctl_handler, "A",
     "debug flags");
+
+SYSCTL_NODE(_kern_hwpmc, OID_AUTO, test, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "HWPMC deterministic test support");
+SYSCTL_COUNTER_U64(_kern_hwpmc_test, OID_AUTO, live_pmc_targets, CTLFLAG_RD,
+    &pmc_test_counters[PMC_TEST_LIVE_PMC_TARGETS],
+    "live pmc_target objects");
+SYSCTL_COUNTER_U64(_kern_hwpmc_test, OID_AUTO, live_group_targets, CTLFLAG_RD,
+    &pmc_test_counters[PMC_TEST_LIVE_GROUP_TARGETS],
+    "live pmu_group_target objects");
+SYSCTL_COUNTER_U64(_kern_hwpmc_test, OID_AUTO, live_target_processes,
+    CTLFLAG_RD, &pmc_test_counters[PMC_TEST_LIVE_TARGET_PROCESSES],
+    "live target pmc_process descriptors");
+SYSCTL_COUNTER_U64(_kern_hwpmc_test, OID_AUTO, live_residual_entries,
+    CTLFLAG_RD, &pmc_test_counters[PMC_TEST_LIVE_RESIDUAL_ENTRIES],
+    "live saved per-thread residual entries");
+SYSCTL_COUNTER_U64(_kern_hwpmc_test, OID_AUTO, live_rotation_refs, CTLFLAG_RD,
+    &pmc_test_counters[PMC_TEST_LIVE_ROTATION_REFS],
+    "active rotation references");
+SYSCTL_COUNTER_U64(_kern_hwpmc_test, OID_AUTO, live_run_refs, CTLFLAG_RD,
+    &pmc_test_counters[PMC_TEST_LIVE_RUN_REFS],
+    "nonzero PMC run-count references");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, fail_group_target_alloc_after,
+    CTLFLAG_RW, &pmc_test_failpoints[PMC_TEST_FAIL_GROUP_TARGET_ALLOC], 0,
+    "allow N group-target allocations, then fail one; UINT_MAX disables");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, fail_target_link_alloc_after,
+    CTLFLAG_RW, &pmc_test_failpoints[PMC_TEST_FAIL_TARGET_LINK_ALLOC], 0,
+    "allow N target-link allocations, then fail one; UINT_MAX disables");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, fail_attach_authorization_after,
+    CTLFLAG_RW, &pmc_test_failpoints[PMC_TEST_FAIL_ATTACH_AUTHORIZATION], 0,
+    "allow N target authorizations, then fail one; UINT_MAX disables");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, fail_system_start_after,
+    CTLFLAG_RW, &pmc_test_failpoints[PMC_TEST_FAIL_SYSTEM_START], 0,
+    "allow N system-group member starts, then fail one; UINT_MAX disables");
+SYSCTL_PROC(_kern_hwpmc_test, OID_AUTO, hold_group_resident,
+    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE, &pmc_test_hold_resident, 0,
+    pmc_test_gate_sysctl_handler, "IU",
+    "group ID to keep resident; zero disables");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, hold_group_resident_ack, CTLFLAG_RD,
+    &pmc_test_hold_resident.ptg_ack, 0,
+    "group ID observed resident and held");
+SYSCTL_PROC(_kern_hwpmc_test, OID_AUTO, hold_group_evicted,
+    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE, &pmc_test_hold_evicted, 0,
+    pmc_test_gate_sysctl_handler, "IU",
+    "group ID to keep evicted; zero disables");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, hold_group_evicted_ack, CTLFLAG_RD,
+    &pmc_test_hold_evicted.ptg_ack, 0,
+    "group ID observed evicted and held");
+SYSCTL_PROC(_kern_hwpmc_test, OID_AUTO, pause_descendants_attach,
+    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE, &pmc_test_pause_descendants, 0,
+    pmc_test_gate_sysctl_handler, "IU",
+    "group ID to pause after descendant enumeration; zero releases");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, pause_descendants_attach_ack,
+    CTLFLAG_RD, &pmc_test_pause_descendants.ptg_ack, 0,
+    "group ID paused after descendant enumeration");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, pause_descendants_target_count,
+    CTLFLAG_RD, &pmc_test_pause_descendants_targets, 0,
+    "number of targets in the paused descendants snapshot");
+SYSCTL_PROC(_kern_hwpmc_test, OID_AUTO, descendants_exit_pid,
+    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE, &pmc_test_descendants_exit, 0,
+    pmc_test_gate_sysctl_handler, "IU",
+    "pid whose process-exit entry should be acknowledged; zero disables");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, descendants_exit_ack, CTLFLAG_RD,
+    &pmc_test_descendants_exit.ptg_ack, 0,
+    "pid observed after the process-exit P_HWPMC snapshot");
+SYSCTL_PROC(_kern_hwpmc_test, OID_AUTO, pause_system_start_after_first,
+    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+    &pmc_test_pause_system_start, 0, pmc_test_gate_sysctl_handler, "IU",
+    "group ID to pause after its first system member starts; zero releases");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, pause_system_start_after_first_ack,
+    CTLFLAG_RD, &pmc_test_pause_system_start.ptg_ack, 0,
+    "group ID paused after its first system member started");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, pause_system_start_member_count,
+    CTLFLAG_RD, &pmc_test_pause_system_start_count, 0,
+    "number of system-group members started at the pause");
+SYSCTL_PROC(_kern_hwpmc_test, OID_AUTO, pause_sample_worker,
+    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE, &pmc_test_pause_sample, 0,
+    pmc_test_gate_sysctl_handler, "IU",
+    "group ID whose accepted sample worker is paused; zero releases");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, pause_sample_worker_ack, CTLFLAG_RD,
+    &pmc_test_pause_sample.ptg_ack, 0,
+    "group ID with an accepted sample held before worker consumption");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, pause_sample_schedule_out_ack,
+    CTLFLAG_RD, &pmc_test_pause_sample_schedule_out_ack, 0,
+    "paused-sample group ID observed in system schedule-out");
+SYSCTL_PROC(_kern_hwpmc_test, OID_AUTO, fail_callchain_log_handle,
+    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+    &pmc_test_fail_callchain_log, 0,
+    pmc_test_handle_failpoint_sysctl_handler, "IU",
+    "PMC handle whose next callchain log reservation fails");
+SYSCTL_UINT(_kern_hwpmc_test, OID_AUTO, fail_callchain_log_handle_ack,
+    CTLFLAG_RD, &pmc_test_fail_callchain_log.pth_ack, 0,
+    "PMC handle whose callchain log reservation was failed");
+SYSCTL_PROC(_kern_hwpmc_test, OID_AUTO, sample_counts,
+    CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_MPSAFE, 0, 0,
+    pmc_test_sample_counts_sysctl_handler, "S,pmc_test_sample_counts",
+    "write a PMC handle and read accepted/emitted/dropped sample counts");
+SYSCTL_PROC(_kern_hwpmc_test, OID_AUTO, inject_kernel_sample,
+    CTLTYPE_U64 | CTLFLAG_WR | CTLFLAG_MPSAFE, 0, 0,
+    pmc_test_inject_kernel_sample_sysctl_handler, "QU",
+    "write a sampling PMC handle to emit one kernel-mode callchain record");
+SYSCTL_PROC(_kern_hwpmc_test, OID_AUTO, group_state,
+    CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_MPSAFE, 0, 0,
+    pmc_test_group_state_sysctl_handler, "S,pmc_test_group_state",
+    "write a leader handle and read logical and resident group state");
+SYSCTL_PROC(_kern_hwpmc_test, OID_AUTO, residual_state,
+    CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_MPSAFE, 0, 0,
+    pmc_test_residual_state_sysctl_handler, "S,pmc_test_residual_query",
+    "write a sampling handle, PID, TID, and operation to inspect or inject "
+    "test residual state");
+
+static int
+pmc_test_gate_sysctl_handler(SYSCTL_HANDLER_ARGS)
+{
+	struct pmc_test_gate *gate;
+	u_int value;
+	int error;
+
+	gate = arg1;
+	value = atomic_load_acq_int(&gate->ptg_request);
+	error = sysctl_handle_32(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+
+	atomic_store_rel_int(&gate->ptg_ack, 0);
+	if (gate == &pmc_test_pause_descendants)
+		atomic_store_rel_int(&pmc_test_pause_descendants_targets, 0);
+	if (gate == &pmc_test_pause_system_start)
+		atomic_store_rel_int(&pmc_test_pause_system_start_count, 0);
+	if (gate == &pmc_test_pause_sample)
+		atomic_store_rel_int(&pmc_test_pause_sample_schedule_out_ack, 0);
+	atomic_store_rel_int(&gate->ptg_request, value);
+	wakeup(&gate->ptg_request);
+	return (0);
+}
+
+static int
+pmc_test_handle_failpoint_sysctl_handler(SYSCTL_HANDLER_ARGS)
+{
+	struct pmc_test_handle_failpoint *failpoint;
+	u_int value;
+	int error;
+
+	failpoint = arg1;
+	value = atomic_load_acq_int(&failpoint->pth_request);
+	error = sysctl_handle_32(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+
+	atomic_store_rel_int(&failpoint->pth_ack, PMC_ID_INVALID);
+	atomic_store_rel_int(&failpoint->pth_request, value);
+	return (0);
+}
+
+void
+pmc_test_counter_add(enum pmc_test_counter counter, int64_t delta)
+{
+
+	KASSERT((u_int)counter < PMC_TEST_COUNTER_COUNT,
+	    ("invalid hwpmc test counter %d", counter));
+	counter_u64_add(pmc_test_counters[counter], delta);
+}
+
+bool
+pmc_test_should_fail(enum pmc_test_failpoint failpoint)
+{
+	u_int value;
+
+	KASSERT((u_int)failpoint < PMC_TEST_FAILPOINT_COUNT,
+	    ("invalid hwpmc test failpoint %d", failpoint));
+	if ((u_int)failpoint >= PMC_TEST_FAILPOINT_COUNT)
+		return (false);
+
+	for (;;) {
+		value = atomic_load_acq_int(&pmc_test_failpoints[failpoint]);
+		if (value == UINT_MAX)
+			return (false);
+		if (value == 0) {
+			if (atomic_cmpset_int(&pmc_test_failpoints[failpoint], 0,
+			    UINT_MAX))
+				return (true);
+			continue;
+		}
+		if (atomic_cmpset_int(&pmc_test_failpoints[failpoint], value,
+		    value - 1))
+			return (false);
+	}
+}
+
+static bool
+pmc_test_group_gate_match(struct pmc_test_gate *gate, pmu_group_t *pg,
+    bool assigned)
+{
+	u_int group_id;
+
+	if (pg == NULL || pg->pg_assigned != assigned)
+		return (false);
+	group_id = atomic_load_acq_int(&gate->ptg_request);
+	if (group_id == 0 || group_id != pg->pg_id)
+		return (false);
+	atomic_store_rel_int(&gate->ptg_ack, group_id);
+	return (true);
+}
+
+bool
+pmc_test_group_hold_resident(pmu_group_t *pg)
+{
+
+	return (pmc_test_group_gate_match(&pmc_test_hold_resident, pg, true));
+}
+
+bool
+pmc_test_group_hold_evicted(pmu_group_t *pg)
+{
+
+	return (pmc_test_group_gate_match(&pmc_test_hold_evicted, pg, false));
+}
+
+void
+pmc_test_descendants_attach_pause(pmu_group_t *pg, u_int ntargets)
+{
+	u_int group_id;
+	int remaining;
+
+	if (pg == NULL)
+		return;
+	group_id = atomic_load_acq_int(&pmc_test_pause_descendants.ptg_request);
+	if (group_id == 0 || group_id != pg->pg_id)
+		return;
+
+	atomic_store_rel_int(&pmc_test_pause_descendants_targets, ntargets);
+	atomic_store_rel_int(&pmc_test_pause_descendants.ptg_ack, group_id);
+	remaining = 30 * hz;
+	while (atomic_load_acq_int(
+	    &pmc_test_pause_descendants.ptg_request) == group_id &&
+	    remaining > 0) {
+		(void)tsleep(&pmc_test_pause_descendants.ptg_request, 0,
+		    "pmctatt", hz);
+		remaining -= hz;
+	}
+	if (remaining == 0)
+		(void)atomic_cmpset_int(&pmc_test_pause_descendants.ptg_request,
+		    group_id, 0);
+}
+
+void
+pmc_test_descendants_exit_observed(struct proc *p)
+{
+	u_int pid;
+
+	pid = atomic_load_acq_int(&pmc_test_descendants_exit.ptg_request);
+	if (pid != 0 && pid == (u_int)p->p_pid)
+		atomic_store_rel_int(&pmc_test_descendants_exit.ptg_ack, pid);
+}
+
+void
+pmc_test_system_start_pause(pmu_group_t *pg, u_int nstarted)
+{
+	u_int group_id;
+	int remaining;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	if (pg == NULL || nstarted != 1)
+		return;
+	group_id =
+	    atomic_load_acq_int(&pmc_test_pause_system_start.ptg_request);
+	if (group_id == 0 || group_id != pg->pg_id)
+		return;
+
+	atomic_store_rel_int(&pmc_test_pause_system_start_count, nstarted);
+	atomic_store_rel_int(&pmc_test_pause_system_start.ptg_ack, group_id);
+	remaining = 30 * hz;
+	while (atomic_load_acq_int(
+	    &pmc_test_pause_system_start.ptg_request) == group_id &&
+	    remaining > 0) {
+		(void)sx_sleep(&pmc_test_pause_system_start.ptg_request, &pmc_sx,
+		    0, "pmctsst", hz);
+		remaining -= hz;
+	}
+	if (remaining == 0)
+		(void)atomic_cmpset_int(
+		    &pmc_test_pause_system_start.ptg_request, group_id, 0);
+}
+
+void
+pmc_test_sample_accepted(struct pmc *pm, uint32_t pid, uint32_t tid)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	u_int group_id;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || pe->pe_group == NULL)
+		return;
+	pg = pe->pe_group;
+	group_id = atomic_load_acq_int(&pmc_test_pause_sample.ptg_request);
+	if (group_id != 0 && group_id == pg->pg_id) {
+		atomic_store_rel_int(&pe->pe_test_sample_pid, pid);
+		atomic_store_rel_int(&pe->pe_test_sample_tid, tid);
+		atomic_store_rel_int(&pmc_test_pause_sample.ptg_ack, group_id);
+	}
+}
+
+bool
+pmc_test_sample_worker_paused(struct pmc *pm)
+{
+	pmu_group_t *pg;
+	u_int group_id;
+
+	pg = pmu_group_from_pmc(pm);
+	if (pg == NULL)
+		return (false);
+	group_id = atomic_load_acq_int(&pmc_test_pause_sample.ptg_request);
+	return (group_id != 0 && group_id == pg->pg_id &&
+	    atomic_load_acq_int(&pmc_test_pause_sample.ptg_ack) == group_id);
+}
+
+void
+pmc_test_sample_schedule_out(pmu_group_t *pg)
+{
+	u_int group_id;
+
+	if (pg == NULL)
+		return;
+	group_id = atomic_load_acq_int(&pmc_test_pause_sample.ptg_request);
+	if (group_id != 0 && group_id == pg->pg_id &&
+	    atomic_load_acq_int(&pmc_test_pause_sample.ptg_ack) == group_id)
+		atomic_store_rel_int(&pmc_test_pause_sample_schedule_out_ack,
+		    group_id);
+}
+
+bool
+pmc_test_callchain_log_should_fail(struct pmc *pm)
+{
+	u_int handle;
+
+	handle = pm->pm_handle;
+	if (handle == PMC_ID_INVALID ||
+	    atomic_load_acq_int(&pmc_test_fail_callchain_log.pth_request) !=
+	    handle)
+		return (false);
+	if (!atomic_cmpset_int(&pmc_test_fail_callchain_log.pth_request,
+	    handle, PMC_ID_INVALID))
+		return (false);
+	atomic_store_rel_int(&pmc_test_fail_callchain_log.pth_ack, handle);
+	return (true);
+}
+
+void
+pmc_test_sample_dropped(struct pmc *pm)
+{
+	pmu_event_t *pe;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe != NULL)
+		counter_u64_add(pe->pe_samples_dropped, 1);
+}
+
+void
+pmc_test_sample_done(struct pmc *pm, bool emitted)
+{
+	pmu_event_t *pe;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL)
+		return;
+	counter_u64_add(emitted ? pe->pe_samples_emitted :
+	    pe->pe_samples_dropped, 1);
+}
+
+static int
+pmc_test_inject_kernel_sample_sysctl_handler(SYSCTL_HANDLER_ARGS)
+{
+	struct pmc_sample sample;
+	struct pmc *pm;
+	uintptr_t pc;
+	uint64_t handle;
+	int error;
+
+	if (req->newptr == NULL || req->newlen != sizeof(handle))
+		return (EINVAL);
+	error = SYSCTL_IN(req, &handle, sizeof(handle));
+	if (error != 0)
+		return (error);
+	if ((uint64_t)(pmc_id_t)handle != handle)
+		return (EINVAL);
+
+	sx_xlock(&pmc_sx);
+	error = pmc_find_pmc((pmc_id_t)handle, &pm);
+	if (error == 0 &&
+	    (!PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)) ||
+	    pm->pm_state != PMC_STATE_RUNNING ||
+	    pm->pm_owner == NULL ||
+	    (pm->pm_owner->po_flags & PMC_PO_OWNS_LOGFILE) == 0))
+		error = EINVAL;
+	if (error == 0) {
+		pc = (uintptr_t)pmc_test_inject_kernel_sample_sysctl_handler;
+		memset(&sample, 0, sizeof(sample));
+		sample.ps_nsamples = 1;
+		sample.ps_tid = 0;
+		sample.ps_pid = -1;
+		sample.ps_td = curthread;
+		sample.ps_pmc = pm;
+		sample.ps_pc = &pc;
+		spinlock_enter();
+		sample.ps_cpu = curcpu;
+		sample.ps_tsc = pmc_rdtsc();
+		if (!pmclog_process_callchain(pm, &sample))
+			error = ENOMEM;
+		spinlock_exit();
+	}
+	sx_xunlock(&pmc_sx);
+	return (error);
+}
+
+static int
+pmc_test_sample_counts_sysctl_handler(SYSCTL_HANDLER_ARGS)
+{
+	struct pmc_test_sample_counts counts;
+	pmu_event_t *pe;
+	struct pmc *pm;
+	uint64_t handle;
+	int error;
+
+	if (req->newptr == NULL || req->newlen != sizeof(handle))
+		return (EINVAL);
+	error = SYSCTL_IN(req, &handle, sizeof(handle));
+	if (error != 0)
+		return (error);
+	if ((uint64_t)(pmc_id_t)handle != handle)
+		return (EINVAL);
+
+	memset(&counts, 0, sizeof(counts));
+	sx_xlock(&pmc_sx);
+	error = pmc_find_pmc((pmc_id_t)handle, &pm);
+	if (error == 0) {
+		pe = pmu_event_from_pmc(pm);
+		if (pe == NULL)
+			error = EINVAL;
+		else {
+			counts.ptsc_handle = pm->pm_handle;
+			counts.ptsc_pid =
+			    atomic_load_acq_int(&pe->pe_test_sample_pid);
+			counts.ptsc_tid =
+			    atomic_load_acq_int(&pe->pe_test_sample_tid);
+			counts.ptsc_accepted = counter_u64_fetch(pe->pe_samples);
+			counts.ptsc_emitted =
+			    counter_u64_fetch(pe->pe_samples_emitted);
+			counts.ptsc_dropped =
+			    counter_u64_fetch(pe->pe_samples_dropped);
+			counts.ptsc_run_refs =
+			    counter_u64_fetch(pm->pm_runcount);
+		}
+	}
+	sx_xunlock(&pmc_sx);
+	if (error != 0)
+		return (error);
+	return (SYSCTL_OUT(req, &counts, sizeof(counts)));
+}
+
+static int
+pmc_test_group_state_sysctl_handler(SYSCTL_HANDLER_ARGS)
+{
+	struct pmc_test_group_state state;
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	struct pmc *pm;
+	uint64_t handle;
+	int error;
+
+	if (req->newptr == NULL || req->newlen != sizeof(handle))
+		return (EINVAL);
+	error = SYSCTL_IN(req, &handle, sizeof(handle));
+	if (error != 0)
+		return (error);
+	if ((uint64_t)(pmc_id_t)handle != handle)
+		return (EINVAL);
+
+	memset(&state, 0, sizeof(state));
+	sx_xlock(&pmc_sx);
+	error = pmc_find_pmc((pmc_id_t)handle, &pm);
+	if (error == 0) {
+		pg = pmu_group_from_pmc(pm);
+		if (pg == NULL || pg->pg_leader == NULL ||
+		    pg->pg_leader->pe_pmc != pm)
+			error = EINVAL;
+		else {
+			state.ptgs_handle = pm->pm_handle;
+			state.ptgs_running = pg->pg_running;
+			state.ptgs_assigned = pg->pg_assigned;
+			state.ptgs_sys_listed = pg->pg_sys_listed;
+			state.ptgs_sscounted = pg->pg_sscounted;
+			state.ptgs_nevents = pg->pg_nevents;
+			TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+				if (pe->pe_pmc->pm_state == PMC_STATE_RUNNING)
+					state.ptgs_running_members++;
+				else if (pe->pe_pmc->pm_state ==
+				    PMC_STATE_STOPPED)
+					state.ptgs_stopped_members++;
+				else if (pe->pe_pmc->pm_state ==
+				    PMC_STATE_ALLOCATED)
+					state.ptgs_allocated_members++;
+			}
+		}
+	}
+	sx_xunlock(&pmc_sx);
+	if (error != 0)
+		return (error);
+	return (SYSCTL_OUT(req, &state, sizeof(state)));
+}
+
+static int
+pmc_test_residual_state_sysctl_handler(SYSCTL_HANDLER_ARGS)
+{
+	struct pmc_test_residual_query query;
+	struct pmu_group_target *pgt;
+	struct pmc_process *pp;
+	struct pmc_thread *pt;
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	struct pmc *pm;
+	pmc_value_t value;
+	int error, ri;
+
+	if (req->newptr == NULL || req->newlen != sizeof(query))
+		return (EINVAL);
+	error = SYSCTL_IN(req, &query, sizeof(query));
+	if (error != 0)
+		return (error);
+	if ((uint64_t)(pmc_id_t)query.ptrq_handle != query.ptrq_handle ||
+	    query.ptrq_pid == 0 || query.ptrq_tid == 0 ||
+	    query.ptrq_operation < PMC_TEST_RESIDUAL_GET_SAVED ||
+	    query.ptrq_operation > PMC_TEST_RESIDUAL_SET_SAVED)
+		return (EINVAL);
+
+	query.ptrq_assigned = 0;
+	query.ptrq_reserved = 0;
+	sx_xlock(&pmc_sx);
+	error = pmc_find_pmc((pmc_id_t)query.ptrq_handle, &pm);
+	if (error != 0)
+		goto out;
+	pe = pmu_event_from_pmc(pm);
+	pg = pmu_group_from_pmc(pm);
+	if (pe == NULL || pg == NULL || PMC_TO_MODE(pm) != PMC_MODE_TS) {
+		error = EINVAL;
+		goto out;
+	}
+
+	pp = NULL;
+	LIST_FOREACH(pgt, &pg->pg_targets, pgt_group_next) {
+		if ((uint32_t)pgt->pgt_pp->pp_proc->p_pid == query.ptrq_pid) {
+			pp = pgt->pgt_pp;
+			break;
+		}
+	}
+	if (pp == NULL) {
+		error = ESRCH;
+		goto out;
+	}
+
+	pt = NULL;
+	mtx_lock_spin(pp->pp_tdslock);
+	LIST_FOREACH(pt, &pp->pp_tds, pt_next) {
+		if ((uint32_t)pt->pt_td->td_tid == query.ptrq_tid)
+			break;
+	}
+	if (pt == NULL) {
+		mtx_unlock_spin(pp->pp_tdslock);
+		error = ESRCH;
+		goto out;
+	}
+
+	query.ptrq_assigned = pg->pg_assigned;
+	if (query.ptrq_operation == PMC_TEST_RESIDUAL_SET_LIVE ||
+	    query.ptrq_operation == PMC_TEST_RESIDUAL_SET_SAVED) {
+		switch (query.ptrq_state) {
+		case PMC_TEST_RESIDUAL_UNINITIALIZED:
+		case PMC_TEST_RESIDUAL_OVERFLOW_PENDING:
+			if (query.ptrq_value != 0) {
+				error = EINVAL;
+				goto unlock;
+			}
+			break;
+		case PMC_TEST_RESIDUAL_VALID:
+			if (query.ptrq_value == 0 ||
+			    query.ptrq_value > pm->pm_sc.pm_reloadcount) {
+				error = EINVAL;
+				goto unlock;
+			}
+			break;
+		default:
+			error = EINVAL;
+			goto unlock;
+		}
+	}
+	if (query.ptrq_operation == PMC_TEST_RESIDUAL_GET_SAVED ||
+	    query.ptrq_operation == PMC_TEST_RESIDUAL_SET_SAVED) {
+		uint8_t state;
+
+		mtx_unlock_spin(pp->pp_tdslock);
+		if (query.ptrq_operation == PMC_TEST_RESIDUAL_SET_SAVED)
+			error = pmu_event_set_thread_residual(pm, pp,
+			    (lwpid_t)query.ptrq_tid, query.ptrq_value,
+			    (uint8_t)query.ptrq_state);
+		if (error == 0)
+			error = pmu_event_get_thread_residual(pm, pp,
+			    (lwpid_t)query.ptrq_tid, &value, &state);
+		if (error != 0)
+			goto out;
+		query.ptrq_value = value;
+		query.ptrq_state = state;
+		goto out;
+	} else {
+		if (!pg->pg_assigned || PMC_ROW_IS_UNASSIGNED(pm)) {
+			error = EBUSY;
+			goto unlock;
+		}
+		ri = PMC_TO_ROWINDEX(pm);
+		if (pp->pp_pmcs[ri].pp_pmc != pm) {
+			error = EBUSY;
+			goto unlock;
+		}
+		if (query.ptrq_operation == PMC_TEST_RESIDUAL_SET_LIVE)
+			pt->pt_pmcs[ri].pt_pmcval = query.ptrq_value;
+		value = pt->pt_pmcs[ri].pt_pmcval;
+		mtx_unlock_spin(pp->pp_tdslock);
+	}
+
+	query.ptrq_value = value;
+	query.ptrq_state = value > 0 &&
+	    value <= pm->pm_sc.pm_reloadcount ?
+	    PMC_TEST_RESIDUAL_VALID : PMC_TEST_RESIDUAL_UNINITIALIZED;
+	goto out;
+unlock:
+	mtx_unlock_spin(pp->pp_tdslock);
+out:
+	sx_xunlock(&pmc_sx);
+	if (error != 0)
+		return (error);
+	return (SYSCTL_OUT(req, &query, sizeof(query)));
+}
 #endif
 
 /*
@@ -937,14 +1653,21 @@ pmc_runcount_add(struct pmc *pm, int64_t delta)
 {
 
 	counter_u64_add(pm->pm_runcount, delta);
+	pmc_test_counter_add(PMC_TEST_LIVE_RUN_REFS, delta);
 }
 
 struct pmc_target *
-pmc_target_object_alloc(int malloc_flags)
+pmc_target_object_alloc(int malloc_flags, bool inject_failure)
 {
+	struct pmc_target *pt;
 
-	return (malloc(sizeof(struct pmc_target), M_PMC,
-	    malloc_flags | M_ZERO));
+	if (inject_failure &&
+	    pmc_test_should_fail(PMC_TEST_FAIL_TARGET_LINK_ALLOC))
+		return (NULL);
+	pt = malloc(sizeof(*pt), M_PMC, malloc_flags | M_ZERO);
+	if (pt != NULL)
+		pmc_test_counter_add(PMC_TEST_LIVE_PMC_TARGETS, 1);
+	return (pt);
 }
 
 void
@@ -953,6 +1676,7 @@ pmc_target_object_free(struct pmc_target *pt)
 
 	if (pt == NULL)
 		return;
+	pmc_test_counter_add(PMC_TEST_LIVE_PMC_TARGETS, -1);
 	free(pt, M_PMC);
 }
 
@@ -1036,7 +1760,8 @@ pmc_link_target_process(struct pmc *pm, struct pmc_process *pp)
 	sx_assert(&pmc_sx, SX_XLOCKED);
 	KASSERT(pm != NULL && pp != NULL,
 	    ("[pmc,%d] Null pm %p or pp %p", __LINE__, pm, pp));
-	pt = pmc_target_object_alloc(M_WAITOK);
+	pt = pmc_target_object_alloc(M_WAITOK,
+	    pmu_group_from_pmc(pm) != NULL);
 	if (pt == NULL)
 		return (ENOMEM);
 	pmc_link_target_process_preallocated(pm, pp, pt);
@@ -1226,7 +1951,7 @@ pmc_rotation_attach(struct pmc *pm, struct pmc_process *pp)
 	KASSERT(pp->pp_pmcs[ri].pp_pmc == NULL,
 	    ("[pmc,%d] rotation attach into busy slot ri=%d", __LINE__, ri));
 
-	ptgt = pmc_target_object_alloc(M_WAITOK);
+	ptgt = pmc_target_object_alloc(M_WAITOK, false);
 	KASSERT(ptgt != NULL, ("[pmc,%d] target allocation failed", __LINE__));
 	ptgt->pt_process = pp;
 	LIST_INSERT_HEAD(&pm->pm_targets, ptgt, pt_next);
@@ -1435,6 +2160,9 @@ pmc_attach_one_process(struct proc *p, struct pmc *pm)
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
 	pg = pmu_group_from_pmc(pm);
+	if (pg != NULL &&
+	    pmc_test_should_fail(PMC_TEST_FAIL_ATTACH_AUTHORIZATION))
+		return (EPERM);
 
 	/*
 	 * Deferred group member. Mark it attached, and register it on
@@ -1610,6 +2338,9 @@ pmc_attach_group_processes(struct proc *top, struct pmc *pm)
 		/* Each target must be debuggable, as in PMCATTACH. */
 		error = p_candebug(curthread, target);
 		PROC_UNLOCK(target);
+		if (error == 0 &&
+		    pmc_test_should_fail(PMC_TEST_FAIL_ATTACH_AUTHORIZATION))
+			error = EPERM;
 		if (error != 0)
 			break;
 
@@ -1645,7 +2376,7 @@ pmc_attach_group_processes(struct proc *top, struct pmc *pm)
 				link_index = (size_t)i * pg->pg_nevents +
 				    event_index++;
 				links[link_index] =
-				    pmc_target_object_alloc(M_WAITOK);
+				    pmc_target_object_alloc(M_WAITOK, true);
 				if (links[link_index] == NULL) {
 					error = ENOMEM;
 					break;
@@ -1662,6 +2393,7 @@ pmc_attach_group_processes(struct proc *top, struct pmc *pm)
 	KASSERT(i == ntargets,
 	    ("[pmc,%d] prepared %u of %u group targets", __LINE__, i,
 	    ntargets));
+	pmc_test_descendants_attach_pause(pg, ntargets);
 
 	/* Linearization point. Every fallible operation is done above. */
 	for (i = 0; i < ntargets; i++)
@@ -1724,6 +2456,7 @@ pmc_attach_process(struct proc *p, struct pmc *pm)
 	pmu_group_t *pg;
 	int error;
 	struct proc *target, *top;
+	u_int ntargets __pmcdbg_used;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
 
@@ -1751,6 +2484,12 @@ pmc_attach_process(struct proc *p, struct pmc *pm)
 	sx_slock(&proctree_lock);
 
 	top = p;
+	ntargets = 0;
+	for (target = top; target != NULL;
+	    target = pmc_next_descendant(top, target))
+		ntargets++;
+	pmc_test_descendants_attach_pause(NULL, ntargets);
+
 	error = 0;
 	for (target = top; target != NULL;
 	    target = pmc_next_descendant(top, target)) {
@@ -3692,6 +4431,7 @@ pmc_find_process_descriptor(struct proc *p, uint32_t mode)
 		mtx_unlock_spin(&pmc_processhash_mtx);
 		pp = ppnew;
 		ppnew = NULL;
+		pmc_test_counter_add(PMC_TEST_LIVE_TARGET_PROCESSES, 1);
 
 		/* Add thread descriptors for this process' current threads. */
 		pmc_add_thread_descriptors_from_proc(p, pp);
@@ -3737,6 +4477,7 @@ pmc_destroy_process_descriptor(struct pmc_process *pp)
 		LIST_REMOVE(pmc_td, pt_next);
 		pmc_thread_descriptor_pool_free(pmc_td);
 	}
+	pmc_test_counter_add(PMC_TEST_LIVE_TARGET_PROCESSES, -1);
 	free(pp, M_PMC);
 }
 
@@ -6670,6 +7411,17 @@ pmc_add_sample(ring_type_t ring, struct pmc *pm, struct trapframe *tf,
 	 * Allocate space for a sample buffer.
 	 */
 	cpu = curcpu;
+	/*
+	 * The test group accepts one sample. After that, force the next
+	 * interrupt down the buffer-full or stalled path. This holds
+	 * the queue at one entry while this group's worker is paused.
+	 */
+	if (pmc_test_sample_worker_paused(pm)) {
+		pm->pm_pcpu_state[cpu].pps_stalled = 1;
+		callchaindepth = 1;
+		error = ENOMEM;
+		goto done;
+	}
 	psb = pmc_pcpu[cpu]->pc_sb[ring];
 	inuserspace = TRAPF_USERMODE(tf);
 	ps = PMC_PROD_SAMPLE(psb);
@@ -6748,6 +7500,7 @@ pmc_add_sample(ring_type_t ring, struct pmc *pm, struct trapframe *tf,
 	psb->ps_prodidx++;
 	if (pm->pm_pmu != NULL) {
 		counter_u64_add(pm->pm_pmu->pe_samples, 1);
+		pmc_test_sample_accepted(pm, ps->ps_pid, ps->ps_tid);
 	}
 done:
 	/* mark CPU as needing processing */
@@ -6874,6 +7627,7 @@ restart:
 			 * reference.
 			 */
 			if (nsamples == 0) {
+				pmc_test_sample_dropped(pm);
 				pmc_runcount_add(pm, -1);
 			}
 		}
@@ -6912,6 +7666,7 @@ pmc_process_samples(int cpu, ring_type_t ring)
 	struct pmc_samplebuffer *psb;
 	uint64_t delta __diagused;
 	int adjri, n;
+	bool emitted __pmcdbg_used;
 
 	KASSERT(PCPU_GET(cpuid) == cpu,
 	    ("[pmc,%d] not on the correct CPU pcpu=%d cpu=%d", __LINE__,
@@ -6929,6 +7684,11 @@ pmc_process_samples(int cpu, ring_type_t ring)
 
 		/* skip non-running samples */
 		pm = ps->ps_pmc;
+		emitted = false;
+		if (pmc_test_sample_worker_paused(pm)) {
+			DPCPU_SET(pmc_sampled, 1);
+			break;
+		}
 		if (pm->pm_state != PMC_STATE_RUNNING &&
 		    atomic_load_acq_int(&pm->pm_rotation_drain) == 0)
 			goto entrydone;
@@ -6988,12 +7748,14 @@ pmc_process_samples(int cpu, ring_type_t ring)
 			if (ps->ps_flags & PMC_CC_F_USERSPACE) {
 				td = FIRST_THREAD_IN_PROC(po->po_owner);
 				addupc_intr(td, ps->ps_pc[0], 1);
+				emitted = true;
 			}
 		} else {
-			pmclog_process_callchain(pm, ps);
+			emitted = pmclog_process_callchain(pm, ps);
 		}
 
 entrydone:
+		pmc_test_sample_done(pm, emitted);
 		ps->ps_nsamples = 0; /* mark entry as free */
 		KASSERT(counter_u64_fetch(pm->pm_runcount) > 0,
 		    ("[pmc,%d] pm=%p runcount %ju", __LINE__, pm,
@@ -7066,6 +7828,7 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 	PROC_LOCK(p);
 	is_using_hwpmcs = (p->p_flag & P_HWPMC) != 0;
 	PROC_UNLOCK(p);
+	pmc_test_descendants_exit_observed(p);
 
 	/*
 	 * Log a sysexit event to all SS PMC owners.
@@ -7217,6 +7980,7 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 	    "process_exit: pid=%d pp=%p draining pmu groups",
 	    p->p_pid, pp);
 	pmu_pp_destroy(pp);
+	pmc_test_counter_add(PMC_TEST_LIVE_TARGET_PROCESSES, -1);
 	free(pp, M_PMC);
 
 out:
@@ -7574,7 +8338,14 @@ pmc_initialize(void)
 	pmc_stats.pm_group_fork_attach_failures = counter_u64_alloc(M_WAITOK);
 
 #ifdef HWPMC_DEBUG
-	/* parse debug flags first */
+	for (c = 0; c < PMC_TEST_COUNTER_COUNT; c++)
+		pmc_test_counters[c] = counter_u64_alloc(M_WAITOK);
+	for (c = 0; c < PMC_TEST_FAILPOINT_COUNT; c++)
+		pmc_test_failpoints[c] = UINT_MAX;
+	pmc_test_fail_callchain_log.pth_request = PMC_ID_INVALID;
+	pmc_test_fail_callchain_log.pth_ack = PMC_ID_INVALID;
+
+	/* Parse debug flags first. */
 	if (TUNABLE_STR_FETCH(PMC_SYSCTL_NAME_PREFIX "debugflags",
 	    pmc_debugstr, sizeof(pmc_debugstr))) {
 		pmc_debugflags_parse(pmc_debugstr, pmc_debugstr +
@@ -7986,6 +8757,10 @@ pmc_cleanup(void)
 	counter_u64_free(pmc_stats.pm_merges);
 	counter_u64_free(pmc_stats.pm_overwrites);
 	counter_u64_free(pmc_stats.pm_group_fork_attach_failures);
+#ifdef HWPMC_DEBUG
+	for (c = 0; c < PMC_TEST_COUNTER_COUNT; c++)
+		counter_u64_free(pmc_test_counters[c]);
+#endif
 	sx_xunlock(&pmc_sx);	/* We are done */
 }
 

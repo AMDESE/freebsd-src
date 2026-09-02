@@ -28,6 +28,55 @@ enum pmc_flags {
 	PMC_FLAG_NOWAIT   = 0x04, /* do not wait for mallocs */
 };
 
+#ifdef HWPMC_DEBUG
+/* These counters are for tests only.  They exist only in HWPMC_DEBUG builds. */
+enum pmc_test_counter {
+	PMC_TEST_LIVE_PMC_TARGETS,
+	PMC_TEST_LIVE_GROUP_TARGETS,
+	PMC_TEST_LIVE_TARGET_PROCESSES,
+	PMC_TEST_LIVE_RESIDUAL_ENTRIES,
+	PMC_TEST_LIVE_ROTATION_REFS,
+	PMC_TEST_LIVE_RUN_REFS,
+	PMC_TEST_COUNTER_COUNT
+};
+
+enum pmc_test_failpoint {
+	PMC_TEST_FAIL_GROUP_TARGET_ALLOC,
+	PMC_TEST_FAIL_TARGET_LINK_ALLOC,
+	PMC_TEST_FAIL_ATTACH_AUTHORIZATION,
+	PMC_TEST_FAIL_SYSTEM_START,
+	PMC_TEST_FAILPOINT_COUNT
+};
+
+void	pmc_test_counter_add(enum pmc_test_counter counter, int64_t delta);
+bool	pmc_test_should_fail(enum pmc_test_failpoint failpoint);
+bool	pmc_test_group_hold_resident(pmu_group_t *pg);
+bool	pmc_test_group_hold_evicted(pmu_group_t *pg);
+void	pmc_test_descendants_attach_pause(pmu_group_t *pg, u_int ntargets);
+void	pmc_test_descendants_exit_observed(struct proc *p);
+void	pmc_test_system_start_pause(pmu_group_t *pg, u_int nstarted);
+void	pmc_test_sample_accepted(struct pmc *pm, uint32_t pid, uint32_t tid);
+bool	pmc_test_sample_worker_paused(struct pmc *pm);
+void	pmc_test_sample_schedule_out(pmu_group_t *pg);
+bool	pmc_test_callchain_log_should_fail(struct pmc *pm);
+void	pmc_test_sample_dropped(struct pmc *pm);
+void	pmc_test_sample_done(struct pmc *pm, bool emitted);
+#else
+#define	pmc_test_counter_add(counter, delta)	do { } while (0)
+#define	pmc_test_should_fail(failpoint)		(false)
+#define	pmc_test_group_hold_resident(pg)	(false)
+#define	pmc_test_group_hold_evicted(pg)		(false)
+#define	pmc_test_descendants_attach_pause(pg, n)	do { } while (0)
+#define	pmc_test_descendants_exit_observed(p)	do { } while (0)
+#define	pmc_test_system_start_pause(pg, n)	do { } while (0)
+#define	pmc_test_sample_accepted(pm, pid, tid)	do { } while (0)
+#define	pmc_test_sample_worker_paused(pm)	(false)
+#define	pmc_test_sample_schedule_out(pg)		do { } while (0)
+#define	pmc_test_callchain_log_should_fail(pm)	(false)
+#define	pmc_test_sample_dropped(pm)		do { } while (0)
+#define	pmc_test_sample_done(pm, emitted)	do { } while (0)
+#endif
+
 /*
  * Scheduling constraint from the class backend.
  * pc_allowed_rows is a bitmask of valid class row indices.
@@ -296,7 +345,8 @@ void pmc_rotation_drain(struct pmc *pm);
 void pmc_rotation_drain_cpu(struct pmc *pm, int cpu);
 void pmc_rotation_detach(struct pmc *pm, struct pmc_process *pp);
 void pmc_rotation_attach(struct pmc *pm, struct pmc_process *pp);
-struct pmc_target *pmc_target_object_alloc(int malloc_flags);
+struct pmc_target *pmc_target_object_alloc(int malloc_flags,
+    bool inject_failure);
 void pmc_target_object_free(struct pmc_target *pt);
 void pmc_link_target_process_preallocated(struct pmc *pm,
     struct pmc_process *pp, struct pmc_target *pt);

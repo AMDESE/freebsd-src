@@ -64,6 +64,8 @@
 #include <machine/clock.h>
 #endif
 
+#include "hwpmc_pmu.h"
+
 #define curdomain PCPU_GET(domain)
 
 /*
@@ -903,7 +905,7 @@ pmclog_close(struct pmc_owner *po)
 	return (0);
 }
 
-void
+bool
 pmclog_process_callchain(struct pmc *pm, struct pmc_sample *ps)
 {
 	int n, recordlen;
@@ -917,7 +919,10 @@ pmclog_process_callchain(struct pmc *pm, struct pmc_sample *ps)
 	    ps->ps_nsamples * sizeof(uintfptr_t);
 	po = pm->pm_owner;
 	flags = PMC_CALLCHAIN_TO_CPUFLAGS(ps->ps_cpu,ps->ps_flags);
-	PMCLOG_RESERVE_SAFE(po, PMCLOG_TYPE_CALLCHAIN, recordlen, ps->ps_tsc);
+	if (pmc_test_callchain_log_should_fail(pm))
+		return (false);
+	_PMCLOG_RESERVE_SAFE(po, PMCLOG_TYPE_CALLCHAIN, recordlen,
+	    return (false), ps->ps_tsc);
 	PMCLOG_EMIT32(ps->ps_pid);
 	PMCLOG_EMIT32(ps->ps_tid);
 	PMCLOG_EMIT32(pm->pm_handle);
@@ -925,6 +930,7 @@ pmclog_process_callchain(struct pmc *pm, struct pmc_sample *ps)
 	for (n = 0; n < ps->ps_nsamples; n++)
 		PMCLOG_EMITADDR(ps->ps_pc[n]);
 	PMCLOG_DESPATCH_SAFE(po);
+	return (true);
 }
 
 void
