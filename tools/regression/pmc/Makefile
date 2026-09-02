@@ -39,7 +39,8 @@ KTESTS=		pmc_group_test pmc_mux_test pmc_mux_works_test \
 		pmc_mux_rotation_test pmc_mux_drain_test pmc_group_fuzz
 
 # Userland-only tests (no PMU access).
-UTESTS=		test_libpmcstat_group
+UTESTS=		test_libpmcstat_group \
+		pmcstat_mux_warning_shim.so
 
 PMCSTAT?=	/usr/sbin/pmcstat
 
@@ -76,9 +77,16 @@ pmc_mux_drain_test: ${.CURDIR}/pmc_mux_drain_test.c
 pmc_group_fuzz: ${.CURDIR}/pmc_group_fuzz.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
 
+pmcstat_mux_warning_shim.so: ${.CURDIR}/pmcstat_mux_warning_shim.c
+	${CC} ${CFLAGS} -fPIC -shared ${LIBPMCSTAT_INC} \
+	    -I${SRCROOT}/sys -o ${.TARGET} ${.ALLSRC}
+
 # These are userland-only checks: parsers and pmcstat warning policy.
 check: ${UTESTS}
 	./test_libpmcstat_group
+	PMCSTAT=${PMCSTAT} \
+	    PMCSTAT_WARNING_SHIM=${.CURDIR}/pmcstat_mux_warning_shim.so \
+	    sh ${.CURDIR}/pmcstat_mux_warning_test.sh
 
 # This in-kernel check needs `kldload hwpmc` and root.
 check-root: ${KTESTS}
