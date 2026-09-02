@@ -4,6 +4,7 @@ ATF_TESTS_C+=	pmc_api_test
 ATF_TESTS_C+=	pmc_credexec_test
 ATF_TESTS_C+=	pmc_detach_test
 ATF_TESTS_C+=	pmc_exec_test
+ATF_TESTS_C+=	pmc_fork_test
 ATF_TESTS_C+=	pmc_group_gate_test
 ATF_TESTS_C+=	pmc_group_test
 ATF_TESTS_C+=	pmc_groupread_test
@@ -18,6 +19,7 @@ TEST_METADATA.pmc_exterr_test+=	required_user="root"
 
 LIBADD+=	pmc
 LIBADD.pmc_detach_test+=	pthread
+LIBADD.pmc_fork_test+=	pthread
 
 CFLAGS.pmc_exterr_test.c+=	-I${SRCTOP}/tests
 
