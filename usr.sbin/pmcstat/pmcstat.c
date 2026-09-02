@@ -115,6 +115,7 @@ static kvm_t	*pmcstat_kvm;
 static struct kinfo_proc *pmcstat_plist;
 struct pmcstat_args args;
 static bool	libpmc_initialized = false;
+static int	next_syntactic_gid = 1;
 
 static void
 pmcstat_get_cpumask(const char *cpuspec, cpuset_t *cpumask)
@@ -138,23 +139,45 @@ pmcstat_get_cpumask(const char *cpuspec, cpuset_t *cpumask)
 	assert(!CPU_EMPTY(cpumask));
 }
 
+/*
+ * The most events a CPU can retire while a group holds hardware for
+ * one rotation window.  A sampling member that needs more than this
+ * cannot overflow in one window, however busy the machine is, so it
+ * will deliver few or no samples.  This value is deliberately high:
+ * it assumes the CPU never stalls and retires several events per
+ * cycle.  So a warning means the period truly is too long, not just
+ * ambitious.  The value is zero if we cannot read the driver or the
+ * clock rate.
+ */
+#define	PMCSTAT_MAX_EVENTS_PER_CYCLE	8
+
 void
 pmcstat_cleanup(void)
 {
-	struct pmcstat_ev *ev;
+	struct pmcstat_ev *ev, *ev2;
 
-	/* release allocated PMCs. */
-	STAILQ_FOREACH(ev, &args.pa_events, ev_next)
-		if (ev->ev_pmcid != PMC_ID_INVALID) {
-			if (pmc_stop(ev->ev_pmcid) < 0)
-				err(EX_OSERR,
+	/* Release the allocated PMCs. */
+	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
+		if (ev->ev_pmcid == PMC_ID_INVALID ||
+		    (ev->ev_groupid != 0 && !ev->ev_is_leader))
+			continue;
+		if (pmc_stop(ev->ev_pmcid) < 0 && errno != EINVAL)
+			err(EX_OSERR,
 				    "ERROR: cannot stop pmc 0x%x \"%s\"",
-				    ev->ev_pmcid, ev->ev_name);
-			if (pmc_release(ev->ev_pmcid) < 0)
-				err(EX_OSERR,
+			    ev->ev_pmcid, ev->ev_name);
+		if (pmc_release(ev->ev_pmcid) < 0)
+			err(EX_OSERR,
 				    "ERROR: cannot release pmc 0x%x \"%s\"",
-				    ev->ev_pmcid, ev->ev_name);
+			    ev->ev_pmcid, ev->ev_name);
+		if (ev->ev_groupid == 0)
+			ev->ev_pmcid = PMC_ID_INVALID;
+		else {
+			STAILQ_FOREACH(ev2, &args.pa_events, ev_next) {
+				if (ev2->ev_groupid == ev->ev_groupid)
+					ev2->ev_pmcid = PMC_ID_INVALID;
+			}
 		}
+	}
 
 	/* de-configure the log file if present. */
 	if (args.pa_flags & (FLAG_HAS_PIPE | FLAG_HAS_OUTPUT_LOGFILE))
@@ -253,29 +276,40 @@ pmcstat_start_pmcs(void)
 	struct pmcstat_ev *ev;
 
 	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
-
 	    assert(ev->ev_pmcid != PMC_ID_INVALID);
-
+		if (ev->ev_groupid != 0 && !ev->ev_is_leader)
+			continue;
 	    if (pmc_start(ev->ev_pmcid) < 0) {
 	        warn("ERROR: Cannot start pmc 0x%x \"%s\"",
-		    ev->ev_pmcid, ev->ev_name);
-		pmcstat_cleanup();
+			    ev->ev_pmcid, ev->ev_name);
+			pmcstat_cleanup();
 		exit(EX_OSERR);
-	    }
+		}
 	}
 }
+
+/*
+ * Column width for the group residency percentage.
+ */
+#define	PRINT_RESIDENCY_WIDTH	8
 
 void
 pmcstat_print_headers(void)
 {
 	struct pmcstat_ev *ev;
-	int c, w;
+	int c, gid, w;
 
 	(void) fprintf(args.pa_printfile, PRINT_HEADER_PREFIX);
 
+	gid = 0;
 	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
 		if (PMC_IS_SAMPLING_MODE(ev->ev_mode))
 			continue;
+
+		if (gid != 0 && ev->ev_groupid != gid)
+			(void) fprintf(args.pa_printfile, "%*s",
+			    PRINT_RESIDENCY_WIDTH, "res%");
+		gid = ev->ev_groupid;
 
 		c = PMC_IS_SYSTEM_MODE(ev->ev_mode) ? 's' : 'p';
 
@@ -291,18 +325,42 @@ pmcstat_print_headers(void)
 			(void) fprintf(args.pa_printfile, "p/%*s ", w,
 			    ev->ev_name);
 	}
+	if (gid != 0)
+			(void) fprintf(args.pa_printfile, "%*s",
+		    PRINT_RESIDENCY_WIDTH, "res%");
 
 	(void) fflush(args.pa_printfile);
+}
+
+static void
+pmcstat_print_residency(int have_times, double residency)
+{
+
+	if (have_times && residency < 100.0)
+		(void) fprintf(args.pa_printfile, " %6.1f%%", residency);
+	else
+			(void) fprintf(args.pa_printfile, "%*s",
+		    PRINT_RESIDENCY_WIDTH, "");
 }
 
 void
 pmcstat_print_counters(void)
 {
-	int extra_width;
+	struct pmc_group_member members[PMC_GROUP_MAX_MEMBERS];
+	struct pmc_group_times times;
 	struct pmcstat_ev *ev;
 	pmc_value_t value;
+	uint64_t d_enabled, d_running, d_value, estimate;
+	double residency;
+	uint32_t i, nmembers;
+	int extra_width, found, gid, have_times, width;
 
 	extra_width = sizeof(PRINT_HEADER_PREFIX) - 1;
+	gid = 0;
+	have_times = 0;
+	nmembers = 0;
+	d_enabled = d_running = 0;
+	residency = 100.0;
 
 	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
 
@@ -310,19 +368,92 @@ pmcstat_print_counters(void)
 		if (PMC_IS_SAMPLING_MODE(ev->ev_mode))
 			continue;
 
-		if (pmc_read(ev->ev_pmcid, &value) < 0)
+		/* Print residency for the previous group. */
+		if (gid != 0 && ev->ev_groupid != gid) {
+			pmcstat_print_residency(have_times, residency);
+			gid = 0;
+		}
+
+		width = ev->ev_fieldwidth + extra_width;
+		extra_width = 0;
+
+		if (ev->ev_groupid == 0) {
+			if (pmc_read(ev->ev_pmcid, &value) < 0)
+				err(EX_OSERR,
+				    "ERROR: Cannot read pmc \"%s\"",
+				    ev->ev_name);
+
+			(void) fprintf(args.pa_printfile, "%*ju ", width,
+			    (uintmax_t) ev->ev_cumulative ? value :
+			    (value - ev->ev_saved));
+
+			if (ev->ev_cumulative == 0)
+				ev->ev_saved = value;
+			continue;
+		}
+
+		/* Read the group snapshot from the leader. */
+		if (ev->ev_is_leader) {
+			gid = ev->ev_groupid;
+			nmembers = PMC_GROUP_MAX_MEMBERS;
+			if (pmc_group_read(ev->ev_pmcid, &nmembers,
+			    members, &times) == 0) {
+				have_times = 1;
+				d_enabled = times.pgt_enabled -
+				    ev->ev_prev_enabled;
+				d_running = times.pgt_running -
+				    ev->ev_prev_running;
+				ev->ev_prev_enabled = times.pgt_enabled;
+				ev->ev_prev_running = times.pgt_running;
+			} else {
+				have_times = 0;
+				nmembers = 0;
+			}
+			residency = (have_times && d_enabled != 0) ?
+			    100.0 * (double)d_running / (double)d_enabled :
+			    100.0;
+		}
+
+		found = 0;
+		value = 0;
+		for (i = 0; i < nmembers; i++) {
+			if (members[i].pm_pmcid == ev->ev_pmcid) {
+				value = members[i].pm_value;
+				found = 1;
+				break;
+			}
+		}
+		if (!found && pmc_read(ev->ev_pmcid, &value) < 0)
 			err(EX_OSERR, "ERROR: Cannot read pmc \"%s\"",
 			    ev->ev_name);
 
-		(void) fprintf(args.pa_printfile, "%*ju ",
-		    ev->ev_fieldwidth + extra_width,
-		    (uintmax_t) ev->ev_cumulative ? value :
-		    (value - ev->ev_saved));
-
-		if (ev->ev_cumulative == 0)
+		d_value = value - ev->ev_saved;
 			ev->ev_saved = value;
-		extra_width = 0;
+
+		/* Scale the count by the enabled/running ratio. */
+		if (!have_times) {
+			(void) fprintf(args.pa_printfile, "%*ju ", width,
+			    (uintmax_t) ev->ev_cumulative ? value : d_value);
+		} else if (d_enabled == 0) {
+			(void) fprintf(args.pa_printfile, "%*s ", width,
+			    "<not enabled>");
+		} else if (d_running == 0) {
+			(void) fprintf(args.pa_printfile, "%*s ", width,
+			    "<not counted>");
+		} else {
+			if (d_enabled > (uint64_t)PMC_SCALE_MAX * d_running)
+				estimate = d_value; /* Cap the scaling ratio. */
+			else
+				estimate = (uint64_t)((long double)d_value *
+				    d_enabled / d_running);
+			ev->ev_scaled_sum += estimate;
+			(void) fprintf(args.pa_printfile, "%*ju ", width,
+			    (uintmax_t) (ev->ev_cumulative ?
+			    ev->ev_scaled_sum : estimate));
+		}
 	}
+	if (gid != 0)
+		pmcstat_print_residency(have_times, residency);
 
 	(void) fflush(args.pa_printfile);
 }
@@ -519,8 +650,12 @@ main(int argc, char **argv)
 	CPU_COPY(&rootmask, &cpumask);
 
 	while ((option = getopt(argc, argv,
-	    "ACD:EF:G:ILM:NO:P:R:S:TUWZa:c:def:gi:l:m:n:o:p:qr:s:t:u:vw:z:")) != -1)
+	    "ACD:EF:G:ILM:NO:P:R:S:TUWZa:bc:def:gi:l:m:n:o:p:qr:s:t:u:vw:z:")) != -1)
 		switch (option) {
+		case 'b':	/* Group events in braces {a,b,c}. */
+			args.pa_flags |= FLAG_DO_GROUPING;
+			break;
+
 		case 'A':
 			args.pa_flags |= FLAG_SKIP_TOP_FN_RES;
 			break;
@@ -639,8 +774,85 @@ main(int argc, char **argv)
 		case 's':	/* system-wide counting PMC */
 		case 'P':	/* process virtual sampling PMC */
 		case 'S':	/* system-wide sampling PMC */
+			if ((args.pa_flags & FLAG_DO_GROUPING) != 0 &&
+			    optarg != NULL && optarg[0] == '{') {
+				char **siblings = NULL;
+				size_t si, nsib = 0;
+				int gid, rv;
+
+				rv = pmcstat_parse_event_group(optarg,
+				    &siblings, &nsib);
+				if (rv < 0)
+					errx(EX_USAGE,
+					    "ERROR: Bad group spec \"%s\"",
+					    optarg);
+				if (rv == 0) {
+					if (option == 'P' || option == 'p')
+						args.pa_required |=
+						    (FLAG_HAS_COMMANDLINE |
+				    FLAG_HAS_TARGET);
+					if (option == 'P' || option == 'S')
+						args.pa_required |=
+						    (FLAG_HAS_PIPE |
+				    FLAG_HAS_OUTPUT_LOGFILE);
+					gid = next_syntactic_gid++;
+					for (si = 0; si < nsib; si++) {
+						ev = pmcstat_add_one_event(
+						    option, siblings[si],
+						    &args, gid, si == 0);
+						if (option == 'S' ||
+						    option == 'P')
+							ev->ev_count =
+							    current_sampling_count ?
+							    current_sampling_count :
+							    pmc_pmu_sample_rate_get(
+							    ev->ev_spec);
+						if (option == 'S' ||
+						    option == 's')
+							ev->ev_cpu =
+							    CPU_FFS(&cpumask) - 1;
+			if (do_callchain) {
+							ev->ev_flags |=
+							    PMC_F_CALLCHAIN;
+				if (do_userspace)
+								ev->ev_flags |=
+								    PMC_F_USERCALLCHAIN;
+						}
+						/*
+						 * This flag is leader-only.
+						 * It governs the whole group.
+						 * On a sibling it would fail
+						 * the commit.
+						 */
+						if (do_descendants &&
+						    si == 0)
+							ev->ev_flags |=
+							    PMC_F_DESCENDANTS;
+			if (do_logprocexit)
+							ev->ev_flags |=
+							    PMC_F_LOG_PROCEXIT;
+			if (do_logproccsw)
+							ev->ev_flags |=
+							    PMC_F_LOG_PROCCSW;
+						ev->ev_cumulative =
+						    use_cumulative_counts;
+					}
+					pmcstat_free_event_group(siblings,
+					    nsib);
+					break;
+				}
+				/* Treat a single-event brace list as one event. */
+				if (nsib == 1 && siblings != NULL) {
+					optarg = strdup(siblings[0]);
+					if (optarg == NULL)
+						errx(EX_SOFTWARE,
+						    "ERROR: Out of memory.");
+				}
+				pmcstat_free_event_group(siblings, nsib);
+				/* Process it as one event. */
+			}
 			caps = 0;
-			if ((ev = malloc(sizeof(*ev))) == NULL)
+			if ((ev = calloc(1, sizeof(*ev))) == NULL)
 				errx(EX_SOFTWARE, "ERROR: Out of memory.");
 
 			switch (option) {
@@ -969,7 +1181,18 @@ main(int argc, char **argv)
 "ERROR: options -P and -p require a target process or a command line."
 		    );
 
-	/* check for process-mode options without a process-mode PMC */
+	/*
+	 * A system-mode PMC is bound to a CPU, not a process, so it
+	 * cannot follow a fork.  This check turns a confusing
+	 * commit-time EINVAL into a clear, immediate error.
+	 */
+	if (do_descendants && (args.pa_flags & FLAG_HAS_SYSTEM_PMCS) != 0)
+		errx(EX_USAGE,
+"ERROR: option -d may not be used with -s or -S: a system mode PMC has no\n"
+"process target to follow through fork."
+		    );
+
+	/* Check for process-mode options without a process-mode PMC. */
 	if ((args.pa_required & FLAG_HAS_PROCESS_PMCS) &&
 	    (args.pa_flags & FLAG_HAS_PROCESS_PMCS) == 0)
 		errx(EX_USAGE,
@@ -1134,18 +1357,35 @@ main(int argc, char **argv)
 	    (args.pa_flags & FLAG_HAS_OUTPUT_LOGFILE);
 
 	/*
-	if (args.pa_flags & FLAG_READ_LOGFILE) {
 	 * Allocate PMCs.
 	 */
 
 	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
-		if (pmc_allocate(ev->ev_spec, ev->ev_mode,
-			ev->ev_flags, ev->ev_cpu, &ev->ev_pmcid,
-			ev->ev_count) < 0)
+		int rc;
+
+		/* Enable multiplexing for group leaders. */
+		if (ev->ev_groupid > 0 && ev->ev_is_leader)
+			ev->ev_flags |= PMC_F_GROUP_MUX;
+
+		if (ev->ev_groupid > 0)
+			rc = pmc_allocate_group(ev->ev_spec, ev->ev_mode,
+			    ev->ev_flags, ev->ev_cpu, &ev->ev_pmcid,
+			    ev->ev_count);
+		else
+			rc = pmc_allocate(ev->ev_spec, ev->ev_mode,
+			    ev->ev_flags, ev->ev_cpu, &ev->ev_pmcid,
+			    ev->ev_count);
+		if (rc < 0)
 			err(EX_OSERR,
 "ERROR: Cannot allocate %s-mode pmc with specification \"%s\"",
 			    PMC_IS_SYSTEM_MODE(ev->ev_mode) ?
 			    "system" : "process", ev->ev_spec);
+		if (args.pa_verbosity > 0 || ev->ev_groupid > 0)
+			fprintf(stderr,
+			    "pmcstat: alloc spec=\"%s\" groupid=%d "
+			    "leader=%d -> pmcid=0x%jx\n",
+			    ev->ev_spec, ev->ev_groupid,
+			    ev->ev_is_leader, (uintmax_t)ev->ev_pmcid);
 
 		if (PMC_IS_SAMPLING_MODE(ev->ev_mode) &&
 		    pmc_set(ev->ev_pmcid, ev->ev_count) < 0)
@@ -1154,7 +1394,41 @@ main(int argc, char **argv)
 			    ev->ev_name);
 	}
 
-	/* compute printout widths */
+	if ((args.pa_flags & FLAG_DO_GROUPING) != 0) {
+		struct pmcstat_ev *ev2;
+		int gid_seen;
+		uint32_t real_gid;
+
+		for (gid_seen = 1; gid_seen < next_syntactic_gid;
+		    gid_seen++) {
+			real_gid = 0;
+			if (pmc_group_create(&real_gid) < 0)
+				err(EX_OSERR, "ERROR: pmc_group_create");
+			fprintf(stderr,
+			    "pmcstat: created kernel gid=%u (syntactic=%d)\n",
+			    real_gid, gid_seen);
+			STAILQ_FOREACH(ev2, &args.pa_events, ev_next) {
+				if (ev2->ev_groupid != gid_seen)
+					continue;
+				fprintf(stderr,
+				    "pmcstat: group_add gid=%u pmcid=0x%jx "
+				    "spec=\"%s\" leader=%d\n",
+				    real_gid, (uintmax_t)ev2->ev_pmcid,
+				    ev2->ev_spec, ev2->ev_is_leader);
+				if (pmc_group_add(real_gid, ev2->ev_pmcid,
+				    ev2->ev_is_leader) < 0)
+					err(EX_OSERR,
+					    "ERROR: pmc_group_add gid=%u",
+					    real_gid);
+			}
+			if (pmc_group_commit(real_gid) < 0)
+				err(EX_OSERR,
+				    "ERROR: pmc_group_commit gid=%u",
+				    real_gid);
+		}
+	}
+
+	/* Compute the printout widths. */
 	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
 		int counter_width;
 		int display_width;
