@@ -151,6 +151,77 @@ pmcstat_get_cpumask(const char *cpuspec, cpuset_t *cpumask)
  */
 #define	PMCSTAT_MAX_EVENTS_PER_CYCLE	8
 
+static uint64_t
+pmcstat_events_per_window(void)
+{
+	uint64_t freq;
+	size_t len;
+	int period_ms;
+
+	len = sizeof(freq);
+	if (sysctlbyname("machdep.tsc_freq", &freq, &len, NULL, 0) != 0)
+		return (0);
+	len = sizeof(period_ms);
+	if (sysctlbyname("kern.hwpmc.mux_period_ms", &period_ms, &len, NULL,
+	    0) != 0 || period_ms <= 0)
+		return (0);
+	return (freq / 1000 * (uint64_t)period_ms *
+	    PMCSTAT_MAX_EVENTS_PER_CYCLE);
+}
+
+static void
+pmcstat_warn_long_sampling_periods(uint64_t events_per_window)
+{
+	struct pmc_group_times times;
+	struct pmcstat_ev *ev, *leader;
+	uint32_t nmembers;
+
+	if (events_per_window == 0)
+		return;
+	STAILQ_FOREACH(leader, &args.pa_events, ev_next) {
+		if (leader->ev_groupid == 0 || !leader->ev_is_leader ||
+		    !PMC_IS_SAMPLING_MODE(leader->ev_mode))
+			continue;
+		nmembers = 0;
+		if (pmc_group_read(leader->ev_pmcid, &nmembers, NULL,
+		    &times) != 0 ||
+		    times.pgt_enabled == 0 ||
+		    times.pgt_running >= times.pgt_enabled)
+			continue;
+
+		STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
+			if (ev->ev_groupid != leader->ev_groupid ||
+			    !PMC_IS_SAMPLING_MODE(ev->ev_mode) ||
+			    (uint64_t)ev->ev_count <= events_per_window)
+				continue;
+			warnx(
+"WARNING: \"%s\" samples every %ju events in a multiplexed group, more than\n"
+"one kern.hwpmc.mux_period_ms rotation window can retire; expect few samples\n"
+"or none.  Lower -n, or drop the braces to stop multiplexing.",
+			    ev->ev_name, (uintmax_t)ev->ev_count);
+		}
+	}
+}
+
+/*
+ * How many times a fork could not carry its group to the child.
+ * A kernel counter that nobody reads gives no insight, so -d
+ * compares this value across the run and reports any change.  The
+ * value is zero if the driver does not report it.
+ */
+static uint64_t
+pmcstat_fork_attach_failures(void)
+{
+	uint64_t v;
+	size_t len;
+
+	len = sizeof(v);
+	if (sysctlbyname("kern.hwpmc.stats.group_fork_attach_failures", &v,
+	    &len, NULL, 0) != 0)
+		return (0);
+	return (v);
+}
+
 void
 pmcstat_cleanup(void)
 {
@@ -587,6 +658,7 @@ main(int argc, char **argv)
 	const char *errmsg, *graphfilename;
 	enum pmcstat_state runstate;
 	struct pmc_driverstats ds_start, ds_end;
+	uint64_t fork_misses_start, fork_misses_end, events_per_window;
 	struct pmcstat_ev *ev;
 	struct sigaction sa;
 	struct kevent kev;
@@ -1360,6 +1432,8 @@ main(int argc, char **argv)
 	 * Allocate PMCs.
 	 */
 
+	events_per_window = pmcstat_events_per_window();
+
 	STAILQ_FOREACH(ev, &args.pa_events, ev_next) {
 		int rc;
 
@@ -1536,7 +1610,10 @@ main(int argc, char **argv)
 	if (check_driver_stats && pmc_get_driver_stats(&ds_start) < 0)
 		err(EX_OSERR, "ERROR: Cannot retrieve driver statistics");
 
-	/* Attach process pmcs to the target process. */
+			if (do_descendants)
+		fork_misses_start = pmcstat_fork_attach_failures();
+
+	/* Attach process PMCs to the target process. */
 	if (args.pa_flags & (FLAG_HAS_TARGET | FLAG_HAS_COMMANDLINE)) {
 		if (SLIST_EMPTY(&args.pa_targets))
 			errx(EX_DATAERR,
@@ -1703,6 +1780,8 @@ main(int argc, char **argv)
 
 	} while (runstate != PMCSTAT_FINISHED);
 
+	pmcstat_warn_long_sampling_periods(events_per_window);
+
 	if ((args.pa_flags & FLAG_DO_TOP) && args.pa_toptty) {
 		pmcstat_topexit();
 		args.pa_toptty = 0;
@@ -1714,7 +1793,23 @@ main(int argc, char **argv)
 
 	pmcstat_cleanup();
 
-	/* check if the driver lost any samples or events */
+	/*
+	 * Report children whose group the driver could not carry
+	 * over.  Their work is missing from the totals above, which
+	 * otherwise look complete.
+	 */
+	if (do_descendants) {
+		fork_misses_end = pmcstat_fork_attach_failures();
+		if (fork_misses_end > fork_misses_start)
+			warnx(
+"WARNING: %ju descendant attach%s failed; their contributions are not in\n"
+"these totals.",
+			    (uintmax_t)(fork_misses_end - fork_misses_start),
+			    (fork_misses_end - fork_misses_start) != 1 ?
+			    "es" : "");
+	}
+
+	/* Check if the driver lost any samples or events. */
 	if (check_driver_stats) {
 		if (pmc_get_driver_stats(&ds_end) < 0)
 			err(EX_OSERR,

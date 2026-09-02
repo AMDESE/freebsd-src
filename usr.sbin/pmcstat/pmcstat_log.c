@@ -573,6 +573,11 @@ pmcstat_print_log(void)
 			    ev.pl_u.pl_d.pl_pmcid,
 			    ev.pl_u.pl_d.pl_pid);
 			break;
+		case PMCLOG_TYPE_PMCGROUPINHERITMISS:
+			PMCSTAT_PRINT_ENTRY("group-inherit-miss","0x%x %d",
+			    ev.pl_u.pl_gim.pl_pmcid,
+			    ev.pl_u.pl_gim.pl_pid);
+			break;
 		case PMCLOG_TYPE_PROCCSW:
 			PMCSTAT_PRINT_ENTRY("cswval","0x%x %d %jd",
 			    ev.pl_u.pl_c.pl_pmcid,

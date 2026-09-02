@@ -310,6 +310,7 @@ pmcview::process(struct pmclog_ev &p)
 		return;
 	case PMCLOG_TYPE_PMCATTACH: [[fallthrough]];
 	case PMCLOG_TYPE_PMCDETACH:
+	case PMCLOG_TYPE_PMCGROUPINHERITMISS:
 	case PMCLOG_TYPE_USERDATA:
 	case PMCLOG_TYPE_PROCCSW:
 	case PMCLOG_TYPE_DROPNOTIFY:
