@@ -2283,6 +2283,195 @@ pmc_delta(const struct pmc_classdep *pcd, pmc_value_t newvalue,
 	return (delta);
 }
 
+struct pmc_group_snapshot_context {
+	pmu_group_t			*pgsc_group;
+	struct pmc_op_pmcgroupread	*pgsc_snapshot;
+	volatile u_int			pgsc_error;
+	volatile u_int			pgsc_finalizer;
+	volatile u_int			pgsc_done;
+};
+
+static void
+pmc_group_snapshot_member(struct pmc_group_member *member, pmu_event_t *pe)
+{
+	struct pmc *pm;
+
+	pm = pe->pe_pmc;
+	member->pm_pmcid = pm->pm_handle;
+	if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm))) {
+		member->pm_mflags = PMC_GROUP_MEMBER_F_SAMPLES;
+		member->pm_value = counter_u64_fetch(pe->pe_samples);
+		return;
+	}
+	mtx_pool_lock_spin(pmc_mtxpool, pm);
+	member->pm_value = pm->pm_gv.pm_savedvalue;
+	mtx_pool_unlock_spin(pmc_mtxpool, pm);
+}
+
+static void
+pmc_group_snapshot_cpu(void *arg)
+{
+	struct pmc_group_snapshot_context *ctx;
+	struct pmc_classdep *pcd;
+	struct pmc_process *pp;
+	pmc_value_t newvalue, tmp;
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	struct pmc *pm;
+	int adjri, cpu, error, ri;
+
+	ctx = arg;
+	pg = ctx->pgsc_group;
+	cpu = PCPU_GET(cpuid);
+	critical_enter();
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		pm = pe->pe_pmc;
+		if (pm == NULL || PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)) ||
+		    PMC_ROW_IS_UNASSIGNED(pm) ||
+		    pm->pm_pcpu_state[cpu].pps_cpustate == 0)
+			continue;
+		ri = PMC_TO_ROWINDEX(pm);
+		pcd = pmc_ri_to_classdep(md, ri, &adjri);
+		if (pcd == NULL || pcd->pcd_read_pmc == NULL) {
+			atomic_cmpset_int(&ctx->pgsc_error, 0, EOPNOTSUPP);
+			continue;
+		}
+		mtx_pool_lock_spin(pmc_mtxpool, pm);
+		error = pcd->pcd_read_pmc(cpu, adjri, pm, &newvalue);
+		if (error == 0) {
+			tmp = pmc_delta(pcd, newvalue,
+			    PMC_PCPU_SAVED(cpu, ri));
+			pm->pm_gv.pm_savedvalue += tmp;
+			PMC_PCPU_SAVED(cpu, ri) = newvalue;
+			if (!ctx->pgsc_group->pg_system) {
+				pp = ctx->pgsc_group->pg_pp;
+				if (pp != NULL && pp->pp_pmcs[ri].pp_pmc == pm) {
+					pp->pp_pmcs[ri].pp_pmcval += tmp;
+					pm->pm_pcpu_state[cpu].pps_read_delta += tmp;
+				}
+			}
+		}
+		mtx_pool_unlock_spin(pmc_mtxpool, pm);
+		if (error != 0)
+			atomic_cmpset_int(&ctx->pgsc_error, 0,
+			    error > 0 ? error : EIO);
+	}
+	critical_exit();
+}
+
+static void
+pmc_group_snapshot_finalize(void *arg)
+{
+	struct pmc_group_snapshot_context *ctx;
+	struct pmc_op_pmcgroupread *snapshot;
+	struct pmu_group_time_snapshot times;
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	u_int i;
+
+	ctx = arg;
+	if (!atomic_cmpset_int(&ctx->pgsc_finalizer, 0, 1)) {
+		while (atomic_load_acq_int(&ctx->pgsc_done) == 0)
+			cpu_spinwait();
+		return;
+	}
+	if (ctx->pgsc_error != 0)
+		goto out;
+
+	pg = ctx->pgsc_group;
+	snapshot = ctx->pgsc_snapshot;
+	i = 0;
+	pmc_group_snapshot_member(&snapshot->pm_members[i++], pg->pg_leader);
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (pe != pg->pg_leader)
+			pmc_group_snapshot_member(&snapshot->pm_members[i++], pe);
+	}
+	KASSERT(i == pg->pg_nevents,
+	    ("[pmc,%d] group %u snapshot has %u of %u members", __LINE__,
+	    pg->pg_id, i, pg->pg_nevents));
+
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_time_snapshot_locked(pg, &times, cpu_ticks());
+	snapshot->pm_gflags = times.pgts_system ?
+	    PMC_GROUP_F_TIME_WALL_NS : PMC_GROUP_F_TIME_THREAD_NS;
+	snapshot->pm_enabled = times.pgts_enabled;
+	snapshot->pm_running = times.pgts_running;
+	snapshot->pm_enabled_wall = times.pgts_enabled_wall;
+	snapshot->pm_wall = times.pgts_wall;
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+
+out:
+	atomic_store_rel_int(&ctx->pgsc_done, 1);
+}
+
+static int
+pmc_group_snapshot_counts(pmu_group_t *pg,
+    struct pmc_op_pmcgroupread *snapshot)
+{
+	struct pmc_group_snapshot_context ctx;
+	struct pmc *pm;
+	cpuset_t cpus;
+	bool transitioning;
+	int cpu;
+
+	pm = pg->pg_leader->pe_pmc;
+	critical_enter();
+	for (;;) {
+		CPU_ZERO(&cpus);
+		transitioning = false;
+		mtx_lock_spin(&pg->pg_snapshot_lock);
+		pg->pg_snapshot_pending = true;
+		mtx_pool_lock_spin(pmc_mtxpool, pg);
+		if (!pg->pg_system) {
+			for (cpu = 0; (u_int)cpu < pg->pg_ncpu; cpu++) {
+				if (pg->pg_cpu_state[cpu].pgcs_transitioning) {
+					transitioning = true;
+					break;
+				}
+			}
+		}
+		if (!transitioning) {
+			pg->pg_snapshot_active = true;
+			pg->pg_snapshot_pending = false;
+			if (!PMC_ROW_IS_UNASSIGNED(pm)) {
+				for (cpu = 0; cpu < pmc_cpu_max(); cpu++) {
+					if (!pmc_cpu_is_active(cpu))
+						continue;
+					if (pm->pm_pcpu_state[cpu].pps_cpustate != 0 ||
+					    (!pg->pg_system &&
+					    (u_int)cpu < pg->pg_ncpu &&
+					    pg->pg_cpu_state[cpu].pgcs_counted))
+						CPU_SET(cpu, &cpus);
+				}
+			}
+		}
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+		mtx_unlock_spin(&pg->pg_snapshot_lock);
+		if (!transitioning)
+			break;
+		DELAY(1);
+	}
+
+	ctx.pgsc_group = pg;
+	ctx.pgsc_snapshot = snapshot;
+	ctx.pgsc_error = 0;
+	ctx.pgsc_finalizer = 0;
+	ctx.pgsc_done = 0;
+	if (CPU_EMPTY(&cpus))
+		pmc_group_snapshot_finalize(&ctx);
+	else
+		smp_rendezvous_cpus(cpus, NULL, pmc_group_snapshot_cpu,
+		    pmc_group_snapshot_finalize, &ctx);
+
+	mtx_lock_spin(&pg->pg_snapshot_lock);
+	KASSERT(pg->pg_snapshot_active,
+	    ("[pmc,%d] inactive group snapshot", __LINE__));
+	pg->pg_snapshot_active = false;
+	mtx_unlock_spin(&pg->pg_snapshot_lock);
+	critical_exit();
+	return (ctx.pgsc_error);
+}
+
 /*
  * Take a process-virtual PMC off the hardware of 'cpu' if it is
  * currently loaded there for process 'pp', accumulating its final
@@ -6193,6 +6382,88 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		error = pmu_group_commit(pg);
 		PMCDBG2(PMC, OPS, 1, "groupcommit: gid=%u err=%d",
 		    gcom.pm_groupid, error);
+	}
+	break;
+
+	case PMC_OP_PMCGROUPREAD:
+	{
+		struct pmc_op_pmcgroupread gr, *snapshot;
+		struct pmc_owner *po;
+		struct pmc *pm;
+		pmu_event_t *pe;
+		pmu_group_t *pg;
+		size_t snapshot_size;
+		uint32_t capacity;
+
+		sx_assert(&pmc_sx, SX_XLOCKED);
+		if ((error = copyin(arg, &gr, sizeof(gr))) != 0)
+			break;
+		capacity = gr.pm_nmembers;
+		if (capacity > PMC_GROUP_MAX_MEMBERS) {
+			error = EINVAL;
+			break;
+		}
+		po = pmc_find_owner_descriptor(td->td_proc);
+		if (po == NULL || pmc_find_pmc(gr.pm_leader, &pm) != 0 ||
+		    pm->pm_owner != po) {
+			error = EINVAL;
+			break;
+		}
+		pe = pmu_event_from_pmc(pm);
+		if (pe == NULL || pe->pe_group == NULL ||
+		    !pe->pe_group->pg_committed ||
+		    pe->pe_group->pg_leader != pe) {
+			error = ENOTTY;
+			break;
+		}
+		pg = pe->pe_group;
+		if (pg->pg_releasing) {
+			error = EBUSY;
+			break;
+		}
+		KASSERT(pg->pg_nevents <= PMC_GROUP_MAX_MEMBERS,
+		    ("[pmc,%d] group %u has %u members", __LINE__, pg->pg_id,
+		    pg->pg_nevents));
+		bzero(&gr, sizeof(gr));
+		gr.pm_leader = pm->pm_handle;
+		gr.pm_nmembers = pg->pg_nevents;
+		if (capacity == 0 || capacity < pg->pg_nevents) {
+			/* Report group times for a size query. */
+			if (capacity == 0) {
+				struct pmu_group_time_snapshot times;
+
+				mtx_pool_lock_spin(pmc_mtxpool, pg);
+				pmu_group_time_snapshot_locked(pg, &times,
+				    cpu_ticks());
+				mtx_pool_unlock_spin(pmc_mtxpool, pg);
+				gr.pm_gflags = times.pgts_system ?
+				    PMC_GROUP_F_TIME_WALL_NS :
+				    PMC_GROUP_F_TIME_THREAD_NS;
+				gr.pm_enabled = times.pgts_enabled;
+				gr.pm_running = times.pgts_running;
+				gr.pm_enabled_wall = times.pgts_enabled_wall;
+				gr.pm_wall = times.pgts_wall;
+			}
+			error = copyout(&gr, arg, sizeof(gr));
+			if (error == 0 && capacity != 0)
+				error = E2BIG;
+			break;
+		}
+
+		snapshot_size = sizeof(*snapshot) + pg->pg_nevents *
+		    sizeof(snapshot->pm_members[0]);
+		snapshot = malloc(snapshot_size, M_PMC, M_WAITOK | M_ZERO);
+		snapshot->pm_leader = pm->pm_handle;
+		snapshot->pm_nmembers = pg->pg_nevents;
+		error = pmc_group_snapshot_counts(pg, snapshot);
+		if (error != 0) {
+			free(snapshot, M_PMC);
+			break;
+		}
+
+		PMC_DOWNGRADE_SX();
+		error = copyout(snapshot, arg, snapshot_size);
+		free(snapshot, M_PMC);
 	}
 	break;
 
