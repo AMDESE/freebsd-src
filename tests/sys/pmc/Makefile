@@ -4,6 +4,9 @@ ATF_TESTS_C+=	pmc_api_test
 ATF_TESTS_C+=	pmc_credexec_test
 ATF_TESTS_C+=	pmc_detach_test
 ATF_TESTS_C+=	pmc_exec_test
+ATF_TESTS_C+=	pmc_group_gate_test
+ATF_TESTS_C+=	pmc_group_test
+ATF_TESTS_C+=	pmc_groupread_test
 .if ${MACHINE_ARCH} == "amd64"
 ATF_TESTS_C+=	pmc_exterr_test
 .endif
