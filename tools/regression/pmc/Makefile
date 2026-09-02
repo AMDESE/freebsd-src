@@ -35,7 +35,8 @@ CFLAGS+=	-O -g -Wall
 CXXFLAGS+=	-O -g -Wall
 
 # Kernel ABI tests (need hwpmc(4) loaded and root to run).
-KTESTS=		pmc_group_test pmc_mux_test pmc_mux_works_test
+KTESTS=		pmc_group_test pmc_mux_test pmc_mux_works_test \
+		pmc_mux_rotation_test pmc_mux_drain_test
 
 # Userland-only tests (no PMU access).
 UTESTS=		test_libpmcstat_group
@@ -63,6 +64,15 @@ test_libpmcstat_group: ${.CURDIR}/test_libpmcstat_group.c \
 		${LIBPMCSTAT_SRC}/libpmcstat_group.c
 	${CC} ${CFLAGS} ${LIBPMCSTAT_INC} -o ${.TARGET} ${.ALLSRC} -lpmc
 
+pmc_mux_rotation_test: ${.CURDIR}/pmc_mux_rotation_test.c
+	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
+
+# This test reproduces the multiplex switch-off drain wedge. It needs
+# -lpthread for the pinned real-time worker threads that starve the
+# passive drain.
+pmc_mux_drain_test: ${.CURDIR}/pmc_mux_drain_test.c
+	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc -lpthread
+
 # These are userland-only checks: parsers and pmcstat warning policy.
 check: ${UTESTS}
 	./test_libpmcstat_group
@@ -75,6 +85,10 @@ check-root: ${KTESTS}
 	./pmc_mux_test
 	@echo "==> pmc_mux_works_test"
 	./pmc_mux_works_test
+	@echo "==> pmc_mux_rotation_test"
+	./pmc_mux_rotation_test
+	@echo "==> pmc_mux_drain_test"
+	./pmc_mux_drain_test
 
 clean:
 	rm -f ${ALL} *.o *.core
