@@ -40,6 +40,7 @@
 #include <machine/profile.h>
 #ifdef _KERNEL
 #include <sys/epoch.h>
+#include <sys/mutex.h>
 #include <ck_queue.h>
 #endif
 
@@ -60,7 +61,7 @@
  * The patch version is incremented for every bug fix.
  */
 #define	PMC_VERSION_MAJOR	0x0A
-#define	PMC_VERSION_MINOR	0x03
+#define	PMC_VERSION_MINOR	0x04
 #define	PMC_VERSION_PATCH	0x0000
 
 #define	PMC_VERSION		(PMC_VERSION_MAJOR << 24 |		\
@@ -351,7 +352,11 @@ enum pmc_event {
 	__PMC_OP(WRITELOG, "Write a cookie to the log file")		\
 	__PMC_OP(CLOSELOG, "Close log file")				\
 	__PMC_OP(GETDYNEVENTINFO, "Get dynamic events list")		\
-	__PMC_OP(GETCAPS, "Get capabilities")
+	__PMC_OP(GETCAPS, "Get capabilities")				\
+	__PMC_OP(PMCGROUPCREATE, "Create a PMC event group")		\
+	__PMC_OP(PMCGROUPADD, "Add PMC to a group")			\
+	__PMC_OP(PMCGROUPCOMMIT, "Commit a PMC event group")		\
+	__PMC_OP(PMCGROUPREAD, "Read a PMC event group")
 
 enum pmc_ops {
 #undef	__PMC_OP
@@ -363,12 +368,16 @@ enum pmc_ops {
  * Flags used in operations on PMCs.
  */
 
-#define	PMC_F_UNUSED1		0x00000001 /* unused */
 #define	PMC_F_DESCENDANTS	0x00000002 /*OP ALLOCATE track descendants */
 #define	PMC_F_LOG_PROCCSW	0x00000004 /*OP ALLOCATE track ctx switches */
 #define	PMC_F_LOG_PROCEXIT	0x00000008 /*OP ALLOCATE log proc exits */
 #define	PMC_F_NEWVALUE		0x00000010 /*OP RW write new value */
 #define	PMC_F_OLDVALUE		0x00000020 /*OP RW get old value */
+/*
+ * Bit 0x00000001 is reserved for PMC_PP_ENABLE_MSR_ACCESS in pp_flags.
+ * Do not use bit 0x00000001 for pm_flags. Bit 0x00000040 is free.
+ */
+#define	PMC_F_GROUP_DEFER	0x00000040 /* Defer HW row assign for a group */
 
 /* V2 API */
 #define	PMC_F_CALLCHAIN		0x00000080 /*OP ALLOCATE capture callchains */
@@ -382,7 +391,14 @@ enum pmc_ops {
 					    * through class-dependent fields
 					    */
 
-/* internal flags */
+#define	PMC_F_GROUP_MUX		0x00000400 /* Multiplex when events exceed slots */
+/*
+ * Bit 0x00000800 was PMC_F_SCALED, which made PMCRW return a scaled
+ * value.  Scaling is now done in userland from the group read data.
+ * Keep the bit reserved.  Do not reuse it.
+ */
+#define	PMC_F_SCALED		0x00000800 /* Obsolete.  Reserved. */
+/* Internal flags */
 #define	PMC_F_ATTACHED_TO_OWNER	0x00010000 /*attached to owner*/
 #define	PMC_F_NEEDS_LOGFILE	0x00020000 /*needs log file */
 #define	PMC_F_ATTACH_DONE	0x00040000 /*attached at least once */
@@ -437,6 +453,51 @@ typedef uint64_t	pmc_value_t;
  */
 
 #define	PMC_CPU_ANY	~0
+
+#define	PMC_ROW_UNASSIGNED	0xFF
+
+struct pmc_op_pmcgroupcreate {
+	uint32_t	pm_groupid;	/* Group ID. The kernel returns this. */
+};
+
+struct pmc_op_pmcgroupadd {
+	uint32_t	pm_groupid;
+	pmc_id_t	pm_pmcid;
+	uint32_t	pm_flags;	/* PMC_GROUP_F_LEADER */
+};
+
+#define	PMC_GROUP_F_LEADER	0x00000001
+#define	PMC_GROUP_MAX_MEMBERS	32
+
+/* Max scaling ratio for count extrapolation. */
+#define	PMC_SCALE_MAX		10
+
+struct pmc_op_pmcgroupcommit {
+	uint32_t	pm_groupid;
+};
+
+#define	PMC_GROUP_MEMBER_F_SAMPLES	0x00000001
+
+struct pmc_group_member {
+	pmc_id_t	pm_pmcid;
+	uint32_t	pm_mflags;
+	pmc_value_t	pm_value;	/* new&returned value */
+};
+
+#define	PMC_GROUP_F_TIME_THREAD_NS	0x00000001
+#define	PMC_GROUP_F_TIME_WALL_NS	0x00000002
+
+struct pmc_op_pmcgroupread {
+	pmc_id_t	pm_leader;
+	uint32_t	pm_nmembers;
+	uint32_t	pm_gflags;
+	uint32_t	pm_pad;
+	uint64_t	pm_enabled;
+	uint64_t	pm_running;
+	uint64_t	pm_enabled_wall;
+	uint64_t	pm_wall;
+	struct pmc_group_member pm_members[];
+};
 
 struct pmc_op_pmcallocate {
 	uint32_t	pm_caps;	/* PMC_CAP_* */
@@ -578,6 +639,8 @@ struct pmc_driverstats {
 						   passes */
 	counter_u64_t	pm_merges;		/* merged k+u */
 	counter_u64_t	pm_overwrites;		/* UR overwrites */
+	counter_u64_t	pm_group_fork_attach_failures;	/* Groups a fork
+							   could not follow */
 };
 #endif
 
@@ -746,10 +809,24 @@ struct pmc_target {
  *
  */
 struct pmc_pcpu_state {
+	pmc_value_t pps_read_delta;	/* Delta flushed by group reads */
 	uint32_t pps_overflowcnt;	/* count overflow interrupts */
 	uint8_t pps_stalled;
 	uint8_t pps_cpustate;
 } __aligned(CACHE_LINE_SIZE);
+
+#ifdef _KERNEL
+/*
+ * Types for PMU grouping and multiplexing.
+ * See full definitions in sys/dev/hwpmc/hwpmc_pmu.h.
+ */
+typedef struct pmu_event pmu_event_t;
+typedef struct pmu_group pmu_group_t;
+LIST_HEAD(pmu_group_list, pmu_group);
+LIST_HEAD(pmu_group_target_list, pmu_group_target);
+LIST_HEAD(pmu_thread_residual_list, pmu_thread_residual);
+#endif
+
 struct pmc {
 	LIST_HEAD(,pmc_target)	pm_targets;	/* list of target processes */
 	LIST_ENTRY(pmc)		pm_next;	/* owner's list */
@@ -790,6 +867,7 @@ struct pmc {
 	uint32_t	pm_flags;	/* additional flags PMC_F_... */
 	struct pmc_owner *pm_owner;	/* owner thread state */
 	counter_u64_t		pm_runcount;	/* #cpus currently on */
+	volatile u_int	pm_rotation_drain;
 	enum pmc_state	pm_state;	/* current PMC state */
 
 	/*
@@ -802,10 +880,39 @@ struct pmc {
 
 	/* md extensions */
 	union pmc_md_pmc	pm_md;
+
+#ifdef _KERNEL
+	pmu_event_t		*pm_pmu;	/* Grouping and multiplex state */
+	pmc_id_t		pm_handle;	/* Stable user handle */
+#endif
 };
 
 /*
- * Accessor macros for 'struct pmc'
+ * Row-index range for deferred group PMC handles, before assignment.
+ * Hardware row indices are always below 0x80.
+ */
+#define	PMC_HANDLE_DEFERRED_BASE	0x80
+#define	PMC_HANDLE_DEFERRED_MAX		0xFE
+#define	PMC_HANDLE_DEFERRED_INDEX_MASK	0x1F
+#define	PMC_HANDLE_DEFERRED_GENERATION_MASK	0x03
+#define	PMC_HANDLE_DEFERRED_GENERATION_SHIFT	5
+#define	PMC_HANDLE_DEFERRED_SLOTS	32
+#define	PMC_HANDLE_DEFERRED_INDEX(R)	\
+	((R) & PMC_HANDLE_DEFERRED_INDEX_MASK)
+#define	PMC_HANDLE_DEFERRED_GENERATION(R)	\
+	(((R) >> PMC_HANDLE_DEFERRED_GENERATION_SHIFT) & \
+	    PMC_HANDLE_DEFERRED_GENERATION_MASK)
+#define	PMC_HANDLE_DEFERRED_ROW(I, G)	\
+	(PMC_HANDLE_DEFERRED_BASE | \
+	    (((G) & PMC_HANDLE_DEFERRED_GENERATION_MASK) << \
+	    PMC_HANDLE_DEFERRED_GENERATION_SHIFT) | \
+	    ((I) & PMC_HANDLE_DEFERRED_INDEX_MASK))
+#define	PMC_ROW_IS_DEFERRED_HANDLE(R)	\
+	((R) >= PMC_HANDLE_DEFERRED_BASE && (R) <= PMC_HANDLE_DEFERRED_MAX && \
+	    PMC_HANDLE_DEFERRED_INDEX(R) < PMC_HANDLE_DEFERRED_SLOTS)
+
+/*
+ * Accessor macros for 'struct pmc'.
  */
 
 #define	PMC_TO_MODE(P)		PMC_ID_TO_MODE((P)->pm_id)
@@ -859,6 +966,31 @@ struct pmc_process {
 	int		pp_refcnt;		/* reference count */
 	uint32_t	pp_flags;		/* flags PMC_PP_* */
 	struct proc	*pp_proc;		/* target process */
+#ifdef _KERNEL
+	struct pmu_group_list pp_pmu_groups;	/* Groups anchored here, FIFO order */
+	/*
+	 * Authoritative group-target edges. Each group that explicitly
+	 * targets, or inherits into, this process has one entry here.
+	 */
+	struct pmu_group_target_list pp_pmu_targets;
+	struct mtx	pp_pmu_lock;		/* Protects PMU group and target lists */
+	struct pmu_thread_residual_list pp_pmu_residuals;
+						/* Saved event and TID progress */
+	/*
+	 * Multiplex rotation thread. It rotates groups when the total
+	 * event count exceeds the available hardware counters.
+	 */
+	struct thread	*pp_pmu_rot_td;
+	u_int		pp_pmu_refs;
+	u_int		pp_pmu_rot_quiesce;
+	bool		pp_pmu_rot_running;
+	bool		pp_pmu_rot_needed;	/* An unplaced MUX group waits */
+	bool		pp_pmu_unhashed;
+	/*
+	 * Group cursor for the next rotation tick.
+	 */
+	pmu_group_t	*pp_pmu_rot_cursor;
+#endif
 	struct pmc_targetstate pp_pmcs[];       /* NHWPMCs */
 };
 
@@ -876,10 +1008,23 @@ struct pmc_process {
  *
  */
 
+#ifdef _KERNEL
+struct pmc_deferred_handle_pool {
+	LIST_ENTRY(pmc_deferred_handle_pool) pdh_next;
+	uint32_t	pdh_cpu;
+	uint32_t	pdh_used;
+	uint8_t		pdh_generation[PMC_HANDLE_DEFERRED_SLOTS];
+};
+#endif
+
 struct pmc_owner  {
 	LIST_ENTRY(pmc_owner)	po_next;	/* hash chain */
 	CK_LIST_ENTRY(pmc_owner)	po_ssnext;	/* (g/p) list of SS PMC owners */
 	LIST_HEAD(, pmc)	po_pmcs;	/* owned PMC list */
+#ifdef _KERNEL
+	LIST_HEAD(, pmu_group)	po_groups;	/* PMU event groups */
+	LIST_HEAD(, pmc_deferred_handle_pool) po_deferred_handles;
+#endif
 	TAILQ_HEAD(, pmclog_buffer) po_logbuffers; /* (o) logbuffer list */
 	struct mtx		po_mtx;		/* spin lock for (o) */
 	struct proc		*po_owner;	/* owner proc */
@@ -1025,6 +1170,7 @@ struct pmc_binding {
 };
 
 struct pmc_mdep;
+struct pmc_sched_constraint;
 
 /*
  * struct pmc_classdep
@@ -1071,6 +1217,15 @@ struct pmc_classdep {
 
 	/* machine-specific interface */
 	int (*pcd_get_msr)(int _ri, uint32_t *_msr);
+
+	/*
+	 * PMU grouping and multiplex constraint functions. Optional.
+	 */
+	int (*pcd_can_assign_pmc)(int _ri, struct pmc *_pm,
+		const struct pmc_op_pmcallocate *_a);
+	int (*pcd_get_sched_constraint)(struct pmc *_pm,
+	    const struct pmc_op_pmcallocate *_a,
+	    struct pmc_sched_constraint *_cons);
 };
 
 /*
