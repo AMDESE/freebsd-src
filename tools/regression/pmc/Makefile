@@ -38,7 +38,7 @@ CXXFLAGS+=	-O -g -Wall
 KTESTS=		pmc_group_test pmc_mux_test pmc_mux_works_test
 
 # Userland-only tests (no PMU access).
-UTESTS=
+UTESTS=		test_libpmcstat_group
 
 PMCSTAT?=	/usr/sbin/pmcstat
 
@@ -57,8 +57,15 @@ pmc_mux_test: ${.CURDIR}/pmc_mux_test.c
 pmc_mux_works_test: ${.CURDIR}/pmc_mux_works_test.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
 
+# libpmcstat is INTERNALLIB. It has no .so file installed. Build the
+# parser TU directly into the test binary.
+test_libpmcstat_group: ${.CURDIR}/test_libpmcstat_group.c \
+		${LIBPMCSTAT_SRC}/libpmcstat_group.c
+	${CC} ${CFLAGS} ${LIBPMCSTAT_INC} -o ${.TARGET} ${.ALLSRC} -lpmc
+
 # These are userland-only checks: parsers and pmcstat warning policy.
 check: ${UTESTS}
+	./test_libpmcstat_group
 
 # This in-kernel check needs `kldload hwpmc` and root.
 check-root: ${KTESTS}
