@@ -52,6 +52,8 @@
 #include <machine/md_var.h>
 #include <machine/specialreg.h>
 
+#include "hwpmc_pmu.h"
+
 #define	OVERFLOW_WAIT_COUNT	50
 
 DPCPU_DEFINE_STATIC(uint32_t, nmi_counter);
@@ -606,6 +608,49 @@ amd_can_assign_pmc(int ri, struct pmc *pm, const struct pmc_op_pmcallocate *a)
 		    "AMD unitmask %#jx exceeds allowed mask %#jx",
 		    (uintmax_t)unitmask, (uintmax_t)allowed_unitmask));
 
+	return (0);
+}
+
+/*
+ * Return scheduling constraints for AMD PMCs.
+ */
+static int
+amd_get_sched_constraint(struct pmc *pm __unused,
+    const struct pmc_op_pmcallocate *a, pmc_sched_constraint_t *cons)
+{
+	uint32_t mask;
+	u_int first, count, i;
+
+	if (cons == NULL || a == NULL)
+		return (EINVAL);
+	bzero(cons, sizeof(*cons));
+
+	switch (a->pm_md.pm_amd.pm_amd_sub_class) {
+	case PMC_AMD_SUB_CLASS_CORE:
+		first = 0;
+		count = amd_core_npmcs;
+		break;
+	case PMC_AMD_SUB_CLASS_L3_CACHE:
+		first = amd_core_npmcs;
+		count = amd_l3_npmcs;
+		break;
+	case PMC_AMD_SUB_CLASS_DATA_FABRIC:
+		first = amd_core_npmcs + amd_l3_npmcs;
+		count = amd_df_npmcs;
+		break;
+	default:
+		return (EOPNOTSUPP);
+	}
+	if (count == 0 || first + count > 32)
+		return (EOPNOTSUPP);
+
+	mask = 0;
+	for (i = 0; i < count; i++)
+		mask |= 1u << (first + i);
+	cons->pc_allowed_rows = mask;
+	cons->pc_weight = (uint8_t)count;
+	cons->pc_flags = PMC_SC_F_SHARED;
+	cons->pc_fixed_row = (uint8_t)first;
 	return (0);
 }
 
@@ -1679,6 +1724,10 @@ pmc_amd_initialize(void)
 	pcd->pcd_stop_pmc	= amd_stop_pmc;
 	pcd->pcd_write_pmc	= amd_write_pmc;
 	pcd->pcd_get_caps	= amd_get_caps;
+
+	/* These are the grouping and multiplex constraint functions. */
+	pcd->pcd_can_assign_pmc		= amd_can_assign_pmc;
+	pcd->pcd_get_sched_constraint	= amd_get_sched_constraint;
 
 	pmc_mdep->pmd_cputype	= cputype;
 	pmc_mdep->pmd_intr	= amd_intr;
