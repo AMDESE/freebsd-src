@@ -35,7 +35,7 @@ CFLAGS+=	-O -g -Wall
 CXXFLAGS+=	-O -g -Wall
 
 # Kernel ABI tests (need hwpmc(4) loaded and root to run).
-KTESTS=		pmc_group_test
+KTESTS=		pmc_group_test pmc_mux_test
 
 # Userland-only tests (no PMU access).
 UTESTS=
@@ -51,6 +51,9 @@ all: ${ALL}
 pmc_group_test: ${.CURDIR}/pmc_group_test.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
 
+pmc_mux_test: ${.CURDIR}/pmc_mux_test.c
+	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
+
 # These are userland-only checks: parsers and pmcstat warning policy.
 check: ${UTESTS}
 
@@ -58,6 +61,8 @@ check: ${UTESTS}
 check-root: ${KTESTS}
 	@echo "==> pmc_group_test"
 	./pmc_group_test
+	@echo "==> pmc_mux_test"
+	./pmc_mux_test
 
 clean:
 	rm -f ${ALL} *.o *.core
