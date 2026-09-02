@@ -36,7 +36,7 @@ CXXFLAGS+=	-O -g -Wall
 
 # Kernel ABI tests (need hwpmc(4) loaded and root to run).
 KTESTS=		pmc_group_test pmc_mux_test pmc_mux_works_test \
-		pmc_mux_rotation_test pmc_mux_drain_test
+		pmc_mux_rotation_test pmc_mux_drain_test pmc_group_fuzz
 
 # Userland-only tests (no PMU access).
 UTESTS=		test_libpmcstat_group
@@ -73,6 +73,9 @@ pmc_mux_rotation_test: ${.CURDIR}/pmc_mux_rotation_test.c
 pmc_mux_drain_test: ${.CURDIR}/pmc_mux_drain_test.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc -lpthread
 
+pmc_group_fuzz: ${.CURDIR}/pmc_group_fuzz.c
+	${CC} ${CFLAGS} -o ${.TARGET} ${.ALLSRC} -lpmc
+
 # These are userland-only checks: parsers and pmcstat warning policy.
 check: ${UTESTS}
 	./test_libpmcstat_group
@@ -89,6 +92,8 @@ check-root: ${KTESTS}
 	./pmc_mux_rotation_test
 	@echo "==> pmc_mux_drain_test"
 	./pmc_mux_drain_test
+	@echo "==> pmc_group_fuzz"
+	./pmc_group_fuzz 20000
 
 clean:
 	rm -f ${ALL} *.o *.core
