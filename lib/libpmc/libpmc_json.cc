@@ -67,6 +67,7 @@ static const char *typenames[] = {
 	"{\"type\": \"thr_create\"",
 	"{\"type\": \"thr_exit\"",
 	"{\"type\": \"proc_create\"",
+	"{\"type\": \"pmcgroupinheritmiss\"",
 };
 
 static string
@@ -134,6 +135,20 @@ pmcdetach_to_json(struct pmclog_ev *ev)
 	snprintf(eventbuf, sizeof(eventbuf),
 		"%s, \"pmcid\": \"0x%08x\", \"pid\": \"%d\"}\n",
 			 startent.c_str(), ev->pl_u.pl_d.pl_pmcid, ev->pl_u.pl_d.pl_pid);
+	return string(eventbuf);
+}
+
+static string
+pmcgroupinheritmiss_to_json(struct pmclog_ev *ev)
+{
+	char eventbuf[128];
+	string startent;
+
+	startent = startentry(ev);
+	snprintf(eventbuf, sizeof(eventbuf),
+	    "%s, \"pmcid\": \"0x%08x\", \"pid\": \"%d\"}\n",
+	    startent.c_str(), ev->pl_u.pl_gim.pl_pmcid,
+	    ev->pl_u.pl_gim.pl_pid);
 	return string(eventbuf);
 }
 
@@ -363,6 +378,7 @@ static jconv jsonconvert[] = {
 	threadcreate_to_json,
 	threadexit_to_json,
 	proccreate_to_json,
+	pmcgroupinheritmiss_to_json,
 };
 
 string
@@ -388,6 +404,7 @@ event_to_json(struct pmclog_ev *ev){
 	case PMCLOG_TYPE_THR_CREATE:
 	case PMCLOG_TYPE_THR_EXIT:
 	case PMCLOG_TYPE_PROC_CREATE:
+	case PMCLOG_TYPE_PMCGROUPINHERITMISS:
 		return jsonconvert[ev->pl_type](ev);
 	default:
 		errx(EX_USAGE, "ERROR: unrecognized event type: %d\n", ev->pl_type);

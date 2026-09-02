@@ -391,6 +391,10 @@ pmclog_get_event(void *cookie, char **data, ssize_t *len,
 		PMCLOG_READ32(le,ev->pl_u.pl_d.pl_pmcid);
 		PMCLOG_READ32(le,ev->pl_u.pl_d.pl_pid);
 		break;
+	case PMCLOG_TYPE_PMCGROUPINHERITMISS:
+		PMCLOG_READ32(le,ev->pl_u.pl_gim.pl_pmcid);
+		PMCLOG_READ32(le,ev->pl_u.pl_gim.pl_pid);
+		break;
 	case PMCLOG_TYPE_PROCCSW:
 		PMCLOG_READ64(le,ev->pl_u.pl_c.pl_value);
 		PMCLOG_READ32(le,ev->pl_u.pl_c.pl_pmcid);
