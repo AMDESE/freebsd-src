@@ -9,6 +9,7 @@ ATF_TESTS_C+=	pmc_exterr_test
 .endif
 ATF_TESTS_C+=	pmc_lifecycle_test
 ATF_TESTS_C+=	pmc_log_test
+ATF_TESTS_C+=	pmc_multipart_test
 ATF_TESTS_C+=	pmc_wrap_test
 
 TEST_METADATA.pmc_exterr_test+=	required_user="root"

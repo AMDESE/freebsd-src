@@ -319,6 +319,12 @@ SYSCTL_COUNTER_U64(_kern_hwpmc_stats, OID_AUTO, overwrites, CTLFLAG_RW,
     &pmc_stats.pm_overwrites,
     "# of times a sample was overwritten before being logged");
 
+/* Every sample slot must fit the multipart header, payload, and one PC. */
+#define	PMC_CALLCHAIN_DEPTH_MIN	\
+	((int)PMC_MULTIPART_SAMPLE_MIN_WORDS_FOR(sizeof(uintptr_t)))
+CTASSERT(PMC_MULTIPART_MAX_PAYLOAD64 ==
+    nitems(((struct pmc_multipart *)0)->pl_mpdata));
+
 static int pmc_callchaindepth = PMC_CALLCHAIN_DEPTH;
 SYSCTL_INT(_kern_hwpmc, OID_AUTO, callchaindepth, CTLFLAG_RDTUN,
     &pmc_callchaindepth, 0,
@@ -4781,6 +4787,7 @@ pmc_multipart_add(struct pmc_sample *ps, int type, int length)
 
 	MPASS(ps->ps_pc != NULL);
 	MPASS(ps->ps_nsamples_actual != 0);
+	MPASS(length >= 0 && length <= UCHAR_MAX);
 
 	hdr = (uint8_t *)ps->ps_pc;
 
@@ -4799,18 +4806,19 @@ pmc_multipart_add(struct pmc_sample *ps, int type, int length)
 static void
 pmc_multipart_copydata(struct pmc_sample *ps, struct pmc_multipart *mp)
 {
-	int i, scale;
-	uint64_t *ps_pc;
+	int scale;
 
 	MPASS(ps->ps_pc != NULL);
 	MPASS(ps->ps_nsamples_actual != 0);
-
-	ps_pc = (uint64_t *)ps->ps_pc;
-
-	for (i = 0; i < mp->pl_length; i++)
-		ps_pc[i + 1] = mp->pl_mpdata[i];
+	MPASS(mp->pl_length >= 0 && mp->pl_length <=
+	    PMC_MULTIPART_MAX_PAYLOAD64);
 
 	scale = sizeof(uint64_t) / sizeof(uintptr_t);
+	MPASS(ps->ps_nsamples_actual + scale * mp->pl_length <=
+	    pmc_callchaindepth);
+	memcpy(ps->ps_pc + ps->ps_nsamples_actual, mp->pl_mpdata,
+	    mp->pl_length * sizeof(uint64_t));
+
 	pmc_multipart_add(ps, mp->pl_type, scale * mp->pl_length);
 }
 
@@ -4877,15 +4885,18 @@ pmc_add_sample(ring_type_t ring, struct pmc *pm, struct trapframe *tf,
 	MPASS(ps->ps_pc != NULL);
 
 	if (mp != NULL) {
-		/* Set multipart flag, clear header and copy data */
+		/* Set multipart flag, clear the full header, and copy data. */
 		ps->ps_flags |= PMC_CC_F_MULTIPART;
-		ps->ps_pc[0] = 0;
-		ps->ps_nsamples_actual = 1;
+		bzero(ps->ps_pc, PMC_MULTIPART_HEADER_LENGTH);
+		ps->ps_nsamples_actual = PMC_MULTIPART_HEADER_WORDS_FOR(
+		    sizeof(uintptr_t));
 		pmc_multipart_copydata(ps, mp);
 	}
 
 	if (callchaindepth == 1) {
 		ps->ps_pc[ps->ps_nsamples_actual] = PMC_TRAPFRAME_TO_PC(tf);
+		/* Count any multipart words or they are lost at logging. */
+		callchaindepth += ps->ps_nsamples_actual;
 	} else {
 		/*
 		 * Kernel stack traversals can be done immediately, while we
@@ -5015,9 +5026,9 @@ restart:
 		 * Retrieve the callchain and mark the sample buffer
 		 * as 'processable' by the timer tick sweep code.
 		 */
-		if (__predict_true(nsamples < pmc_callchaindepth - 1))
+		if (__predict_true(nsamples < pmc_callchaindepth))
 			nsamples += pmc_save_user_callchain(ps->ps_pc + nsamples,
-			    pmc_callchaindepth - nsamples - 1, tf);
+			    pmc_callchaindepth - nsamples, tf);
 
 		/*
 		 * We have to prevent hardclock from potentially overwriting
@@ -5145,8 +5156,17 @@ pmc_process_samples(int cpu, ring_type_t ring)
 		 */
 		if (pm->pm_flags & PMC_F_ATTACHED_TO_OWNER) {
 			if (ps->ps_flags & PMC_CC_F_USERSPACE) {
+				uint32_t pcidx;
+
+				pcidx = 0;
+				if ((ps->ps_flags & PMC_CC_F_MULTIPART) != 0 &&
+				    !pmclog_multipart_callchain_offset(ps->ps_pc,
+				    ps->ps_nsamples, &pcidx))
+					goto entrydone;
+				if (pcidx >= ps->ps_nsamples)
+					goto entrydone;
 				td = FIRST_THREAD_IN_PROC(po->po_owner);
-				addupc_intr(td, ps->ps_pc[0], 1);
+				addupc_intr(td, ps->ps_pc[pcidx], 1);
 			}
 		} else
 			pmclog_process_callchain(pm, ps);
@@ -5727,6 +5747,12 @@ pmc_initialize(void)
 		    "range - using %d.\n", pmc_callchaindepth,
 		    PMC_CALLCHAIN_DEPTH_MAX);
 		pmc_callchaindepth = PMC_CALLCHAIN_DEPTH_MAX;
+	}
+	if (pmc_callchaindepth < PMC_CALLCHAIN_DEPTH_MIN) {
+		printf("hwpmc: tunable \"callchaindepth\"=%d too small for "
+		    "multipart samples - using %d.\n", pmc_callchaindepth,
+		    PMC_CALLCHAIN_DEPTH_MIN);
+		pmc_callchaindepth = PMC_CALLCHAIN_DEPTH_MIN;
 	}
 
 	md = pmc_md_initialize();

@@ -127,17 +127,76 @@ struct pmclog_callchain {
 
 /*
  * If the multipart flag is set, then pl_pc contains multiple data types.  The
- * first 8 bytes is a header made up of a 1 byte type and 1 byte length that
- * describes the use of the remaining pl_pc array.
+ * first 8 bytes are a header made up of four 1 byte type and 1 byte length
+ * tuples that describe the use of the remaining pl_pc array.  Lengths are
+ * counted in native pointer-sized pl_pc entries; 64-bit payload values consume
+ * two entries on 32-bit platforms.
  */
 
 #define PMC_MULTIPART_HEADER_LENGTH	8
 #define PMC_MULTIPART_HEADER_ENTRIES	4
+#define	PMC_MULTIPART_HEADER_WORDS_FOR(SZ)	\
+	(PMC_MULTIPART_HEADER_LENGTH / (SZ))
+#define	PMC_MULTIPART_64BIT_WORDS_FOR(N, SZ)	\
+	((N) * (sizeof(uint64_t) / (SZ)))
+#define	PMC_MULTIPART_HEADER_WORDS	\
+	PMC_MULTIPART_HEADER_WORDS_FOR(sizeof(uintfptr_t))
+#define	PMC_MULTIPART_PAYLOAD_WORDS(N)	\
+	PMC_MULTIPART_64BIT_WORDS_FOR((N), sizeof(uintfptr_t))
+#define	PMC_MULTIPART_MAX_PAYLOAD64	10
+#define	PMC_MULTIPART_SAMPLE_MIN_WORDS_FOR(SZ)	\
+	(PMC_MULTIPART_HEADER_WORDS_FOR(SZ) + \
+	    PMC_MULTIPART_64BIT_WORDS_FOR(PMC_MULTIPART_MAX_PAYLOAD64, \
+	    (SZ)) + 1)
+#define	PMC_MULTIPART_SAMPLE_MIN_WORDS	\
+	PMC_MULTIPART_SAMPLE_MIN_WORDS_FOR(sizeof(uintfptr_t))
 
 #define	PMC_CC_MULTIPART_NONE		0
 #define	PMC_CC_MULTIPART_CALLCHAIN	1
 #define	PMC_CC_MULTIPART_IBS_FETCH	2
 #define	PMC_CC_MULTIPART_IBS_OP		3
+
+static __inline int
+pmclog_multipart_callchain_offset(const void *pc, uint32_t npc,
+    uint32_t *offsetp)
+{
+	const uint8_t *hdr;
+	uint32_t i, len, offset, type;
+
+	if (offsetp != NULL)
+		*offsetp = 0;
+	if (pc == NULL || npc < PMC_MULTIPART_HEADER_WORDS)
+		return (0);
+
+	hdr = (const uint8_t *)pc;
+	offset = PMC_MULTIPART_HEADER_WORDS;
+	for (i = 0; i < PMC_MULTIPART_HEADER_ENTRIES; i++) {
+		type = hdr[2 * i];
+		len = hdr[2 * i + 1];
+
+		if (type == PMC_CC_MULTIPART_NONE ||
+		    type == PMC_CC_MULTIPART_CALLCHAIN)
+			break;
+		if (len > npc - offset)
+			return (0);
+		offset += len;
+	}
+	if (offset > npc)
+		return (0);
+	if (offsetp != NULL)
+		*offsetp = offset;
+	return (1);
+}
+
+static __inline uint32_t
+pmclog_multipart_offset(const void *pc)
+{
+	uint32_t offset;
+
+	if (!pmclog_multipart_callchain_offset(pc, ~(uint32_t)0, &offset))
+		return (~(uint32_t)0);
+	return (offset);
+}
 
 struct pmclog_closelog {
 	PMCLOG_ENTRY_HEADER

@@ -121,6 +121,7 @@ static struct mtx pmc_kthread_mtx;	/* sleep lock */
 	}								\
 	ph = (struct pmclog_header *)_le;				\
 	ph->pl_header =_PMCLOG_TO_HEADER(TYPE,_len);			\
+	ph->pl_spare = 0;						\
 	ph->pl_tsc = (TSC);						\
 	_le += sizeof(*ph) / 4	/* skip over timestamp */
 
@@ -139,6 +140,7 @@ static struct mtx pmc_kthread_mtx;	/* sleep lock */
 	}								\
 	ph = (struct pmclog_header *)_le;				\
 	ph->pl_header =_PMCLOG_TO_HEADER(TYPE,_len);			\
+	ph->pl_spare = 0;						\
 	ph->pl_tsc = tsc;						\
 	_le += sizeof(*ph) / 4	/* skip over timestamp */
 

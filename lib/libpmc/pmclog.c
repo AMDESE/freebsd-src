@@ -150,7 +150,8 @@ pmclog_get_record(struct pmclog_parse_state *ps, char **data, ssize_t *len)
 		h = PMCLOG_HEADER_FROM_SAVED_STATE(ps);
 		recordsize = PMCLOG_HEADER_TO_LENGTH(h);
 
-		if (recordsize <= 0)
+		if (recordsize < (int)sizeof(struct pmclog_header) ||
+		    recordsize > (int)sizeof(ps->ps_saved))
 			goto error;
 
 		if (recordsize <= avail) { /* full record available */
@@ -213,7 +214,8 @@ pmclog_get_record(struct pmclog_parse_state *ps, char **data, ssize_t *len)
 		h = PMCLOG_HEADER_FROM_SAVED_STATE(ps);
 		recordsize = PMCLOG_HEADER_TO_LENGTH(h);
 
-		if (recordsize <= 0)
+		if (recordsize < (int)sizeof(struct pmclog_header) ||
+		    recordsize > (int)sizeof(ps->ps_saved))
 			goto error;
 
 		if (avail + ps->ps_svcount < recordsize) {
@@ -300,8 +302,13 @@ pmclog_get_event(void *cookie, char **data, ssize_t *len,
 	} while (0)
 
 #define	PMCLOG_GET_CALLCHAIN_SIZE(SZ,E) do {				\
-		(SZ) = ((E) - offsetof(struct pmclog_callchain, pl_pc))	\
-			/ sizeof(uintfptr_t);				\
+		int _payload;						\
+		_payload = (E) - offsetof(struct pmclog_callchain, pl_pc);	\
+		if (_payload < 0 || _payload % sizeof(uintfptr_t) != 0)	\
+			goto error;					\
+		(SZ) = _payload / sizeof(uintfptr_t);			\
+		if ((SZ) > PMC_CALLCHAIN_DEPTH_MAX)			\
+			goto error;					\
 	} while (0);
 
 	switch (ev->pl_type = PMCLOG_HEADER_TO_TYPE(h)) {

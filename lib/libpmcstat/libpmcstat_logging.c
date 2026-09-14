@@ -191,7 +191,7 @@ pmcstat_analyze_log(struct pmcstat_args *args,
     int *pmcstat_npmcs,
     int *ps_samples_period)
 {
-	uint32_t cpu, cpuflags;
+	uint32_t cpu, cpuflags, noff;
 	pid_t pid;
 	struct pmcstat_image *image;
 	struct pmcstat_process *pp, *ppnew;
@@ -283,6 +283,19 @@ pmcstat_analyze_log(struct pmcstat_args *args,
 				break;
 			}
 
+			/* Skip the header and payload of a multipart sample. */
+			noff = 0;
+			if ((cpuflags & PMC_CC_F_MULTIPART) != 0 &&
+			    !pmclog_multipart_callchain_offset(ev.pl_u.pl_cc.pl_pc,
+			    ev.pl_u.pl_cc.pl_npc, &noff)) {
+				pmcstat_stats->ps_samples_skipped++;
+				break;
+			}
+			if (noff >= ev.pl_u.pl_cc.pl_npc) {
+				pmcstat_stats->ps_samples_skipped++;
+				break;
+			}
+
 			pp = pmcstat_process_lookup(ev.pl_u.pl_cc.pl_pid,
 			    PMCSTAT_ALLOCATE);
 
@@ -298,14 +311,14 @@ pmcstat_analyze_log(struct pmcstat_args *args,
 			if (plugins[args->pa_pplugin].pl_process != NULL)
 				plugins[args->pa_pplugin].pl_process(
 				    pp, pmcr,
-				    ev.pl_u.pl_cc.pl_npc,
-				    ev.pl_u.pl_cc.pl_pc,
+				    ev.pl_u.pl_cc.pl_npc - noff,
+				    ev.pl_u.pl_cc.pl_pc + noff,
 				    PMC_CALLCHAIN_CPUFLAGS_TO_USERMODE(cpuflags),
 				    cpu);
 			plugins[args->pa_plugin].pl_process(
 			    pp, pmcr,
-			    ev.pl_u.pl_cc.pl_npc,
-			    ev.pl_u.pl_cc.pl_pc,
+			    ev.pl_u.pl_cc.pl_npc - noff,
+			    ev.pl_u.pl_cc.pl_pc + noff,
 			    PMC_CALLCHAIN_CPUFLAGS_TO_USERMODE(cpuflags),
 			    cpu);
 			break;

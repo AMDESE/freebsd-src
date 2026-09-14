@@ -48,6 +48,9 @@ IBS events set the PMC_F_MULTIPART flag to signify multiple payload types are
 contained in the callchain.
 The first 8 bytes of the callchain contain four tuples with a one byte type and
 a one byte length field.
+Length fields are expressed in native pointer-sized callchain slots, not in
+64-bit payload words; therefore each 64-bit IBS payload entry consumes one slot
+on 64-bit platforms and two slots on 32-bit platforms.
 The regular PMC callchain can be found following the multipart payload.
 .Pp
 IBS only provides two events that analyze instruction fetches and instruction
