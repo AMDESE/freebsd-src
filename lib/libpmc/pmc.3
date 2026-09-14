@@ -21,7 +21,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd June 23, 2023
+.Dd September 14, 2026
 .Dt PMC 3
 .Os
 .Sh NAME
@@ -114,6 +114,7 @@ These include:
 System scope sampling PMCs.
 .It
 Process scope sampling PMCs.
+This includes self-attached PMCs that request AMD LBR capture.
 .It
 Process scope counting PMCs that have been configured to report PMC
 readings on process context switches or process exits.
@@ -282,6 +283,10 @@ The ability to interrupt the CPU.
 .It Li PMC_CAP_INVERT
 The ability to invert the sense of the hardware conditions being
 measured.
+.It Li PMC_CAP_LBR
+The ability to capture last-branch records with a sampling PMC.
+AMD LBR v2 capture is supported on amd64 as described in
+.Xr pmc.lbr 3 .
 .It Li PMC_CAP_PRECISE
 The ability to perform precise sampling.
 .It Li PMC_CAP_QUALIFIER
@@ -509,7 +514,7 @@ following manual pages:
 .It Li PMC_CLASS_IAF    Ta Xr pmc.iaf 3
 .It Li PMC_CLASS_IAP    Ta Xr pmc.atom 3 , Xr pmc.core 3 , Xr pmc.core2 3
 .It Li PMC_CLASS_IBS    Ta Xr pmc.ibs 3
-.It Li PMC_CLASS_K8     Ta Xr pmc.amd 3
+.It Li PMC_CLASS_K8     Ta Xr pmc.amd 3 , Xr pmc.lbr 3
 .It Li PMC_CLASS_RAPL   Ta Xr pmc.rapl 3
 .It Li PMC_CLASS_PERF   Ta Xr pmc.perf 3
 .It Li PMC_CLASS_TSC    Ta Xr pmc.tsc 3
@@ -565,6 +570,7 @@ Doing otherwise is unsupported.
 .Xr pmc.ibs 3 ,
 .Xr pmc.ivybridge 3 ,
 .Xr pmc.ivybridgexeon 3 ,
+.Xr pmc.lbr 3 ,
 .Xr pmc.perf 3 ,
 .Xr pmc.rapl 3 ,
 .Xr pmc.sandybridge 3 ,

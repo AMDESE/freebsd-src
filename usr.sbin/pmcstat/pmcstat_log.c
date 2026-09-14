@@ -470,13 +470,41 @@ pmcstat_print_ibs_op(struct pmclog_ev_callchain *cc, int offset, int len64)
 }
 #endif
 
+#if defined(__amd64__) || defined(__i386__)
+static int
+pmcstat_print_lbr(struct pmclog_ev_callchain *cc, uint32_t offset,
+    uint32_t len64)
+{
+	const char *lbrbuf;
+	uint64_t from, to;
+	uint32_t i;
+
+	if ((len64 & 1) != 0 || len64 > 2 * AMD_LBR_MAX_DEPTH)
+		return (0);
+
+	lbrbuf = (const char *)&cc->pl_pc[offset];
+	/* Raw From/To pairs, top of stack first (see PMC_CC_MULTIPART_LBR). */
+	for (i = 0; i < len64; i += 2) {
+		memcpy(&from, lbrbuf + i * sizeof(from), sizeof(from));
+		memcpy(&to, lbrbuf + (i + 1) * sizeof(to), sizeof(to));
+		PMCSTAT_PRINT_ENTRY("lbr", "%#jx -> %#jx%s%s",
+		    (uintmax_t)AMD_LBR_IP(from), (uintmax_t)AMD_LBR_IP(to),
+		    (from & AMD_LBR_FROM_MISPREDICT) ? " mispredicted" : "",
+		    (to & AMD_LBR_TO_SPEC) ? " speculative" : "");
+	}
+	return (1);
+}
+#endif
+
 static int
 pmcstat_print_multipart(struct pmclog_ev_callchain *cc)
 {
 	int i;
 	uint8_t *hdr = (uint8_t *)&cc->pl_pc[0];
 	uint32_t offset = PMC_MULTIPART_HEADER_WORDS;
-	uint32_t words_per_64 = sizeof(uint64_t) / sizeof(uintptr_t);
+#if defined(__amd64__) || defined(__i386__)
+	uint32_t words_per_64 = PMC_MULTIPART_PAYLOAD_WORDS(1);
+#endif
 
 	if (cc->pl_npc < offset) {
 		PMCSTAT_PRINT_ENTRY("truncated multipart record!");
@@ -504,6 +532,12 @@ pmcstat_print_multipart(struct pmclog_ev_callchain *cc)
 		} else if (type == PMC_CC_MULTIPART_IBS_OP) {
 			if (len % words_per_64 != 0 ||
 			    !pmcstat_print_ibs_op(cc, offset, len / words_per_64)) {
+				PMCSTAT_PRINT_ENTRY("truncated multipart record!");
+				return (cc->pl_npc);
+			}
+		} else if (type == PMC_CC_MULTIPART_LBR) {
+			if (len % words_per_64 != 0 ||
+			    !pmcstat_print_lbr(cc, offset, len / words_per_64)) {
 				PMCSTAT_PRINT_ENTRY("truncated multipart record!");
 				return (cc->pl_npc);
 			}

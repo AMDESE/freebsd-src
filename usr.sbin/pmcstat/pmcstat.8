@@ -23,7 +23,7 @@
 .\" out of the use of this software, even if advised of the possibility of
 .\" such damage.
 .\"
-.Dd August 14, 2026
+.Dd September 14, 2026
 .Dt PMCSTAT 8
 .Os
 .Sh NAME
@@ -120,6 +120,36 @@ The syntax of these event specifiers is machine dependent and is
 documented in
 .Xr pmc 3 .
 .Pp
+On amd64 kernels with a processor supporting AMD LBR v2, the
+.Li lbr
+event qualifier captures last-branch From/To pairs with core sampling PMCs
+selected by
+.Fl P
+or
+.Fl S .
+It is not supported for counting PMCs selected by
+.Fl p
+or
+.Fl s .
+The
+.Li usr
+and
+.Li os
+qualifiers select the branch privilege filter.
+Omitting both or specifying both selects the same filter.
+.Pp
+All allocated process mode LBR PMCs share one normalized filter.
+System mode LBR PMCs on the same CPU must also share a filter.
+When any process mode LBR PMC is allocated, system mode LBR PMCs on every CPU
+must use that filter.
+System mode LBR PMCs on disjoint CPUs may differ when no process mode LBR PMC
+is allocated.
+A filter reservation is retained while its PMC is stopped and ends only when
+the PMC is released.
+See
+.Xr pmc.lbr 3
+for the supported hardware, log format, and filtering restrictions.
+.Pp
 A process-mode PMC may be configured to be inheritable by the target
 process' current and future children.
 .Sh OPTIONS
@@ -186,6 +216,8 @@ option.
 .It Fl N
 Toggle capturing callchain information for subsequent sampling PMCs.
 The default is for sampling PMCs to capture callchain information.
+For LBR sampling, disabling callchain capture retains the branch records and
+the sampled instruction pointer.
 .It Fl O Ar logfilename
 Send logging output to file
 .Ar logfilename .
@@ -481,6 +513,15 @@ based on processor instructions retired use:
 If callgraph capture is not desired use:
 .Dl "pmcstat -N -S instructions -O /tmp/sample.out"
 .Pp
+To record user-mode branches for a command on a supported AMD LBR v2 processor:
+.Dl "pmcstat -P ex_ret_brn_tkn,lbr,usr -O /tmp/lbr.out command"
+To print the log, including the decoded
+.Li lbr
+entries:
+.Dl "pmcstat -R /tmp/lbr.out"
+Each branch entry shows its From and To addresses and any misprediction or
+speculation flags.
+.Pp
 To send the generated event log to a remote machine use:
 .Dl "pmcstat -S instructions -O remotehost:port"
 On the remote machine, the sample log can be collected using
@@ -549,6 +590,7 @@ files are also only meaningful for native executables.
 .Xr nc 1 ,
 .Xr execvp 3 ,
 .Xr pmc 3 ,
+.Xr pmc.lbr 3 ,
 .Xr pmclog 3 ,
 .Xr hwpmc 4 ,
 .Xr pmccontrol 8 ,

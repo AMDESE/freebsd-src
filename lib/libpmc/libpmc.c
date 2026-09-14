@@ -550,6 +550,7 @@ static const struct pmc_masks k8_mask_nhbb[] = { /* HT bus bandwidth */
 #define	K8_KW_COUNT	"count"
 #define	K8_KW_EDGE	"edge"
 #define	K8_KW_INV	"inv"
+#define	K8_KW_LBR	"lbr"
 #define	K8_KW_MASK	"mask"
 #define	K8_KW_OS	"os"
 #define	K8_KW_USR	"usr"
@@ -658,6 +659,8 @@ k8_allocate_pmc(enum pmc_event pe, char *ctrspec,
 			pmc_config->pm_caps |= PMC_CAP_EDGE;
 		} else if (KWMATCH(p, K8_KW_INV)) {
 			pmc_config->pm_caps |= PMC_CAP_INVERT;
+		} else if (KWMATCH(p, K8_KW_LBR)) {
+			pmc_config->pm_caps |= PMC_CAP_LBR;
 		} else if (KWPREFIXMATCH(p, K8_KW_MASK "=")) {
 			if ((n = pmc_parse_mask(pmask, p, &evmask)) < 0)
 				return (-1);
@@ -1262,12 +1265,12 @@ pmc_allocate(const char *ctrspec, enum pmc_mode mode,
     uint64_t count)
 {
 	size_t n;
-	int retval;
-	char *r, *spec_copy;
+	int retval, unknown_qualifier;
+	char *p, *r, *spec_copy;
 	const char *ctrname;
 	const struct pmc_event_descr *ev;
 	const struct pmc_event_alias *alias;
-	struct pmc_op_pmcallocate pmc_config;
+	struct pmc_op_pmcallocate pmc_config, pmu_config;
 	const struct pmc_class_descr *pcd;
 
 	spec_copy = NULL;
@@ -1292,11 +1295,40 @@ pmc_allocate(const char *ctrspec, enum pmc_mode mode,
 	 * continue with searching the regular event tables.
 	 */
 	r = spec_copy = strdup(ctrspec);
+	if (spec_copy == NULL)
+		goto out;
 	ctrname = strsep(&r, ",");
 	if (pmc_pmu_enabled()) {
-		errno = pmc_pmu_pmcallocate(ctrname, &pmc_config);
-		if (errno == 0)
+		/*
+		 * Keep the original configuration for legacy event lookup:
+		 * pmc_pmu_pmcallocate() clears capabilities on failure.
+		 */
+		pmu_config = pmc_config;
+		unknown_qualifier = 0;
+		while ((p = strsep(&r, ",")) != NULL) {
+			if (KWMATCH(p, "lbr"))
+				pmu_config.pm_caps |= PMC_CAP_LBR;
+			else if (KWMATCH(p, "usr"))
+				pmu_config.pm_caps |= PMC_CAP_USER;
+			else if (KWMATCH(p, "os"))
+				pmu_config.pm_caps |= PMC_CAP_SYSTEM;
+			else if (KWPREFIXMATCH(p, "lbr=")) {
+				errno = EINVAL;
+				goto out;
+			} else
+				unknown_qualifier = 1;
+		}
+		errno = pmc_pmu_pmcallocate(ctrname, &pmu_config);
+		if (errno == 0) {
+			/* Do not silently ignore qualifiers on an LBR request. */
+			if ((pmu_config.pm_caps & PMC_CAP_LBR) != 0 &&
+			    unknown_qualifier) {
+				errno = EINVAL;
+				goto out;
+			}
+			pmc_config = pmu_config;
 			goto found;
+		}
 		if (errno == EOPNOTSUPP)
 			goto out;
 	}
@@ -1313,6 +1345,8 @@ pmc_allocate(const char *ctrspec, enum pmc_mode mode,
 
 	if (spec_copy == NULL)
 		spec_copy = strdup(ctrspec);
+	if (spec_copy == NULL)
+		goto out;
 
 	r = spec_copy;
 	ctrname = strsep(&r, ",");

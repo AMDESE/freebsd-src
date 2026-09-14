@@ -1328,6 +1328,12 @@ pmc_process_exec(struct thread *td, struct pmckern_procexec *pk)
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
 
+	/* SS LBR records also need a reset for unmonitored address spaces. */
+	critical_enter();
+	if (md->pmd_lbr_exec != NULL)
+		md->pmd_lbr_exec(pmc_pcpu[curcpu]);
+	critical_exit();
+
 	p = td->td_proc;
 	pmc_getfilename(p->p_textvp, &fullpath, &freepath);
 
@@ -1480,8 +1486,13 @@ pmc_process_csw_in(struct thread *td)
 
 	p = td->td_proc;
 	pt = NULL;
-	if ((pp = pmc_find_process_descriptor(p, PMC_FLAG_NONE)) == NULL)
+	if ((pp = pmc_find_process_descriptor(p, PMC_FLAG_NONE)) == NULL) {
+		critical_enter();
+		if (md->pmd_lbr_csw != NULL)
+			md->pmd_lbr_csw(pmc_pcpu[curcpu], true);
+		critical_exit();
 		return;
+	}
 
 	KASSERT(pp->pp_proc == td->td_proc,
 	    ("[pmc,%d] not my thread state", __LINE__));
@@ -1616,6 +1627,10 @@ pmc_process_csw_in(struct thread *td)
 	 */
 	(void)(*md->pmd_switch_in)(pc, pp);
 
+	/* Wipe the branch history before the incoming counters go live. */
+	if (md->pmd_lbr_csw != NULL)
+		md->pmd_lbr_csw(pc, true);
+
 	/* Commit all class PMC start updates at one boundary. */
 	pmc_process_csw_start_all(cpu);
 
@@ -1739,6 +1754,10 @@ pmc_process_csw_out(struct thread *td)
 	    ("[pmc,%d weird CPU id %d", __LINE__, cpu));
 
 	pc = pmc_pcpu[cpu];
+
+	/* Suspend branch recording before changing the address space. */
+	if (md->pmd_lbr_csw != NULL)
+		md->pmd_lbr_csw(pc, false);
 
 	/* Close shared class gates before any PMC stop or read. */
 	pmc_process_csw_stop_all(cpu);
@@ -1877,7 +1896,8 @@ pmc_process_csw_out(struct thread *td)
 
 	/*
 	 * Perform any other architecture/cpu dependent thread
-	 * switch out functions.
+	 * switch out functions.  The descriptor may be NULL after detach;
+	 * these callbacks must still revoke access such as CR4.PCE.
 	 */
 	(void)(*md->pmd_switch_out)(pc, pp);
 
@@ -3400,7 +3420,7 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 	uint32_t caps, flags;
 	u_int cpu;
 	int adjri, n;
-	int error;
+	int alloc_error, error;
 
 	class = pa->pm_class;
 	caps  = pa->pm_caps;
@@ -3529,6 +3549,8 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 	} else
 		pmc->pm_sc.pm_initial = pa->pm_count;
 
+	error = EINVAL;
+
 	/* switch thread to CPU 'cpu' */
 	pmc_save_cpu_binding(&pb);
 
@@ -3550,7 +3572,10 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 			    !PMC_IS_SHAREABLE_PMC(cpu, n))
 				continue;
 
-			if (pcd->pcd_allocate_pmc(cpu, adjri, pmc, pa) == 0) {
+			alloc_error = pcd->pcd_allocate_pmc(cpu, adjri, pmc, pa);
+			if ((caps & PMC_CAP_LBR) != 0 && alloc_error != EINVAL)
+				error = alloc_error;
+			if (alloc_error == 0) {
 				/* Success. */
 				break;
 			}
@@ -3564,8 +3589,11 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 			    !pmc_can_allocate_rowindex(p, n, PMC_CPU_ANY))
 				continue;
 
-			if (pcd->pcd_allocate_pmc(td->td_oncpu, adjri, pmc,
-			    pa) == 0) {
+			alloc_error = pcd->pcd_allocate_pmc(td->td_oncpu, adjri,
+			    pmc, pa);
+			if ((caps & PMC_CAP_LBR) != 0 && alloc_error != EINVAL)
+				error = alloc_error;
+			if (alloc_error == 0) {
 				/* Success. */
 				break;
 			}
@@ -3581,8 +3609,8 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 		pmc_destroy_pmc_descriptor(pmc);
 		/* Preserve a more specific error from the class allocator. */
 		if ((td->td_pflags2 & TDP2_EXTERR) != 0)
-			return (EINVAL);
-		return (EXTERROR(EINVAL,
+			return (error);
+		return (EXTERROR(error,
 		    "No PMC row accepted the allocation request"));
 	}
 
@@ -3596,8 +3624,9 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 	if ((pmc->pm_flags & (PMC_F_LOG_PROCEXIT | PMC_F_LOG_PROCCSW)) != 0)
 		pmc->pm_flags |= PMC_F_NEEDS_LOGFILE;
 
-	/* All system mode sampling PMCs require a log file. */
-	if (PMC_IS_SAMPLING_MODE(mode) && PMC_IS_SYSTEM_MODE(mode))
+	/* LBR records cannot be delivered through profil(2), even for self. */
+	if (PMC_IS_SAMPLING_MODE(mode) &&
+	    (PMC_IS_SYSTEM_MODE(mode) || (caps & PMC_CAP_LBR) != 0))
 		pmc->pm_flags |= PMC_F_NEEDS_LOGFILE;
 
 	/*
@@ -4373,6 +4402,9 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 			break;
 
 		error = copyout(&pa, arg, sizeof(pa));
+		/* A failed publication must not retain a shared LBR filter. */
+		if (error != 0 && (pa.pm_caps & PMC_CAP_LBR) != 0)
+			(void)pmc_do_op_pmcrelease(pa.pm_pmcid);
 	}
 	break;
 
@@ -5088,6 +5120,7 @@ pmc_process_samples(int cpu, ring_type_t ring)
 	struct pmc_samplebuffer *psb;
 	uint64_t delta __diagused;
 	int adjri, n;
+	bool restarted;
 
 	KASSERT(PCPU_GET(cpuid) == cpu,
 	    ("[pmc,%d] not on the correct CPU pcpu=%d cpu=%d", __LINE__,
@@ -5147,14 +5180,15 @@ pmc_process_samples(int cpu, ring_type_t ring)
 		 * If this is a process-mode PMC that is attached to
 		 * its owner, and if the PC is in user mode, update
 		 * profiling statistics like timer-based profiling
-		 * would have done.
+		 * would have done.  LBR samples always use the log.
 		 *
 		 * Otherwise, this is either a sampling-mode PMC that
 		 * is attached to a different process than its owner,
 		 * or a system-wide sampling PMC. Dispatch a log
 		 * entry to the PMC's owner process.
 		 */
-		if (pm->pm_flags & PMC_F_ATTACHED_TO_OWNER) {
+		if ((pm->pm_flags & PMC_F_ATTACHED_TO_OWNER) != 0 &&
+		    (pm->pm_caps & PMC_CAP_LBR) == 0) {
 			if (ps->ps_flags & PMC_CC_F_USERSPACE) {
 				uint32_t pcidx;
 
@@ -5193,6 +5227,7 @@ entrydone:
 	 * the check below, we'll end up processing the stalled PMC at
 	 * the next hardclock tick.
 	 */
+	restarted = false;
 	for (n = 0; n < md->pmd_npmc; n++) {
 		pcd = pmc_ri_to_classdep(md, n, &adjri);
 		KASSERT(pcd != NULL,
@@ -5208,7 +5243,10 @@ entrydone:
 
 		pm->pm_pcpu_state[cpu].pps_stalled = 0;
 		(void)(*pcd->pcd_start_pmc)(cpu, adjri, pm);
+		restarted = true;
 	}
+	if (restarted)
+		pmc_process_csw_start_all(cpu);
 }
 
 /*

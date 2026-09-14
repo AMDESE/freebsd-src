@@ -1,0 +1,143 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 Advanced Micro Devices, Inc.
+.\"
+.Dd September 14, 2026
+.Dt PMC.LBR 3
+.Os
+.Sh NAME
+.Nm pmc.lbr
+.Nd Last Branch Record capture for AMD CPUs
+.Sh LIBRARY
+.Lb libpmc
+.Sh SYNOPSIS
+.In pmc.h
+.Sh DESCRIPTION
+AMD Last Branch Record version 2 (LBR v2) records taken branches in a
+per-CPU ring of From/To address pairs.
+Capture is supported only on amd64 kernels, on processors that advertise
+PerfMonV2 and LbrExtV2 with an LBR depth from 1 through 16.
+The ring freezes when a core counter overflows on processors with
+LbrAndPmcFreeze, so the records describe the branches leading up to each
+sampling interrupt.
+.Pp
+LBR capture is not a PMC class of its own.
+It is requested with the
+.Li lbr
+event qualifier, which requests
+.Dv PMC_CAP_LBR ,
+on a core counter allocated in thread-sampling
+.Pq Dv PMC_MODE_TS
+or system-sampling
+.Pq Dv PMC_MODE_SS
+mode.
+For example:
+.Bd -literal -offset indent
+pmcstat -P ex_ret_brn_tkn,lbr,usr -O sample.out command
+pmcstat -R sample.out
+.Ed
+.Pp
+The qualifier takes no value.
+For events named by the pmu-events tables, it may be combined with
+.Li usr
+and
+.Li os ;
+other qualifiers on these LBR requests are rejected.
+Legacy AMD event names retain the qualifiers documented in
+.Xr pmc.amd 3 .
+.Pp
+Allocation fails on unsupported processors or kernels, for counting modes,
+and for PMCs other than AMD core counters, including IBS, L3, and Data Fabric
+PMCs.
+The
+.Li usr
+and
+.Li os
+qualifiers also scope the branch records:
+.Li usr
+alone suppresses branches ending in CPL 0, and
+.Li os
+alone suppresses branches ending in CPL greater than 0.
+Omitting both qualifiers or specifying both selects the same normalized
+filter, which records both user and kernel branches.
+.Pp
+The LBR_SELECT register is shared by all counters on a CPU, and a
+thread-sampling PMC can run on any CPU.
+Consequently all allocated thread-sampling LBR PMCs must use the same
+normalized filter.
+All allocated system-sampling LBR PMCs on a CPU must also use the same filter.
+If any thread-sampling LBR PMC is allocated, every system-sampling LBR PMC
+on every CPU must match its filter.
+System-sampling LBR PMCs on disjoint CPUs may use different filters when no
+thread-sampling LBR PMC is allocated.
+Filters are reserved at allocation and held until release, including while
+the PMC is stopped.
+.Pp
+Samples taken with LBR active set the
+.Dv PMC_CC_F_MULTIPART
+flag and embed a payload of type
+.Dv PMC_CC_MULTIPART_LBR
+in the callchain record, using the layout
+described in
+.Xr pmc.ibs 3 .
+The eight-byte multipart header gives payload lengths in native pointer-sized
+slots; each LBR record contains two 64-bit words.
+The payload holds up to 16 valid branch records, most recent branch first.
+Each record contains the raw From then To register image.
+The instruction pointer is bits [57:0] of each word, sign-extended from bit 57;
+bit 63 of the From word flags a mispredicted branch; bit 62 of the To word flags
+a speculative record.
+Invalid records are dropped in the kernel and do not appear in the payload.
+The payload may be empty after the ring has been reset.
+.Pp
+The textual log decoder in
+.Xr pmcstat 8
+prints an
+.Li lbr
+entry for each From/To pair and marks mispredicted and speculative records.
+Callchain analysis and JSON callchain output use the sampled instruction
+pointers following the payload, without treating branch records as stack frames.
+Disabling callchain capture with
+.Fl N
+in
+.Xr pmcstat 8
+retains the LBR payload and the sampled instruction pointer.
+.Pp
+A self-attached thread-sampling LBR PMC requires a configured log file before it
+can be started.
+Applications must call
+.Xr pmc_configure_logfile 3
+before
+.Xr pmc_start 3 .
+These samples are written to the PMC log rather than the
+.Xr profil 2
+buffer, so that the branch payload is retained.
+.Sh SEE ALSO
+.Xr pmc 3 ,
+.Xr pmc.amd 3 ,
+.Xr pmc.ibs 3 ,
+.Xr pmc_configure_logfile 3 ,
+.Xr pmc_start 3 ,
+.Xr pmclog 3 ,
+.Xr hwpmc 4 ,
+.Xr pmcstat 8
+.Pp
+The record format is described in the
+.Rs
+.%B "Processor Programming Reference (PPR) for AMD Family 19h Model 11h"
+.%N "Publication No. 55901"
+.%Q "Advanced Micro Devices, Inc."
+.Re
+.Sh HISTORY
+LBR v2 capture support was first introduced in
+.Fx 16.0 .
+.Sh CAVEATS
+LBR records are not tagged with an address-space identifier.
+When any LBR PMC is active, hwpmc resets the ring across context switches and
+exec to avoid attributing stale branch addresses to the new address space.
+On CPUs without LbrAndPmcFreeze the ring is stopped while the interrupt handler
+reads it, but records may still include branches taken during interrupt entry.
+.Pp
+User-only sampling drops records whose From address is in the kernel half in
+addition to using the hardware CPL filter.
+Native i386 kernels do not support AMD LBR allocation.

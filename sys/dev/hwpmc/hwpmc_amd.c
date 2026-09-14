@@ -39,6 +39,7 @@
 #include <sys/pcpu.h>
 #include <sys/pmc.h>
 #include <sys/pmckern.h>
+#include <sys/pmclog.h>
 #include <sys/smp.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
@@ -52,7 +53,13 @@
 #include <machine/md_var.h>
 #include <machine/specialreg.h>
 
+#include <dev/hwpmc/hwpmc_amd_lbr.h>
+
 #define	OVERFLOW_WAIT_COUNT	50
+
+/* The multipart carrier must hold a full LBR ring snapshot. */
+CTASSERT(2 * AMD_LBR_MAX_DEPTH <=
+    nitems(((struct pmc_multipart *)0)->pl_mpdata));
 
 DPCPU_DEFINE_STATIC(uint32_t, nmi_counter);
 
@@ -68,6 +75,9 @@ static struct amd_descr *amd_pmcdesc;
 
 static int amd_npmcs;
 static int amd_core_npmcs, amd_l3_npmcs, amd_df_npmcs, amd_umc_npmcs;
+static int amd_lbr_depth;		/* LBR v2 stack depth; 0 = not present */
+static bool amd_lbr_freeze;		/* LbrAndPmcFreeze supported */
+
 
 struct amd_event_code_map {
 	enum pmc_event	pe_ev;	 /* enum value */
@@ -192,8 +202,15 @@ struct amd_cpu {
 	volatile u_int	pc_global_mask;
 	volatile u_int	pc_virtual_mask;
 	volatile u_int	pc_gate_depth;
+	uint32_t	pc_lbr_mask;		/* core rows with LBR active */
+	uint64_t	pc_lbr_select;		/* active LBR_SELECT image */
+	bool		pc_lbr_suspended;
+	volatile u_int	pc_lbr_busy;		/* NMI must not sample a transition */
 };
 static struct amd_cpu **amd_pcpu;
+
+static struct amd_lbr_filter amd_lbr_ts;
+static struct amd_lbr_filter *amd_lbr_ss;
 
 /* Populated by amd_init_policy(); PRECISERETIRE is OR-ed in per-allocation. */
 static uint64_t amd_core_allowed_mask;
@@ -232,6 +249,10 @@ SYSCTL_BOOL(_kern_hwpmc, OID_AUTO, amd_perfmon_v2, CTLFLAG_RD,
     &amd_perfmon_v2, 0,
     "AMD PerfMonV2 global-control path selected (read-only)");
 
+SYSCTL_INT(_kern_hwpmc, OID_AUTO, amd_lbr_depth, CTLFLAG_RD,
+    &amd_lbr_depth, 0,
+    "AMD LBR v2 branch-record stack depth (0 = not present)");
+
 static void
 amd_init_policy(void)
 {
@@ -268,6 +289,203 @@ amd_config_mask(enum sub_class subclass, uint64_t caps)
 	default:
 		return (0);
 	}
+}
+
+static uint64_t
+amd_lbr_filter_for_caps(uint32_t caps)
+{
+
+	if ((caps & (PMC_CAP_USER | PMC_CAP_SYSTEM)) == PMC_CAP_USER)
+		return (AMD_LBR_SELECT_CPL0);
+	if ((caps & (PMC_CAP_USER | PMC_CAP_SYSTEM)) == PMC_CAP_SYSTEM)
+		return (AMD_LBR_SELECT_CPLGT0);
+	return (0);
+}
+
+static int
+amd_lbr_reserve_filter(int cpu, enum pmc_mode mode, uint64_t filter)
+{
+	int error;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	KASSERT(PMC_IS_VIRTUAL_MODE(mode) ||
+	    (cpu >= 0 && cpu < pmc_cpu_max()),
+	    ("[amd,%d] illegal CPU value %d", __LINE__, cpu));
+	error = amd_lbr_filter_reserve(&amd_lbr_ts, amd_lbr_ss, pmc_cpu_max(),
+	    PMC_IS_VIRTUAL_MODE(mode), cpu, filter);
+	if (error != 0)
+		return (EXTERROR(error,
+		    "AMD LBR filter conflicts with an allocated LBR PMC"));
+	return (0);
+}
+
+static void
+amd_lbr_release_filter(int cpu, enum pmc_mode mode, uint64_t filter)
+{
+	struct amd_lbr_filter *slot;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	KASSERT(PMC_IS_VIRTUAL_MODE(mode) ||
+	    (cpu >= 0 && cpu < pmc_cpu_max()),
+	    ("[amd,%d] illegal CPU value %d", __LINE__, cpu));
+	slot = PMC_IS_VIRTUAL_MODE(mode) ? &amd_lbr_ts : &amd_lbr_ss[cpu];
+	KASSERT(slot->refs > 0 && slot->select == filter,
+	    ("[amd,%d] invalid LBR filter release", __LINE__));
+	amd_lbr_filter_release(slot);
+}
+
+static void
+amd_lbr_reset(void)
+{
+	int i;
+
+	for (i = 0; i < amd_lbr_depth; i++) {
+		wrmsr(AMD_MSR_SAMP_BR_FROM + 2 * i, 0);
+		wrmsr(AMD_MSR_SAMP_BR_FROM + 2 * i + 1, 0);
+	}
+	wrmsr(AMD_PMC_GLOBAL_STATUS_CLR, AMD_PMC_GLOBAL_STATUS_LBRS_FROZEN);
+}
+
+static void amd_v2_freeze_core(int cpu);
+static void amd_v2_thaw_core(int cpu);
+
+static void
+amd_lbr_disable(void)
+{
+
+	wrmsr(AMD_MSR_DBG_EXTN_CFG,
+	    rdmsr(AMD_MSR_DBG_EXTN_CFG) & ~AMD_DBG_EXTN_CFG_LBRV2EN);
+	if (amd_lbr_freeze)
+		wrmsr(MSR_DEBUGCTLMSR,
+		    rdmsr(MSR_DEBUGCTLMSR) & ~AMD_DEBUGCTL_FREEZE_LBRS_ON_PMI);
+}
+
+/* Called in an NMI or with interrupts disabled and pc_lbr_busy set. */
+static void
+amd_lbr_resume(struct amd_cpu *pac)
+{
+
+	if (pac->pc_lbr_mask == 0 || pac->pc_lbr_suspended)
+		return;
+	wrmsr(AMD_MSR_LBR_SELECT, pac->pc_lbr_select);
+	if (amd_lbr_freeze)
+		wrmsr(MSR_DEBUGCTLMSR,
+		    rdmsr(MSR_DEBUGCTLMSR) | AMD_DEBUGCTL_FREEZE_LBRS_ON_PMI);
+	wrmsr(AMD_MSR_DBG_EXTN_CFG,
+	    rdmsr(AMD_MSR_DBG_EXTN_CFG) | AMD_DBG_EXTN_CFG_LBRV2EN);
+}
+
+/*
+ * A late NMI can arrive even after GLOBAL_CTL is cleared.  Exclude ordinary
+ * interrupts and tell the NMI handler to discard LBR samples until the ring,
+ * filter and row mask form a consistent state.  The existing nested gate
+ * keeps an interrupt from prematurely restarting the core counters.
+ */
+static register_t
+amd_lbr_update_begin(int cpu)
+{
+	register_t flags;
+
+	flags = intr_disable();
+	KASSERT(atomic_load_acq_int(&amd_pcpu[cpu]->pc_lbr_busy) == 0,
+	    ("[amd,%d] nested LBR update", __LINE__));
+	atomic_store_rel_int(&amd_pcpu[cpu]->pc_lbr_busy, 1);
+	amd_v2_freeze_core(cpu);
+	amd_lbr_disable();
+	return (flags);
+}
+
+static void
+amd_lbr_update_end(int cpu, register_t flags)
+{
+	struct amd_cpu *pac;
+
+	pac = amd_pcpu[cpu];
+	/* An enclosing NMI resumes recording after acknowledging its overflow. */
+	if (atomic_load_acq_int(&pac->pc_gate_depth) == 1)
+		amd_lbr_resume(pac);
+	amd_v2_thaw_core(cpu);
+	atomic_store_rel_int(&pac->pc_lbr_busy, 0);
+	intr_restore(flags);
+}
+
+static void
+amd_lbr_activate(int cpu, int ri, struct pmc *pm)
+{
+	struct amd_cpu *pac;
+	register_t flags;
+	u_int mask;
+
+	if ((pm->pm_caps & PMC_CAP_LBR) == 0)
+		return;
+
+	flags = amd_lbr_update_begin(cpu);
+	pac = amd_pcpu[cpu];
+	mask = 1U << ri;
+	if (pac->pc_lbr_mask == 0) {
+		pac->pc_lbr_select = pm->pm_md.pm_amd.pm_amd_lbr_select;
+		amd_lbr_reset();
+	} else {
+		KASSERT(pac->pc_lbr_select == pm->pm_md.pm_amd.pm_amd_lbr_select,
+		    ("[amd,%d] incompatible reserved LBR filter", __LINE__));
+	}
+	/* A system PMC starts in the current context, outside a switch pair. */
+	if (PMC_IS_SYSTEM_MODE(PMC_TO_MODE(pm)) && pac->pc_lbr_suspended) {
+		amd_lbr_reset();
+		pac->pc_lbr_suspended = false;
+	}
+	pac->pc_lbr_mask |= mask;
+	amd_lbr_update_end(cpu, flags);
+}
+
+static void
+amd_lbr_deactivate(int cpu, int ri, struct pmc *pm)
+{
+	struct amd_cpu *pac;
+	register_t flags;
+
+	if ((pm->pm_caps & PMC_CAP_LBR) == 0)
+		return;
+
+	flags = amd_lbr_update_begin(cpu);
+	pac = amd_pcpu[cpu];
+	pac->pc_lbr_mask &= ~(1U << ri);
+	if (pac->pc_lbr_mask == 0)
+		pac->pc_lbr_select = 0;
+	amd_lbr_update_end(cpu, flags);
+}
+
+static void
+amd_lbr_csw(struct pmc_cpu *pc, bool switch_in)
+{
+	struct amd_cpu *pac;
+	register_t flags;
+	int cpu;
+
+	if (pc == NULL)
+		return;
+	cpu = PMC_PCPU_STATE_TO_CPU(pc->pc_state);
+	pac = amd_pcpu[cpu];
+	if (pac == NULL)
+		return;
+	if (pac->pc_lbr_mask == 0) {
+		pac->pc_lbr_suspended = !switch_in;
+		return;
+	}
+
+	flags = amd_lbr_update_begin(cpu);
+	pac->pc_lbr_suspended = !switch_in;
+	if (switch_in)
+		amd_lbr_reset();
+	amd_lbr_update_end(cpu, flags);
+}
+
+static void
+amd_lbr_exec(struct pmc_cpu *pc)
+{
+
+	/* The same quiesced reset also handles an unpaired exec boundary. */
+	amd_lbr_csw(pc, true);
 }
 
 static __inline u_int
@@ -492,8 +710,10 @@ amd_config_pmc(int cpu, int ri, struct pmc *pm)
 		__LINE__, pm, phw->phw_pmc));
 
 	if (amd_perfmon_v2 && pm == NULL && phw->phw_pmc != NULL &&
-	    amd_pmcdesc[ri].pm_subclass == PMC_AMD_SUB_CLASS_CORE)
+	    amd_pmcdesc[ri].pm_subclass == PMC_AMD_SUB_CLASS_CORE) {
+		amd_lbr_deactivate(cpu, ri, phw->phw_pmc);
 		amd_v2_forget_core(cpu, ri, phw->phw_pmc);
+	}
 
 	phw->phw_pmc = pm;
 	return (0);
@@ -572,6 +792,16 @@ amd_can_assign_pmc(int ri, struct pmc *pm, const struct pmc_op_pmcallocate *a)
 	    ((pd->pd_caps & PMC_CAP_PRECISE) == 0))
 		return (EINVAL);
 
+	/* LBR: core sampling PMCs on LBR v2 hardware only. */
+	if ((caps & PMC_CAP_LBR) != 0) {
+		if ((pd->pd_caps & PMC_CAP_LBR) == 0)
+			return (EXTERROR(EOPNOTSUPP,
+			    "AMD LBR is only supported on LBR-capable core counters"));
+		if (!PMC_IS_SAMPLING_MODE(a->pm_mode))
+			return (EXTERROR(EINVAL,
+			    "AMD LBR requires sampling mode"));
+	}
+
 	/* PMC_F_EV_PMU: config comes from pmu-events tables. */
 	if ((a->pm_flags & PMC_F_EV_PMU) != 0) {
 		config = a->pm_md.pm_amd.pm_amd_config;
@@ -631,6 +861,14 @@ amd_allocate_pmc(int cpu __unused, int ri, struct pmc *pm,
 	if ((a->pm_flags & PMC_F_EV_PMU) != 0) {
 		config = a->pm_md.pm_amd.pm_amd_config;
 		pm->pm_md.pm_amd.pm_amd_evsel = config;
+		if ((caps & PMC_CAP_LBR) != 0) {
+			pm->pm_md.pm_amd.pm_amd_lbr_select =
+			    amd_lbr_filter_for_caps(caps);
+			error = amd_lbr_reserve_filter(a->pm_cpu, a->pm_mode,
+			    pm->pm_md.pm_amd.pm_amd_lbr_select);
+			if (error != 0)
+				return (error);
+		}
 		PMCDBG2(MDP, ALL, 2, "amd-allocate ri=%d -> config=0x%jx",
 		    ri, (uintmax_t)config);
 		return (0);
@@ -670,6 +908,13 @@ amd_allocate_pmc(int cpu __unused, int ri, struct pmc *pm,
 		config |= AMD_PMC_INT;
 
 	pm->pm_md.pm_amd.pm_amd_evsel = config;
+	if ((caps & PMC_CAP_LBR) != 0) {
+		pm->pm_md.pm_amd.pm_amd_lbr_select = amd_lbr_filter_for_caps(caps);
+		error = amd_lbr_reserve_filter(a->pm_cpu, a->pm_mode,
+		    pm->pm_md.pm_amd.pm_amd_lbr_select);
+		if (error != 0)
+			return (error);
+	}
 
 	PMCDBG2(MDP, ALL, 2, "amd-allocate ri=%d -> config=0x%x", ri, config);
 
@@ -681,7 +926,7 @@ amd_allocate_pmc(int cpu __unused, int ri, struct pmc *pm,
  * no-op on this architecture.
  */
 static int
-amd_release_pmc(int cpu, int ri, struct pmc *pmc __unused)
+amd_release_pmc(int cpu, int ri, struct pmc *pmc)
 {
 	struct pmc_hw *phw __diagused;
 
@@ -694,6 +939,10 @@ amd_release_pmc(int cpu, int ri, struct pmc *pmc __unused)
 
 	KASSERT(phw->phw_pmc == NULL,
 	    ("[amd,%d] PHW pmc %p non-NULL", __LINE__, phw->phw_pmc));
+
+	if ((pmc->pm_caps & PMC_CAP_LBR) != 0)
+		amd_lbr_release_filter(cpu, PMC_TO_MODE(pmc),
+		    pmc->pm_md.pm_amd.pm_amd_lbr_select);
 
 	return (0);
 }
@@ -790,6 +1039,9 @@ amd_start_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
 			DPCPU_SET(nmi_counter, 1);
 	}
 
+	if (pd->pm_subclass == PMC_AMD_SUB_CLASS_CORE)
+		amd_lbr_activate(cpu, ri, pm);
+
 	/* Enable EVSEL while the virtual slot's global bit is off. */
 	config = pm->pm_md.pm_amd.pm_amd_evsel | AMD_PMC_ENABLE;
 	wrmsr(pd->pm_evsel, config);
@@ -884,6 +1136,9 @@ amd_stop_pmc_v2(int cpu __diagused, int ri, struct pmc *pm)
 	/* Disable EVSEL after the counter's global bit is off. */
 	wrmsr(pd->pm_evsel,
 	    pm->pm_md.pm_amd.pm_amd_evsel & ~AMD_PMC_ENABLE);
+
+	if (pd->pm_subclass == PMC_AMD_SUB_CLASS_CORE)
+		amd_lbr_deactivate(cpu, ri, pm);
 
 	/* Wait out an in-flight overflow NMI.  The handler clears the status bit. */
 	if (pd->pm_subclass == PMC_AMD_SUB_CLASS_CORE &&
@@ -1028,10 +1283,12 @@ amd_intr_v2(struct trapframe *tf)
 {
 	struct amd_cpu *pac;
 	struct pmc *pm;
+	struct pmc_multipart mpd;
 	pmc_value_t v;
-	uint64_t status, pending;
+	uint64_t from, status, pending, to;
 	uint32_t active = 0, count = 0;
-	int i, error, retval, cpu;
+	int i, error, n, retval, cpu;
+	bool lbr_sample, usronly;
 
 	cpu = curcpu;
 	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
@@ -1051,6 +1308,32 @@ amd_intr_v2(struct trapframe *tf)
 	/* Read the overflow bitmap once. */
 	status = rdmsr(AMD_PMC_GLOBAL_STATUS);
 	status &= amd_global_cntr_mask;
+
+	/* Never expose an old or partially reset ring during a context change. */
+	lbr_sample = amd_lbr_depth > 0 &&
+	    atomic_load_acq_int(&pac->pc_lbr_busy) == 0 &&
+	    !pac->pc_lbr_suspended && pac->pc_lbr_mask != 0;
+	mpd.pl_type = PMC_CC_MULTIPART_LBR;
+	mpd.pl_length = 0;
+	if (lbr_sample) {
+		/* Also quiesce CPUs without hardware freeze, before any MSR read. */
+		amd_lbr_disable();
+		if ((status & pac->pc_lbr_mask) != 0) {
+			usronly = (pac->pc_lbr_select & AMD_LBR_SELECT_CPL0) != 0;
+			for (i = 0, n = 0; i < amd_lbr_depth; i++) {
+				from = rdmsr(AMD_MSR_SAMP_BR_FROM + 2 * i);
+				to = rdmsr(AMD_MSR_SAMP_BR_FROM + 2 * i + 1);
+				if ((to & (AMD_LBR_TO_VALID | AMD_LBR_TO_SPEC)) == 0 ||
+				    (to & AMD_LBR_TO_RESERVED) != 0)
+					continue;
+				if (usronly && (int64_t)AMD_LBR_IP(from) < 0)
+					continue;
+				mpd.pl_mpdata[n++] = from;
+				mpd.pl_mpdata[n++] = to;
+			}
+			mpd.pl_length = n;
+		}
+	}
 
 	/*
 	 * Count all active sampling PMCs, not just the ones that
@@ -1083,18 +1366,28 @@ amd_intr_v2(struct trapframe *tf)
 		wrmsr(amd_pmcdesc[i].pm_perfctr,
 		    AMD_RELOAD_COUNT_TO_PERFCTR_VALUE(v));
 
-		/*
-		 * On a log failure, leave the PMC disabled. MI code restarts
-		 * it via pcd_start_pmc.
-		  */
-		error = pmc_process_interrupt(PMC_HR, pm, tf);
-		if (error != 0)
+		/* On a log failure, leave the PMC disabled.  MI code restarts it via pcd_start_pmc. */
+		if ((pm->pm_caps & PMC_CAP_LBR) != 0) {
+			if (!lbr_sample || (pac->pc_lbr_mask & (1U << i)) == 0)
+				continue;
+			error = pmc_process_interrupt_mp(PMC_HR, pm, tf, &mpd);
+		} else
+			error = pmc_process_interrupt(PMC_HR, pm, tf);
+		if (error != 0) {
 			wrmsr(amd_pmcdesc[i].pm_evsel,
 			    pm->pm_md.pm_amd.pm_amd_evsel & ~AMD_PMC_ENABLE);
+			amd_lbr_deactivate(cpu, i, pm);
+			amd_v2_forget_core(cpu, i, pm);
+		}
 	}
 
-	/* Acknowledge the overflow bits through GLOBAL_STATUS_CLR. */
+	/* Acknowledge overflow bits; clearing LBRS_FROZEN re-arms the ring. */
+	if (amd_lbr_depth > 0)
+		status |= AMD_PMC_GLOBAL_STATUS_LBRS_FROZEN;
 	wrmsr(AMD_PMC_GLOBAL_STATUS_CLR, status);
+
+	if (lbr_sample)
+		amd_lbr_resume(pac);
 
 	/* Thaw the core counters. */
 	amd_v2_thaw_core(cpu);
@@ -1244,6 +1537,11 @@ amd_pcpu_init(struct pmc_mdep *md, int cpu)
 		    __LINE__, cpu));
 		amd_v2_disable_all();
 	}
+	if (amd_lbr_depth > 0) {
+		amd_lbr_disable();
+		amd_lbr_reset();
+		wrmsr(AMD_MSR_LBR_SELECT, 0);
+	}
 
 	/*
 	 * Set the content of the hardware descriptors to a known
@@ -1292,8 +1590,12 @@ amd_pcpu_fini(struct pmc_mdep *md, int cpu)
 		    ("[amd,%d] nonzero desired mask on CPU %d", __LINE__, cpu));
 		KASSERT(atomic_load_acq_int(&pac->pc_virtual_mask) == 0,
 		    ("[amd,%d] nonzero virtual mask on CPU %d", __LINE__, cpu));
+		KASSERT(pac->pc_lbr_mask == 0,
+		    ("[amd,%d] nonzero LBR mask on CPU %d", __LINE__, cpu));
 		amd_v2_disable_all();
 	}
+	if (amd_lbr_depth > 0)
+		amd_lbr_disable();
 	amd_pcpu[cpu] = NULL;
 
 #ifdef	HWPMC_DEBUG
@@ -1343,6 +1645,13 @@ amd_v2_hwcheck_cpu(void *arg)
 		if ((reg & AMD_PMC_ENABLE) != 0)
 			atomic_set_int(&state->avh_enabled, 1);
 	}
+	if (amd_lbr_depth > 0) {
+		error = rdmsr_safe(AMD_MSR_DBG_EXTN_CFG, &reg);
+		if (error != 0)
+			atomic_set_int(&state->avh_read_error, 1);
+		else if ((reg & AMD_DBG_EXTN_CFG_LBRV2EN) != 0)
+			atomic_set_int(&state->avh_enabled, 1);
+	}
 }
 
 /*
@@ -1364,7 +1673,7 @@ amd_hwcheck(void)
 		smp_rendezvous_cpus(all_cpus, smp_no_rendezvous_barrier,
 		    amd_v2_hwcheck_cpu, smp_no_rendezvous_barrier, &state);
 		if (state.avh_read_error != 0) {
-			printf("hwpmc: AMD PerfMonV2 EVSEL read failed on one "
+			printf("hwpmc: AMD PerfMonV2 control register read failed on one "
 			    "or more CPUs!\n");
 			return (-1);
 		}
@@ -1507,6 +1816,18 @@ pmc_amd_initialize(void)
 		/* EAX bit 0 holds the PerfMonV2 flag. */
 		if (EXTPERFMON_PERFMONV2(regs[0]) && family >= 0x19)
 			amd_perfmon_v2 = true;
+#if defined(__amd64__)
+		/* LBR v2 rides on the PerfMonV2 machinery. */
+		if (amd_perfmon_v2 && EXTPERFMON_LBR_V2(regs[0])) {
+			amd_lbr_depth = EXTPERFMON_LBR_DEPTH(regs[1]);
+			if (amd_lbr_depth > AMD_LBR_MAX_DEPTH) {
+				printf("hwpmc: unsupported LBR depth %d\n",
+				    amd_lbr_depth);
+				amd_lbr_depth = 0;
+			}
+			amd_lbr_freeze = EXTPERFMON_LBR_FREEZE(regs[0]) != 0;
+		}
+#endif
 	}
 
 	/*
@@ -1542,6 +1863,8 @@ pmc_amd_initialize(void)
 		 */
 		if ((family >= 0x1a) && (i == 2))
 			d->pm_descr.pd_caps |= PMC_CAP_PRECISE;
+		if (amd_lbr_depth > 0)
+			d->pm_descr.pd_caps |= PMC_CAP_LBR;
 		d->pm_descr.pd_width = 48;
 		if ((amd_feature2 & AMDID2_PCXC) != 0) {
 			d->pm_evsel = AMD_PMC_CORE_BASE + 2 * i;
@@ -1625,6 +1948,10 @@ pmc_amd_initialize(void)
 	 */
 	amd_pcpu = malloc(sizeof(struct amd_cpu *) * pmc_cpu_max(), M_PMC,
 	    M_WAITOK | M_ZERO);
+	if (amd_lbr_depth > 0) {
+		amd_lbr_ss = malloc(sizeof(*amd_lbr_ss) * pmc_cpu_max(), M_PMC,
+		    M_WAITOK | M_ZERO);
+	}
 
 	/*
 	 * These processors have two or three classes of PMCs: the TSC,
@@ -1661,6 +1988,8 @@ pmc_amd_initialize(void)
 	pcd = &pmc_mdep->pmd_classdep[PMC_MDEP_CLASS_INDEX_K8];
 
 	pcd->pcd_caps		= AMD_PMC_CAPS;
+	if (amd_lbr_depth > 0)
+		pcd->pcd_caps |= PMC_CAP_LBR;
 	pcd->pcd_class		= PMC_CLASS_K8;
 	pcd->pcd_num		= amd_npmcs;
 	pcd->pcd_ri		= pmc_mdep->pmd_npmc;
@@ -1693,6 +2022,10 @@ pmc_amd_initialize(void)
 		pcd->pcd_stop_all  = amd_stop_pmc_all_v2;
 		pmc_mdep->pmd_intr = amd_intr_v2;
 	}
+	if (amd_lbr_depth > 0) {
+		pmc_mdep->pmd_lbr_csw = amd_lbr_csw;
+		pmc_mdep->pmd_lbr_exec = amd_lbr_exec;
+	}
 
 	pmc_mdep->pmd_npmc	+= amd_npmcs;
 
@@ -1717,9 +2050,11 @@ pmc_amd_initialize(void)
 	return (pmc_mdep);
 
 error:
-	free(pmc_mdep, M_PMC);
+	free(amd_lbr_ss, M_PMC);
+	amd_lbr_ss = NULL;
 	free(amd_pcpu, M_PMC);
 	amd_pcpu = NULL;
+	free(pmc_mdep, M_PMC);
 	free(amd_pmcdesc, M_PMC);
 	amd_pmcdesc = NULL;
 	amd_npmcs = 0;
@@ -1747,6 +2082,8 @@ pmc_amd_finalize(struct pmc_mdep *md)
 		KASSERT(amd_pcpu[i] == NULL,
 		    ("[amd,%d] non-null pcpu cpu %d", __LINE__, i));
 
+	free(amd_lbr_ss, M_PMC);
+	amd_lbr_ss = NULL;
 	free(amd_pcpu, M_PMC);
 	amd_pcpu = NULL;
 

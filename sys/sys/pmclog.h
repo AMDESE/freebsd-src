@@ -143,7 +143,7 @@ struct pmclog_callchain {
 	PMC_MULTIPART_HEADER_WORDS_FOR(sizeof(uintfptr_t))
 #define	PMC_MULTIPART_PAYLOAD_WORDS(N)	\
 	PMC_MULTIPART_64BIT_WORDS_FOR((N), sizeof(uintfptr_t))
-#define	PMC_MULTIPART_MAX_PAYLOAD64	10
+#define	PMC_MULTIPART_MAX_PAYLOAD64	32
 #define	PMC_MULTIPART_SAMPLE_MIN_WORDS_FOR(SZ)	\
 	(PMC_MULTIPART_HEADER_WORDS_FOR(SZ) + \
 	    PMC_MULTIPART_64BIT_WORDS_FOR(PMC_MULTIPART_MAX_PAYLOAD64, \
@@ -155,6 +155,13 @@ struct pmclog_callchain {
 #define	PMC_CC_MULTIPART_CALLCHAIN	1
 #define	PMC_CC_MULTIPART_IBS_FETCH	2
 #define	PMC_CC_MULTIPART_IBS_OP		3
+/*
+ * PMC_CC_MULTIPART_LBR payload: N valid branch records, top-of-stack first,
+ * two 64-bit words each: the raw From then To MSR image (AMD LbrExtV2).
+ * The IP is bits [57:0], sign-extended from bit 57; From[63] is the
+ * mispredict flag; To[63] is valid and To[62] is speculative.
+ */
+#define	PMC_CC_MULTIPART_LBR		4
 
 static __inline int
 pmclog_multipart_callchain_offset(const void *pc, uint32_t npc,

@@ -297,7 +297,8 @@ enum pmc_disp {
 	__PMC_CAP(TAGGING,	10, "tag upstream events")		\
 	__PMC_CAP(CASCADE,	11, "cascade counters")			\
 	__PMC_CAP(SYSWIDE,	12, "system wide counter")		\
-	__PMC_CAP(DOMWIDE,	13, "NUMA domain wide counter")
+	__PMC_CAP(DOMWIDE,	13, "NUMA domain wide counter")		\
+	__PMC_CAP(LBR,		14, "record last-branch stack")
 
 enum pmc_caps
 {
@@ -307,7 +308,7 @@ enum pmc_caps
 };
 
 #define	PMC_CAP_FIRST		PMC_CAP_INTERRUPT
-#define	PMC_CAP_LAST		PMC_CAP_DOMWIDE
+#define	PMC_CAP_LAST		PMC_CAP_LBR
 
 /*
  * PMC Event Numbers
@@ -987,7 +988,7 @@ struct pmc_samplebuffer {
 struct pmc_multipart {
 	char			pl_type;
 	char			pl_length;
-	uint64_t		pl_mpdata[10];
+	uint64_t		pl_mpdata[32];	/* fits 16 LBR From/To pairs */
 };
 
 /*
@@ -1094,6 +1095,10 @@ struct pmc_mdep  {
 
 	/* handle a PMC interrupt */
 	int (*pmd_intr)(struct trapframe *_tf);
+
+	/* optional MD hook for branch-trace context hygiene */
+	void (*pmd_lbr_csw)(struct pmc_cpu *_p, bool _switch_in);
+	void (*pmd_lbr_exec)(struct pmc_cpu *_p);
 
 	/*
 	 * PMC class dependent information.

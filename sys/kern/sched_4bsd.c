@@ -1076,7 +1076,8 @@ sched_4bsd_switch(struct thread *td, int flags)
 
 	if (td != newtd) {
 #ifdef	HWPMC_HOOKS
-		if (PMC_PROC_IS_USING_PMCS(td->td_proc))
+		if (PMC_PROC_IS_USING_PMCS(td->td_proc) ||
+		    PMC_SYSTEM_SAMPLING_ACTIVE())
 			PMC_SWITCH_CONTEXT(td, PMC_FN_CSW_OUT);
 #endif
 
@@ -1121,7 +1122,8 @@ sched_4bsd_switch(struct thread *td, int flags)
 
 		SDT_PROBE0(sched, , , on__cpu);
 #ifdef	HWPMC_HOOKS
-		if (PMC_PROC_IS_USING_PMCS(td->td_proc))
+		if (PMC_PROC_IS_USING_PMCS(td->td_proc) ||
+		    PMC_SYSTEM_SAMPLING_ACTIVE())
 			PMC_SWITCH_CONTEXT(td, PMC_FN_CSW_IN);
 #endif
 	} else {

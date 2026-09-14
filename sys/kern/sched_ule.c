@@ -2415,7 +2415,8 @@ sched_ule_switch(struct thread *td, int flags)
 	 */
 	if (td != newtd) {
 #ifdef	HWPMC_HOOKS
-		if (PMC_PROC_IS_USING_PMCS(td->td_proc))
+		if (PMC_PROC_IS_USING_PMCS(td->td_proc) ||
+		    PMC_SYSTEM_SAMPLING_ACTIVE())
 			PMC_SWITCH_CONTEXT(td, PMC_FN_CSW_OUT);
 #endif
 		SDT_PROBE2(sched, , , off__cpu, newtd, newtd->td_proc);
@@ -2441,7 +2442,8 @@ sched_ule_switch(struct thread *td, int flags)
 
 		SDT_PROBE0(sched, , , on__cpu);
 #ifdef	HWPMC_HOOKS
-		if (PMC_PROC_IS_USING_PMCS(td->td_proc))
+		if (PMC_PROC_IS_USING_PMCS(td->td_proc) ||
+		    PMC_SYSTEM_SAMPLING_ACTIVE())
 			PMC_SWITCH_CONTEXT(td, PMC_FN_CSW_IN);
 #endif
 	} else {
