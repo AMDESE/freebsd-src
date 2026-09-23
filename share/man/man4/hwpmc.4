@@ -28,7 +28,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd July 8, 2023
+.Dd September 23, 2026
 .Dt HWPMC 4
 .Os
 .Sh NAME
@@ -428,7 +428,10 @@ tunables:
 .Bl -tag -width indent
 .It Va kern.hwpmc.callchaindepth Pq integer, read-only
 The maximum number of call chain records to capture per sample.
-The default is 8.
+The default is 128.
+Each sample slot must also hold the largest multipart payload
+(an 8-byte header, 32 64-bit words and one program counter), so smaller
+values are raised to 34 on 64-bit platforms and 67 on 32-bit platforms.
 .It Va kern.hwpmc.debugflags Pq string, read-write
 (Only available if the
 .Nm

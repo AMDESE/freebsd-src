@@ -157,9 +157,11 @@ struct pmclog_callchain {
 #define	PMC_CC_MULTIPART_IBS_OP		3
 /*
  * PMC_CC_MULTIPART_LBR payload: N valid branch records, top-of-stack first,
- * two 64-bit words each: the raw From then To MSR image (AMD LbrExtV2).
- * The IP is bits [57:0], sign-extended from bit 57; From[63] is the
- * mispredict flag; To[63] is valid and To[62] is speculative.
+ * two 64-bit words each: the From then To MSR image (AMD LbrExtV2).
+ * The IP is bits [57:0], sign-extended from bit 57 (the kernel rewrites the
+ * field from the implemented address width); From[63] is the mispredict
+ * flag; To[63] is valid and To[62] is speculative.  The payload may be
+ * empty.
  */
 #define	PMC_CC_MULTIPART_LBR		4
 

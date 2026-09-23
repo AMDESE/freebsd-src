@@ -23,7 +23,7 @@
 .\" out of the use of this software, even if advised of the possibility of
 .\" such damage.
 .\"
-.Dd September 14, 2026
+.Dd September 23, 2026
 .Dt PMCSTAT 8
 .Os
 .Sh NAME
@@ -137,6 +137,11 @@ and
 .Li os
 qualifiers select the branch privilege filter.
 Omitting both or specifying both selects the same filter.
+Unless the
+.Li usr
+qualifier is given alone, kernel branches may be recorded, and the
+allocation requires the same privilege as a system-wide PMC even with
+.Fl P .
 .Pp
 All allocated process mode LBR PMCs share one normalized filter.
 System mode LBR PMCs on the same CPU must also share a filter.

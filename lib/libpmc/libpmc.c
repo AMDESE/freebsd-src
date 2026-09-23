@@ -1265,7 +1265,8 @@ pmc_allocate(const char *ctrspec, enum pmc_mode mode,
     uint64_t count)
 {
 	size_t n;
-	int retval, unknown_qualifier;
+	int lbr, retval, unknown_qualifier;
+	uint32_t caps;
 	char *p, *r, *spec_copy;
 	const char *ctrname;
 	const struct pmc_event_descr *ev;
@@ -1302,27 +1303,34 @@ pmc_allocate(const char *ctrspec, enum pmc_mode mode,
 		/*
 		 * Keep the original configuration for legacy event lookup:
 		 * pmc_pmu_pmcallocate() clears capabilities on failure.
+		 *
+		 * pmu-events specifiers historically ignore qualifiers.  Only
+		 * an LBR request honors "usr" and "os", which also select the
+		 * branch filter (and thereby the privilege needed), and
+		 * rejects anything else instead of silently ignoring it.
 		 */
 		pmu_config = pmc_config;
-		unknown_qualifier = 0;
+		lbr = unknown_qualifier = 0;
+		caps = 0;
 		while ((p = strsep(&r, ",")) != NULL) {
 			if (KWMATCH(p, "lbr"))
-				pmu_config.pm_caps |= PMC_CAP_LBR;
+				lbr = 1;
 			else if (KWMATCH(p, "usr"))
-				pmu_config.pm_caps |= PMC_CAP_USER;
+				caps |= PMC_CAP_USER;
 			else if (KWMATCH(p, "os"))
-				pmu_config.pm_caps |= PMC_CAP_SYSTEM;
+				caps |= PMC_CAP_SYSTEM;
 			else if (KWPREFIXMATCH(p, "lbr=")) {
 				errno = EINVAL;
 				goto out;
 			} else
 				unknown_qualifier = 1;
 		}
+		if (lbr)
+			pmu_config.pm_caps |= caps | PMC_CAP_LBR;
 		errno = pmc_pmu_pmcallocate(ctrname, &pmu_config);
 		if (errno == 0) {
-			/* Do not silently ignore qualifiers on an LBR request. */
-			if ((pmu_config.pm_caps & PMC_CAP_LBR) != 0 &&
-			    unknown_qualifier) {
+			/* Legacy event names keep their own qualifiers. */
+			if (lbr && unknown_qualifier) {
 				errno = EINVAL;
 				goto out;
 			}

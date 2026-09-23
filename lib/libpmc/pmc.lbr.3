@@ -2,7 +2,7 @@
 .\"
 .\" Copyright (c) 2026 Advanced Micro Devices, Inc.
 .\"
-.Dd September 14, 2026
+.Dd September 23, 2026
 .Dt PMC.LBR 3
 .Os
 .Sh NAME
@@ -61,6 +61,20 @@ alone suppresses branches ending in CPL greater than 0.
 Omitting both qualifiers or specifying both selects the same normalized
 filter, which records both user and kernel branches.
 .Pp
+Branch records that may contain kernel addresses disclose kernel layout and
+control flow.
+Unless
+.Va security.bsd.unprivileged_syspmcs
+is set, an LBR PMC without the
+.Li usr
+qualifier alone requires the same privilege as a system-wide PMC
+.Pq Dv PRIV_PMC_SYSTEM ,
+even in thread-sampling mode, and is never available inside a jail.
+Allocation fails with
+.Er EPERM
+otherwise.
+User-only LBR PMCs follow the ordinary process-mode rules.
+.Pp
 The LBR_SELECT register is shared by all counters on a CPU, and a
 thread-sampling PMC can run on any CPU.
 Consequently all allocated thread-sampling LBR PMCs must use the same
@@ -84,11 +98,24 @@ The eight-byte multipart header gives payload lengths in native pointer-sized
 slots; each LBR record contains two 64-bit words.
 The payload holds up to 16 valid branch records, most recent branch first.
 Each record contains the raw From then To register image.
-The instruction pointer is bits [57:0] of each word, sign-extended from bit 57;
-bit 63 of the From word flags a mispredicted branch; bit 62 of the To word flags
-a speculative record.
+The instruction pointer is bits [57:0] of each word, sign-extended from bit 57.
+The kernel rewrites these bits from the processor's implemented linear-address
+width, so the result is a canonical address on every processor.
+Bit 63 of the From word flags a mispredicted branch; bit 63 of the To word
+flags a valid (retired) record and bit 62 a speculative one.
 Invalid records are dropped in the kernel and do not appear in the payload.
-The payload may be empty after the ring has been reset.
+.Pp
+Every sample of an LBR PMC carries an LBR payload part, but the payload
+is empty when the ring could not be read for that interrupt: shortly after
+a context switch or exec reset, while hwpmc updates the recording state, or
+for an overflow of a PMC that was not yet active on the CPU.
+The
+.Va kern.hwpmc.amd_lbr_empty_samples
+sysctl counts samples that were logged empty for these reasons; an
+empty payload after a reset with no branches since is not counted.
+The
+.Va kern.hwpmc.amd_lbr_depth
+sysctl reports the ring depth, or 0 when LBR capture is unavailable.
 .Pp
 The textual log decoder in
 .Xr pmcstat 8
@@ -138,6 +165,16 @@ exec to avoid attributing stale branch addresses to the new address space.
 On CPUs without LbrAndPmcFreeze the ring is stopped while the interrupt handler
 reads it, but records may still include branches taken during interrupt entry.
 .Pp
-User-only sampling drops records whose From address is in the kernel half in
-addition to using the hardware CPL filter.
+User-only sampling drops records whose From or To address is a kernel
+address, in addition to using the hardware CPL filter, which does not
+suppress returns from the kernel to user mode.
 Native i386 kernels do not support AMD LBR allocation.
+.Pp
+LBR capture is disabled, and the rest of hwpmc remains usable, when the LBR
+registers cannot be read or are already enabled when the module loads,
+for example by firmware or a hypervisor.
+.Pp
+Branches taken by a
+.Xr bhyve 8
+guest are recorded in the host ring unless the hypervisor virtualizes LBR,
+and are attributed to the thread running the virtual CPU.

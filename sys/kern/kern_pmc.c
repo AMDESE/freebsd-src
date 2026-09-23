@@ -85,6 +85,12 @@ DPCPU_DEFINE(uint8_t, pmc_sampled);
 volatile int pmc_ss_count;
 
 /*
+ * A global count of running SS mode PMCs that need every context switch;
+ * see PMC_SYSTEM_CSW_ACTIVE().
+ */
+volatile int pmc_ss_csw_count;
+
+/*
  * Since PMC(4) may not be loaded in the current kernel, the
  * convention followed is that a non-NULL value of 'pmc_hook' implies
  * the presence of this kernel module.

@@ -8,14 +8,19 @@
 #include <sys/cpuset.h>
 #include <sys/mman.h>
 #include <sys/module.h>
+#include <sys/pmclog.h>
 #include <sys/sysctl.h>
+#include <sys/wait.h>
 
 #include <atf-c.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pmc.h>
+#include <pmclog.h>
+#include <pwd.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -30,7 +35,9 @@
 #define	EVENT		"k8-fr-retired-branches"
 #define	USER_LBR	EVENT ",usr,lbr"
 #define	KERNEL_LBR	EVENT ",os,lbr"
+#define	ALL_LBR		EVENT ",lbr"
 #define	SLOW_PERIOD	(UINT64_C(1) << 40)
+#define	FAST_PERIOD	UINT64_C(20011)	/* retired taken branches */
 
 struct context {
 	pmc_id_t id[3];
@@ -502,6 +509,387 @@ ATF_TC_BODY(lbr_copyout_rollback, tc)
 	cleanup(&c);
 }
 
+/*
+ * Sampling helpers.  The workload mixes user branches with system calls so
+ * that, without the user-only software filter, return-to-user records with
+ * a kernel From address would appear in the payload.
+ */
+static volatile uint64_t sink;
+static pmc_id_t scan_log_pending_id;
+
+static void
+workload(unsigned int iterations)
+{
+	unsigned int i, j;
+
+	for (i = 0; i < iterations; i++) {
+		for (j = 0; j < 2000; j++)
+			sink += (j & 1) != 0 ? j : sink >> 1;
+		(void)getppid();
+	}
+}
+
+static uint64_t
+decode_ip(uint64_t word)
+{
+	return ((uint64_t)((int64_t)(word << 6) >> 6));
+}
+
+struct lbr_log_stats {
+	unsigned int samples;		/* callchain records for the PMC */
+	unsigned int lbr_samples;	/* ... carrying an LBR payload part */
+	unsigned int nonempty;		/* ... with at least one record */
+	unsigned int records;		/* total From/To pairs */
+	unsigned int kernel_records;	/* pairs naming a kernel address */
+	unsigned int malformed;
+};
+
+/* Decode the log file and account for the LBR payloads of 'id'. */
+static void
+scan_log(const char *path, pmc_id_t id, struct lbr_log_stats *st)
+{
+	struct pmclog_ev ev;
+	const struct pmclog_ev_callchain *cc;
+	const uint8_t *hdr;
+	uint64_t from, to;
+	uint32_t i, len, off, part, type;
+	void *cookie;
+	int fd;
+
+	memset(st, 0, sizeof(*st));
+	fd = open(path, O_RDONLY);
+	ATF_REQUIRE_MSG(fd != -1, "open %s: %s", path, strerror(errno));
+	cookie = pmclog_open(fd);
+	ATF_REQUIRE(cookie != NULL);
+	while (pmclog_read(cookie, &ev) == 0) {
+		if (ev.pl_state != PMCLOG_OK)
+			break;
+		if (ev.pl_type != PMCLOG_TYPE_CALLCHAIN)
+			continue;
+		cc = &ev.pl_u.pl_cc;
+		if (cc->pl_pmcid != id)
+			continue;
+		st->samples++;
+		if ((cc->pl_cpuflags & PMC_CC_F_MULTIPART) == 0 ||
+		    cc->pl_npc < PMC_MULTIPART_HEADER_WORDS) {
+			st->malformed++;
+			continue;
+		}
+		hdr = (const uint8_t *)cc->pl_pc;
+		off = PMC_MULTIPART_HEADER_WORDS;
+		for (part = 0; part < PMC_MULTIPART_HEADER_ENTRIES; part++) {
+			type = hdr[2 * part];
+			len = hdr[2 * part + 1];
+			if (type == PMC_CC_MULTIPART_NONE ||
+			    type == PMC_CC_MULTIPART_CALLCHAIN)
+				break;
+			if (len > cc->pl_npc - off) {
+				st->malformed++;
+				break;
+			}
+			if (type == PMC_CC_MULTIPART_LBR) {
+				st->lbr_samples++;
+				if (len % PMC_MULTIPART_PAYLOAD_WORDS(2) != 0) {
+					st->malformed++;
+					break;
+				}
+				if (len != 0)
+					st->nonempty++;
+				for (i = 0; i < len; i +=
+				    PMC_MULTIPART_PAYLOAD_WORDS(2)) {
+					memcpy(&from, &cc->pl_pc[off + i],
+					    sizeof(from));
+					memcpy(&to, &cc->pl_pc[off + i +
+					    PMC_MULTIPART_PAYLOAD_WORDS(1)],
+					    sizeof(to));
+					st->records++;
+					if ((int64_t)decode_ip(from) < 0 ||
+					    (int64_t)decode_ip(to) < 0)
+						st->kernel_records++;
+				}
+			}
+			off += len;
+		}
+	}
+	pmclog_close(cookie);
+	close(fd);
+}
+
+/* Run 'iterations' of the workload under a started self-attached PMC. */
+static void
+sample_self(struct context *c, const char *event, unsigned int iterations,
+    struct lbr_log_stats *st)
+{
+	int result;
+
+	c->logfd = open("lbr.pmc", O_CREAT | O_TRUNC | O_RDWR, 0600);
+	if (c->logfd == -1)
+		require_call(c, -1, "open private ATF-work-directory logfile");
+	CALL(c, pmc_configure_logfile(c->logfd));
+	c->logging = true;
+	result = pmc_allocate(event, PMC_MODE_TS, 0, PMC_CPU_ANY, &c->id[0],
+	    FAST_PERIOD);
+	require_call(c, result, "allocate fast LBR sampling PMC");
+	start_slot(c, 0, true);
+	workload(iterations);
+	stop_slot(c, 0);
+	CALL(c, pmc_flush_logfile());
+	/* Keep the ID for filtering; release and close the log. */
+	scan_log_pending_id = c->id[0];
+	cleanup(c);
+	scan_log("lbr.pmc", scan_log_pending_id, st);
+}
+
+/* Allocate SS PMCs of 'event' on 'cpu' until failure; release them all. */
+static unsigned int
+count_free_rows(int cpu, const char *event)
+{
+	pmc_id_t ids[64];
+	unsigned int i, n;
+
+	for (n = 0; n < nitems(ids); n++)
+		if (pmc_allocate(event, PMC_MODE_SS, 0, cpu, &ids[n],
+		    SLOW_PERIOD) != 0)
+			break;
+	for (i = 0; i < n; i++)
+		ATF_CHECK(pmc_release(ids[i]) == 0);
+	return (n);
+}
+
+ATF_TC(copyout_rollback_non_lbr);
+ATF_TC_HEAD(copyout_rollback_non_lbr, tc)
+{
+	metadata(tc, "Failed handle copyout also releases a non-LBR PMC, "
+	    "so its row is not leaked until process exit");
+}
+ATF_TC_BODY(copyout_rollback_non_lbr, tc)
+{
+	struct pmc_op_pmcallocate *pa;
+	struct module_stat ms;
+	struct context c;
+	size_t pagesize;
+	unsigned int after, before;
+	int modid, result, saved_errno;
+
+	setup(tc, &c, 1);
+	modid = modfind("hwpmc");
+	if (modid == -1)
+		require_call(&c, -1, "find installed hwpmc syscall module");
+	memset(&ms, 0, sizeof(ms));
+	ms.version = sizeof(ms);
+	CALL(&c, modstat(modid, &ms));
+	before = count_free_rows(c.cpu[0], EVENT ",usr");
+	ATF_REQUIRE_MSG(before > 0, "no free core row on CPU %d", c.cpu[0]);
+
+	pagesize = (size_t)getpagesize();
+	pa = mmap(NULL, pagesize, PROT_READ | PROT_WRITE,
+	    MAP_ANON | MAP_PRIVATE, -1, 0);
+	if (pa == MAP_FAILED)
+		require_call(&c, -1, "map allocation argument page");
+	pa->pm_class = PMC_CLASS_K8;
+	pa->pm_caps = PMC_CAP_USER | PMC_CAP_INTERRUPT;
+	pa->pm_ev = PMC_EV_K8_FR_RETIRED_BRANCHES;
+	pa->pm_mode = PMC_MODE_SS;
+	pa->pm_cpu = c.cpu[0];
+	pa->pm_count = SLOW_PERIOD;
+	CALL(&c, mprotect(pa, pagesize, PROT_READ));
+	errno = 0;
+	result = syscall(ms.data.intval, PMC_OP_PMCALLOCATE, pa);
+	saved_errno = errno;
+	CALL(&c, munmap(pa, pagesize));
+	expect_error(&c, result, saved_errno, EFAULT,
+	    "allocation handle copyout to a read-only page");
+
+	after = count_free_rows(c.cpu[0], EVENT ",usr");
+	cleanup(&c);
+	ATF_CHECK_EQ_MSG(before, after,
+	    "free core rows went from %u to %u after a failed copyout",
+	    before, after);
+}
+
+ATF_TC(lbr_unprivileged_kernel_rejected);
+ATF_TC_HEAD(lbr_unprivileged_kernel_rejected, tc)
+{
+	metadata(tc, "Without privilege, LBR requests that may record kernel "
+	    "branches fail with EPERM while user-only LBR is allowed");
+	atf_tc_set_md_var(tc, "require.user", "root");
+}
+ATF_TC_BODY(lbr_unprivileged_kernel_rejected, tc)
+{
+	struct context c;
+	struct passwd *pw;
+	size_t len;
+	pid_t pid;
+	int status, unpriv;
+
+	setup(tc, &c, 1);
+	len = sizeof(unpriv);
+	ATF_REQUIRE(sysctlbyname("security.bsd.unprivileged_syspmcs", &unpriv,
+	    &len, NULL, 0) == 0);
+	if (unpriv != 0) {
+		cleanup(&c);
+		atf_tc_skip("security.bsd.unprivileged_syspmcs is enabled");
+	}
+	pw = getpwnam("nobody");
+	ATF_REQUIRE(pw != NULL);
+	pid = fork();
+	ATF_REQUIRE(pid != -1);
+	if (pid == 0) {
+		pmc_id_t id;
+		int code;
+
+		if (setgid(pw->pw_gid) != 0 || setuid(pw->pw_uid) != 0)
+			_exit(10);
+		code = 0;
+		errno = 0;
+		if (pmc_allocate(ALL_LBR, PMC_MODE_TS, 0, PMC_CPU_ANY, &id,
+		    SLOW_PERIOD) == 0 || errno != EPERM)
+			code |= 1;
+		errno = 0;
+		if (pmc_allocate(KERNEL_LBR, PMC_MODE_TS, 0, PMC_CPU_ANY, &id,
+		    SLOW_PERIOD) == 0 || errno != EPERM)
+			code |= 2;
+		if (pmc_allocate(USER_LBR, PMC_MODE_TS, 0, PMC_CPU_ANY, &id,
+		    SLOW_PERIOD) != 0)
+			code |= 4;
+		else if (pmc_release(id) != 0)
+			code |= 8;
+		_exit(code);
+	}
+	ATF_REQUIRE(waitpid(pid, &status, 0) == pid);
+	cleanup(&c);
+	ATF_REQUIRE(WIFEXITED(status));
+	ATF_CHECK_MSG((WEXITSTATUS(status) & 1) == 0,
+	    "unprivileged user+kernel LBR was not rejected with EPERM");
+	ATF_CHECK_MSG((WEXITSTATUS(status) & 2) == 0,
+	    "unprivileged kernel-only LBR was not rejected with EPERM");
+	ATF_CHECK_MSG((WEXITSTATUS(status) & 4) == 0,
+	    "unprivileged user-only LBR allocation failed");
+	ATF_CHECK_MSG((WEXITSTATUS(status) & 8) == 0,
+	    "unprivileged user-only LBR release failed");
+	ATF_CHECK_MSG(WEXITSTATUS(status) != 10, "could not drop privilege");
+}
+
+ATF_TC(lbr_user_records_are_user);
+ATF_TC_HEAD(lbr_user_records_are_user, tc)
+{
+	metadata(tc, "User-only LBR samples carry branch records and never "
+	    "a canonical kernel address, including syscall returns");
+}
+ATF_TC_BODY(lbr_user_records_are_user, tc)
+{
+	struct context c;
+	struct lbr_log_stats st;
+
+	setup(tc, &c, 1);
+	sample_self(&c, USER_LBR, 20000, &st);
+	printf("samples %u lbr %u nonempty %u records %u kernel %u "
+	    "malformed %u\n", st.samples, st.lbr_samples, st.nonempty,
+	    st.records, st.kernel_records, st.malformed);
+	ATF_CHECK_EQ(0, st.malformed);
+	ATF_REQUIRE_MSG(st.samples > 10, "too few samples: %u", st.samples);
+	/* Every sample of an LBR PMC is a multipart LBR record. */
+	ATF_CHECK_EQ(st.samples, st.lbr_samples);
+	ATF_CHECK_MSG(st.nonempty * 2 > st.samples,
+	    "most samples should carry branch records (%u of %u)",
+	    st.nonempty, st.samples);
+	ATF_CHECK_EQ_MSG(0, st.kernel_records,
+	    "%u of %u user-only records name a kernel address",
+	    st.kernel_records, st.records);
+}
+
+ATF_TC(lbr_kernel_records_present);
+ATF_TC_HEAD(lbr_kernel_records_present, tc)
+{
+	metadata(tc, "Privileged unfiltered LBR sees syscall branches, "
+	    "decoded as canonical kernel addresses");
+}
+ATF_TC_BODY(lbr_kernel_records_present, tc)
+{
+	struct context c;
+	struct lbr_log_stats st;
+
+	setup(tc, &c, 1);
+	sample_self(&c, ALL_LBR, 20000, &st);
+	printf("samples %u lbr %u nonempty %u records %u kernel %u "
+	    "malformed %u\n", st.samples, st.lbr_samples, st.nonempty,
+	    st.records, st.kernel_records, st.malformed);
+	ATF_CHECK_EQ(0, st.malformed);
+	ATF_REQUIRE_MSG(st.records > 0, "no branch records");
+	ATF_CHECK_MSG(st.kernel_records > 0,
+	    "an unfiltered syscall-heavy workload produced no kernel records");
+}
+
+ATF_TC(lbr_ss_exec_and_switch);
+ATF_TC_HEAD(lbr_ss_exec_and_switch, tc)
+{
+	metadata(tc, "System-mode LBR survives context switches and exec of "
+	    "unmonitored processes on its CPU, then stops and releases");
+}
+ATF_TC_BODY(lbr_ss_exec_and_switch, tc)
+{
+	struct context c;
+	cpuset_t one;
+	pid_t pid;
+	int i, status;
+
+	setup(tc, &c, 1);
+	configure_log(&c);
+	allocate(&c, 0, PMC_MODE_SS, c.cpu[0], ALL_LBR);
+	CALL(&c, pmc_set(c.id[0], FAST_PERIOD * 10));
+	start_slot(&c, 0, false);
+	for (i = 0; i < 50; i++) {
+		pid = fork();
+		if (pid == -1)
+			require_call(&c, -1, "fork");
+		if (pid == 0) {
+			CPU_ZERO(&one);
+			CPU_SET(c.cpu[0], &one);
+			(void)cpuset_setaffinity(CPU_LEVEL_WHICH,
+			    CPU_WHICH_PID, -1, sizeof(one), &one);
+			execl("/bin/sh", "sh", "-c", "i=0; while [ $i -lt 50 ];"
+			    " do i=$((i+1)); done", NULL);
+			_exit(127);
+		}
+		workload(10);
+		if (waitpid(pid, &status, 0) != pid)
+			require_call(&c, -1, "waitpid");
+		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+			cleanup(&c);
+			atf_tc_fail("child failed: %#x", status);
+		}
+	}
+	stop_slot(&c, 0);
+	cleanup(&c);
+}
+
+ATF_TC(lbr_empty_sample_counter);
+ATF_TC_HEAD(lbr_empty_sample_counter, tc)
+{
+	metadata(tc, "The empty-payload counter is exported and monotonic");
+}
+ATF_TC_BODY(lbr_empty_sample_counter, tc)
+{
+	struct context c;
+	struct lbr_log_stats st;
+	uint64_t after, before;
+	size_t len;
+
+	setup(tc, &c, 1);
+	len = sizeof(before);
+	ATF_REQUIRE(sysctlbyname("kern.hwpmc.amd_lbr_empty_samples", &before,
+	    &len, NULL, 0) == 0);
+	sample_self(&c, USER_LBR, 5000, &st);
+	len = sizeof(after);
+	ATF_REQUIRE(sysctlbyname("kern.hwpmc.amd_lbr_empty_samples", &after,
+	    &len, NULL, 0) == 0);
+	ATF_CHECK(after >= before);
+	/* Every sample of an LBR PMC is logged, with or without records. */
+	ATF_CHECK_EQ(0, st.malformed);
+	ATF_CHECK_EQ(st.samples, st.lbr_samples);
+	ATF_CHECK(st.samples > 0);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, lbr_counting_rejected);
@@ -512,5 +900,11 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, lbr_simultaneous_ts_ss);
 	ATF_TP_ADD_TC(tp, lbr_disjoint_ss_filters);
 	ATF_TP_ADD_TC(tp, lbr_copyout_rollback);
+	ATF_TP_ADD_TC(tp, copyout_rollback_non_lbr);
+	ATF_TP_ADD_TC(tp, lbr_unprivileged_kernel_rejected);
+	ATF_TP_ADD_TC(tp, lbr_user_records_are_user);
+	ATF_TP_ADD_TC(tp, lbr_kernel_records_present);
+	ATF_TP_ADD_TC(tp, lbr_ss_exec_and_switch);
+	ATF_TP_ADD_TC(tp, lbr_empty_sample_counter);
 	return (atf_no_error());
 }

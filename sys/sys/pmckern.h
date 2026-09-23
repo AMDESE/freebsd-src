@@ -188,6 +188,13 @@ DPCPU_DECLARE(uint8_t, pmc_sampled);
 /* Count of system-wide sampling PMCs in existence */
 extern volatile int pmc_ss_count;
 
+/*
+ * Count of running system-wide PMCs that need to observe every context
+ * switch, including those of processes that do not use PMCs (e.g. to reset
+ * branch-record state that is not tagged with an address space).
+ */
+extern volatile int pmc_ss_csw_count;
+
 /* kernel version number */
 extern const int pmc_kernel_version;
 
@@ -243,6 +250,10 @@ do {						\
 	(__predict_false((p)->td_pflags & TDP_CALLCHAIN))
 
 #define	PMC_SYSTEM_SAMPLING_ACTIVE()		(pmc_ss_count > 0)
+
+/* Check if the scheduler must call the context-switch hooks for everyone. */
+#define	PMC_SYSTEM_CSW_ACTIVE()			\
+	(__predict_false(pmc_ss_csw_count > 0))
 
 /* Check if a CPU has recorded samples. */
 #define	PMC_CPU_HAS_SAMPLES(C)	(__predict_false(DPCPU_ID_GET((C), pmc_sampled)))

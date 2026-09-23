@@ -143,9 +143,18 @@ static int		*pmc_pmcdisp;	 /* PMC row dispositions */
 		    __LINE__));						  \
 } while (0)
 
+/*
+ * A running SS PMC with this property makes the scheduler call the context
+ * switch hooks for every thread, not only for threads of processes using
+ * PMCs (see PMC_SYSTEM_CSW_ACTIVE()).  Only LBR needs this today.
+ */
+#define	PMC_NEEDS_ALL_CSW(PM)						\
+	(PMC_TO_MODE(PM) == PMC_MODE_SS && md->pmd_lbr_csw != NULL &&	\
+	    ((PM)->pm_caps & PMC_CAP_LBR) != 0)
+
 /* various event handlers */
 static eventhandler_tag	pmc_exit_tag, pmc_fork_tag, pmc_kld_load_tag,
-    pmc_kld_unload_tag;
+    pmc_kld_unload_tag, pmc_exec_tag;
 
 /* Module statistics */
 struct pmc_driverstats pmc_stats;
@@ -1310,6 +1319,25 @@ done:
 }
 
 /*
+ * process_exec event handler.  It runs in exec_new_vmspace(), before the old
+ * address space is torn down, for every exec while hwpmc is loaded.  Branch
+ * records are not tagged with an address space, so ask the MD layer to
+ * discard any record of the old image; the PMC_FN_PROCESS_EXEC hook runs
+ * much later and only when PMCs are in use.
+ */
+static void
+pmc_process_exec_early(void *arg __unused, struct proc *p __unused,
+    struct image_params *imgp __unused)
+{
+
+	if (md->pmd_lbr_exec == NULL)
+		return;
+	critical_enter();
+	md->pmd_lbr_exec(pmc_pcpu[curcpu]);
+	critical_exit();
+}
+
+/*
  * Handle events after an exec() for a process:
  *  - Inform log owners of the new exec() event
  *  - Release any PMCs owned by the process before the exec()
@@ -1327,12 +1355,6 @@ pmc_process_exec(struct thread *td, struct pmckern_procexec *pk)
 	bool is_using_hwpmcs;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
-
-	/* SS LBR records also need a reset for unmonitored address spaces. */
-	critical_enter();
-	if (md->pmd_lbr_exec != NULL)
-		md->pmd_lbr_exec(pmc_pcpu[curcpu]);
-	critical_exit();
 
 	p = td->td_proc;
 	pmc_getfilename(p->p_textvp, &fullpath, &freepath);
@@ -1486,11 +1508,18 @@ pmc_process_csw_in(struct thread *td)
 
 	p = td->td_proc;
 	pt = NULL;
-	if ((pp = pmc_find_process_descriptor(p, PMC_FLAG_NONE)) == NULL) {
-		critical_enter();
-		if (md->pmd_lbr_csw != NULL)
+	/*
+	 * With PMC_SYSTEM_CSW_ACTIVE(), the scheduler calls this hook for
+	 * every thread.  Skip the process hash lookup for threads of
+	 * processes that do not use PMCs, which is the common case.
+	 */
+	if (!PMC_PROC_IS_USING_PMCS(p) ||
+	    (pp = pmc_find_process_descriptor(p, PMC_FLAG_NONE)) == NULL) {
+		if (md->pmd_lbr_csw != NULL) {
+			critical_enter();
 			md->pmd_lbr_csw(pmc_pcpu[curcpu], true);
-		critical_exit();
+			critical_exit();
+		}
 		return;
 	}
 
@@ -1741,6 +1770,22 @@ pmc_process_csw_out(struct thread *td)
 	 * are currently running on hardware.
 	 */
 	p = td->td_proc;
+
+	/*
+	 * A process without P_HWPMC has no process-virtual PMC loaded on
+	 * any CPU (see pmc_detach_one_process()); this is the condition the
+	 * scheduler used before PMC_SYSTEM_CSW_ACTIVE().  Only the MD
+	 * branch-record state needs to see the switch.
+	 */
+	if (!PMC_PROC_IS_USING_PMCS(p)) {
+		if (md->pmd_lbr_csw != NULL) {
+			critical_enter();
+			md->pmd_lbr_csw(pmc_pcpu[curcpu], false);
+			critical_exit();
+		}
+		return;
+	}
+
 	pp = pmc_find_process_descriptor(p, PMC_FLAG_NONE);
 
 	critical_enter();
@@ -2888,6 +2933,8 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 
 		/* adjust the global and process count of SS mode PMCs */
 		if (mode == PMC_MODE_SS && pm->pm_state == PMC_STATE_RUNNING) {
+			if (PMC_NEEDS_ALL_CSW(pm))
+				atomic_subtract_rel_int(&pmc_ss_csw_count, 1);
 			po = pm->pm_owner;
 			po->po_sscount--;
 			if (po->po_sscount == 0) {
@@ -3267,6 +3314,12 @@ pmc_start(struct pmc *pm)
 		return (EXTERROR(ENXIO, "PMC CPU %ju is not active for start",
 		    (uintmax_t)cpu));
 	}
+	/*
+	 * Make every context switch call the hooks before the hardware
+	 * starts; the CPU migration below orders this store.
+	 */
+	if (PMC_NEEDS_ALL_CSW(pm))
+		atomic_add_rel_int(&pmc_ss_csw_count, 1);
 	pmc_select_cpu(cpu);
 
 	/*
@@ -3333,6 +3386,8 @@ pmc_stop(struct pmc *pm)
 	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
 	    ("[pmc,%d] illegal cpu=%d", __LINE__, cpu));
 	if (!pmc_cpu_is_active(cpu)) {
+		if (PMC_NEEDS_ALL_CSW(pm))
+			atomic_subtract_rel_int(&pmc_ss_csw_count, 1);
 		return (EXTERROR(ENXIO, "PMC CPU %ju is not active for stop",
 		    (uintmax_t)cpu));
 	}
@@ -3350,6 +3405,10 @@ pmc_stop(struct pmc *pm)
 	critical_exit();
 
 	pmc_restore_cpu_binding(&pb);
+
+	/* Drop the all-switches reference once the hardware is stopped. */
+	if (PMC_NEEDS_ALL_CSW(pm))
+		atomic_subtract_rel_int(&pmc_ss_csw_count, 1);
 
 	/* Remove this owner from the global list of SS PMC owners. */
 	po = pm->pm_owner;
@@ -3522,6 +3581,25 @@ pmc_do_op_pmcallocate(struct thread *td, struct pmc_op_pmcallocate *pa)
 		return (EXTERROR(EOPNOTSUPP,
 		    "Requested PMC capabilities %#jx are not supported",
 		    (uintmax_t)caps));
+
+	/*
+	 * Branch records that may include kernel addresses disclose kernel
+	 * layout and control flow.  Treat them like system-wide PMCs, even
+	 * for a thread PMC attached to the caller's own process.
+	 */
+	if ((caps & PMC_CAP_LBR) != 0 &&
+	    (caps & (PMC_CAP_USER | PMC_CAP_SYSTEM)) != PMC_CAP_USER) {
+		if (jailed(td->td_ucred))
+			return (EXTERROR(EPERM,
+			    "Kernel branch records are not available in a jail"));
+		if (!pmc_unprivileged_syspmcs) {
+			error = priv_check(td, PRIV_PMC_SYSTEM);
+			if (error != 0)
+				return (EXTERROR(error,
+				    "Kernel branch records require privilege; "
+				    "use the usr qualifier"));
+		}
+	}
 
 	PMCDBG4(PMC,ALL,2, "event=%d caps=0x%x mode=%d cpu=%d", pa->pm_ev,
 	    caps, mode, cpu);
@@ -4402,8 +4480,11 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 			break;
 
 		error = copyout(&pa, arg, sizeof(pa));
-		/* A failed publication must not retain a shared LBR filter. */
-		if (error != 0 && (pa.pm_caps & PMC_CAP_LBR) != 0)
+		/*
+		 * The caller never learns the ID of an unpublished PMC; do
+		 * not leave it (and any row or LBR filter it holds) behind.
+		 */
+		if (error != 0)
 			(void)pmc_do_op_pmcrelease(pa.pm_pmcid);
 	}
 	break;
@@ -5120,7 +5201,6 @@ pmc_process_samples(int cpu, ring_type_t ring)
 	struct pmc_samplebuffer *psb;
 	uint64_t delta __diagused;
 	int adjri, n;
-	bool restarted;
 
 	KASSERT(PCPU_GET(cpuid) == cpu,
 	    ("[pmc,%d] not on the correct CPU pcpu=%d cpu=%d", __LINE__,
@@ -5227,7 +5307,6 @@ entrydone:
 	 * the check below, we'll end up processing the stalled PMC at
 	 * the next hardclock tick.
 	 */
-	restarted = false;
 	for (n = 0; n < md->pmd_npmc; n++) {
 		pcd = pmc_ri_to_classdep(md, n, &adjri);
 		KASSERT(pcd != NULL,
@@ -5243,10 +5322,7 @@ entrydone:
 
 		pm->pm_pcpu_state[cpu].pps_stalled = 0;
 		(void)(*pcd->pcd_start_pmc)(cpu, adjri, pm);
-		restarted = true;
 	}
-	if (restarted)
-		pmc_process_csw_start_all(cpu);
 }
 
 /*
@@ -5928,6 +6004,7 @@ pmc_initialize(void)
 
 	CK_LIST_INIT(&pmc_ss_owners);
 	pmc_ss_count = 0;
+	pmc_ss_csw_count = 0;
 
 	/* allocate a pool of spin mutexes */
 	pmc_mtxpool = mtx_pool_create("pmc-leaf", pmc_mtxpool_size,
@@ -5949,6 +6026,9 @@ pmc_initialize(void)
 	    pmc_process_exit, NULL, EVENTHANDLER_PRI_ANY);
 	pmc_fork_tag = EVENTHANDLER_REGISTER(process_fork,
 	    pmc_process_fork, NULL, EVENTHANDLER_PRI_ANY);
+	if (md->pmd_lbr_exec != NULL)
+		pmc_exec_tag = EVENTHANDLER_REGISTER(process_exec,
+		    pmc_process_exec_early, NULL, EVENTHANDLER_PRI_FIRST);
 
 	/* register kld event handlers */
 	pmc_kld_load_tag = EVENTHANDLER_REGISTER(kld_load, pmc_kld_load,
@@ -6015,6 +6095,10 @@ pmc_cleanup(void)
 	/* deregister event handlers */
 	EVENTHANDLER_DEREGISTER(process_fork, pmc_fork_tag);
 	EVENTHANDLER_DEREGISTER(process_exit, pmc_exit_tag);
+	if (pmc_exec_tag != NULL) {
+		EVENTHANDLER_DEREGISTER(process_exec, pmc_exec_tag);
+		pmc_exec_tag = NULL;
+	}
 	EVENTHANDLER_DEREGISTER(kld_load, pmc_kld_load_tag);
 	EVENTHANDLER_DEREGISTER(kld_unload, pmc_kld_unload_tag);
 
@@ -6075,6 +6159,8 @@ pmc_cleanup(void)
 	    ("[pmc,%d] Global SS owner list not empty", __LINE__));
 	KASSERT(pmc_ss_count == 0,
 	    ("[pmc,%d] Global SS count not empty", __LINE__));
+	KASSERT(pmc_ss_csw_count == 0,
+	    ("[pmc,%d] Global SS context-switch count not empty", __LINE__));
 
  	/* do processor and pmc-class dependent cleanup */
 	maxcpu = pmc_cpu_max();

@@ -223,6 +223,111 @@ ATF_TC_BODY(lbr_allocation_rollback, tc)
 	check_reservations(&r, &empty);
 }
 
+/*
+ * Branch record IP canonicalization.  The raw words below use the From/To
+ * flag layout: From[63] mispredict, To[63] valid, To[62] speculative,
+ * To[61] reserved.
+ */
+#define	FLAGS_FROM	(UINT64_C(1) << 63)
+#define	FLAGS_TO	(UINT64_C(3) << 62)
+#define	IP_MASK		((UINT64_C(1) << 58) - 1)
+
+/* The consumer decode documented for PMC_CC_MULTIPART_LBR. */
+static uint64_t
+decode_ip(uint64_t word)
+{
+	return ((uint64_t)((int64_t)(word << 6) >> 6));
+}
+
+ATF_TC(lbr_va_bits_clamp);
+ATF_TC_HEAD(lbr_va_bits_clamp, tc)
+{
+	atf_tc_set_md_var(tc, "descr",
+	    "CPUID linear-address widths are clamped to the IP field");
+}
+ATF_TC_BODY(lbr_va_bits_clamp, tc)
+{
+	ATF_CHECK_EQ(48, amd_lbr_va_bits(0));
+	ATF_CHECK_EQ(48, amd_lbr_va_bits(32));
+	ATF_CHECK_EQ(48, amd_lbr_va_bits(48));
+	ATF_CHECK_EQ(57, amd_lbr_va_bits(57));
+	ATF_CHECK_EQ(58, amd_lbr_va_bits(58));
+	ATF_CHECK_EQ(58, amd_lbr_va_bits(64));
+}
+
+ATF_TC(lbr_canonicalize_48);
+ATF_TC_HEAD(lbr_canonicalize_48, tc)
+{
+	atf_tc_set_md_var(tc, "descr",
+	    "on a 48-bit CPU, kernel IPs with zero upper IP bits decode to "
+	    "canonical kernel addresses and are classified as kernel");
+}
+ATF_TC_BODY(lbr_canonicalize_48, tc)
+{
+	uint64_t kraw, uraw, k, u;
+
+	/* Hardware may leave IP bits [57:48] zero for a kernel address. */
+	kraw = FLAGS_FROM | UINT64_C(0x0000ffff80001234);
+	uraw = FLAGS_TO | UINT64_C(0x00007fffdeadbeef);
+
+	/* Without canonicalization the kernel address would look like user. */
+	ATF_CHECK((int64_t)decode_ip(kraw) > 0);
+	ATF_CHECK(amd_lbr_ip_is_kernel(kraw, 48));
+	ATF_CHECK(!amd_lbr_ip_is_kernel(uraw, 48));
+
+	k = amd_lbr_canonicalize(kraw, 48);
+	u = amd_lbr_canonicalize(uraw, 48);
+	ATF_CHECK_EQ(UINT64_C(0xffffffff80001234), decode_ip(k));
+	ATF_CHECK_EQ(UINT64_C(0x00007fffdeadbeef), decode_ip(u));
+	/* Flag bits survive. */
+	ATF_CHECK_EQ(FLAGS_FROM, k & ~IP_MASK);
+	ATF_CHECK_EQ(FLAGS_TO, u & ~IP_MASK);
+	/* Canonicalization is idempotent and keeps the classification. */
+	ATF_CHECK_EQ(k, amd_lbr_canonicalize(k, 48));
+	ATF_CHECK(amd_lbr_ip_is_kernel(k, 48));
+	ATF_CHECK(!amd_lbr_ip_is_kernel(u, 48));
+}
+
+ATF_TC(lbr_canonicalize_57);
+ATF_TC_HEAD(lbr_canonicalize_57, tc)
+{
+	atf_tc_set_md_var(tc, "descr",
+	    "on an LA57 CPU, the full 57-bit user range stays user and "
+	    "kernel addresses sign-extend from bit 56");
+}
+ATF_TC_BODY(lbr_canonicalize_57, tc)
+{
+	uint64_t kraw, uraw;
+
+	uraw = UINT64_C(0x00ff000000001000);	/* 5-level user address */
+	kraw = UINT64_C(0x0100000000002000);	/* bit 56 set: kernel */
+	ATF_CHECK(!amd_lbr_ip_is_kernel(uraw, 57));
+	ATF_CHECK(amd_lbr_ip_is_kernel(kraw, 57));
+	/* A 48-bit interpretation would call this LA57 user address kernel. */
+	ATF_CHECK(amd_lbr_ip_is_kernel(uraw, 48));
+	ATF_CHECK_EQ(UINT64_C(0x00ff000000001000),
+	    decode_ip(amd_lbr_canonicalize(uraw, 57)));
+	ATF_CHECK_EQ(UINT64_C(0xff00000000002000),
+	    decode_ip(amd_lbr_canonicalize(kraw, 57)));
+}
+
+ATF_TC(lbr_canonicalize_58);
+ATF_TC_HEAD(lbr_canonicalize_58, tc)
+{
+	atf_tc_set_md_var(tc, "descr",
+	    "at the maximum width canonicalization is the identity");
+}
+ATF_TC_BODY(lbr_canonicalize_58, tc)
+{
+	uint64_t raw;
+
+	raw = FLAGS_TO | UINT64_C(0x03ffffff80001234);
+	ATF_CHECK_EQ(raw, amd_lbr_canonicalize(raw, 58));
+	ATF_CHECK(amd_lbr_ip_is_kernel(raw, 58));
+	ATF_CHECK_EQ(UINT64_C(0xffffffff80001234),
+	    decode_ip(amd_lbr_canonicalize(raw, 58)));
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, lbr_ts_references);
@@ -230,6 +335,10 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, lbr_ss_before_ts);
 	ATF_TP_ADD_TC(tp, lbr_disjoint_ss);
 	ATF_TP_ADD_TC(tp, lbr_allocation_rollback);
+	ATF_TP_ADD_TC(tp, lbr_va_bits_clamp);
+	ATF_TP_ADD_TC(tp, lbr_canonicalize_48);
+	ATF_TP_ADD_TC(tp, lbr_canonicalize_57);
+	ATF_TP_ADD_TC(tp, lbr_canonicalize_58);
 
 	return (atf_no_error());
 }

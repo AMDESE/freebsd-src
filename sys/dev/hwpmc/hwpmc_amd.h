@@ -95,7 +95,10 @@
 #define	AMD_LBR_TO_SPEC		(1ULL << 62)
 #define	AMD_LBR_TO_RESERVED	(1ULL << 61)	/* erratum 1452: skip if set */
 #define	AMD_LBR_FROM_MISPREDICT	(1ULL << 63)
-/* IP is bits [57:0]; sign-extend from bit 57 to a canonical address. */
+/*
+ * IP is bits [57:0].  hwpmc canonicalizes the field from the CPU's linear
+ * address width before logging, so consumers sign-extend from bit 57.
+ */
 #define	AMD_LBR_IP(x)	((uint64_t)((int64_t)(((uint64_t)(x)) << 6) >> 6))
 
 #define	AMD_PMC_COUNTERMASK	0xFF000000
