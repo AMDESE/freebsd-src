@@ -2,6 +2,7 @@ TESTSDIR=	${TESTSBASE}/sys/pmc
 BINDIR=		${TESTSDIR}
 
 ATF_TESTS_C+=	pmc_api_test
+ATF_TESTS_C+=	pmc_attach_running_test
 ATF_TESTS_C+=	pmc_credexec_test
 ATF_TESTS_C+=	pmc_detach_test
 ATF_TESTS_C+=	pmc_exec_test
@@ -31,6 +32,7 @@ ATF_TESTS_SH+=	pmcstat_tsc_test
 TESTS_SUBDIRS+=	amd
 .endif
 
+TEST_METADATA.pmc_attach_running_test+=	required_user="root"
 TEST_METADATA.pmc_exterr_test+=		required_user="root"
 TEST_METADATA.pmc_callchain_ur_test+=	is_exclusive="true"
 TEST_METADATA.pmc_cli_test+=		is_exclusive="true"
