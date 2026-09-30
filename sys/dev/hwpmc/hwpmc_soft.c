@@ -409,8 +409,12 @@ pmc_soft_intr(struct pmckern_soft *ks)
 }
 
 static void
-ast_hwpmc(struct thread *td, int tda __unused)
+ast_hwpmc(struct thread *td, int tda)
 {
+	/* Load PMCs started while the thread was running. */
+	if ((tda & TDAI(TDA_HWPMC)) != 0)
+		pmc_ast_load(td);
+
 	/* Handle Software PMC callchain capture. */
 	if (PMC_IS_PENDING_CALLCHAIN(td))
 		PMC_CALL_HOOK_UNLOCKED(td, PMC_FN_USER_CALLCHAIN_SOFT,
