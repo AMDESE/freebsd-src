@@ -49,13 +49,16 @@
  */
 
 #include <sys/param.h>
+#include <sys/cpuset.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <pmc.h>
+#include <pmclog.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -344,6 +347,116 @@ ATF_TC_BODY(log_survives_userland_closing_the_fd, tc)
 	    "close after the fd was closed in userland: %s", strerror(errno));
 }
 
+/** @internal Pin to one CPU. Return false on failure. */
+static bool
+pin_to_cpu(int cpu)
+{
+	cpuset_t set;
+
+	CPU_ZERO(&set);
+	CPU_SET(cpu, &set);
+	return (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1,
+	    sizeof(set), &set) == 0);
+}
+
+/** @internal Select two allowed CPUs, or skip. */
+static void
+require_two_cpus(int *first, int *second)
+{
+	cpuset_t set;
+	int cpu, n;
+
+	ATF_REQUIRE(cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1,
+	    sizeof(set), &set) == 0);
+	n = 0;
+	for (cpu = 0; cpu < CPU_SETSIZE && n < 2; cpu++) {
+		if (!CPU_ISSET(cpu, &set))
+			continue;
+		if (n++ == 0)
+			*first = cpu;
+		else
+			*second = cpu;
+	}
+	if (n < 2)
+		atf_tc_skip("needs two CPUs");
+}
+
+#define	CLOSE_ORDER_RECORDS	64
+#define	CLOSE_ORDER_MARKER	0x434c4f00U
+
+/** @internal Verify cross-CPU close puts all records before the close record. */
+ATF_TC_WITHOUT_HEAD(close_record_is_last);
+ATF_TC_BODY(close_record_is_last, tc)
+{
+	struct pmclog_ev ev;
+	char *buf;
+	void *parser;
+	off_t len;
+	size_t off;
+	uint32_t h;
+	int closes, cpu_close, cpu_write, fd, i, seen, stray;
+
+	require_hwpmc();
+	require_two_cpus(&cpu_close, &cpu_write);
+	fd = work_file("close-order.pmclog");
+	ATF_REQUIRE_MSG(pmc_configure_logfile(fd) == 0,
+	    "pmc_configure_logfile: %s", strerror(errno));
+
+	ATF_REQUIRE_MSG(pin_to_cpu(cpu_write), "cannot pin to CPU %d: %s",
+	    cpu_write, strerror(errno));
+	for (i = 0; i < CLOSE_ORDER_RECORDS; i++)
+		ATF_REQUIRE_MSG(pmc_writelog(CLOSE_ORDER_MARKER | i) == 0,
+		    "pmc_writelog: %s", strerror(errno));
+
+	ATF_REQUIRE_MSG(pin_to_cpu(cpu_close), "cannot pin to CPU %d: %s",
+	    cpu_close, strerror(errno));
+	ATF_REQUIRE_MSG(pmc_close_logfile() == 0, "pmc_close_logfile: %s",
+	    strerror(errno));
+	ATF_REQUIRE_MSG(pmc_configure_logfile(-1) == 0,
+	    "pmc_configure_logfile(-1): %s", strerror(errno));
+
+	ATF_REQUIRE(lseek(fd, 0, SEEK_SET) == 0);
+	ATF_REQUIRE((parser = pmclog_open(fd)) != NULL);
+	seen = 0;
+	while (pmclog_read(parser, &ev) == 0) {
+		if (ev.pl_type == PMCLOG_TYPE_USERDATA &&
+		    (ev.pl_u.pl_u.pl_userdata & ~0xffU) == CLOSE_ORDER_MARKER)
+			seen++;
+	}
+	ATF_CHECK_MSG(ev.pl_state == PMCLOG_EOF,
+	    "log parse ended in state %d", ev.pl_state);
+	pmclog_close(parser);
+
+	/* Scan raw records because the parser stops at close. */
+	closes = stray = 0;
+	ATF_REQUIRE((len = lseek(fd, 0, SEEK_END)) > 0);
+	ATF_REQUIRE((buf = malloc(len)) != NULL);
+	ATF_REQUIRE(pread(fd, buf, len, 0) == len);
+	for (off = 0; off + sizeof(h) <= (size_t)len;
+	    off += PMCLOG_HEADER_TO_LENGTH(h)) {
+		memcpy(&h, buf + off, sizeof(h));
+		if (!PMCLOG_HEADER_CHECK_MAGIC(h) ||
+		    PMCLOG_HEADER_TO_LENGTH(h) < sizeof(h)) {
+			atf_tc_fail("bad log record header 0x%08x at offset %zu",
+			    h, off);
+		}
+		if (PMCLOG_HEADER_TO_TYPE(h) == PMCLOG_TYPE_CLOSELOG)
+			closes++;
+		else if (closes > 0)
+			stray++;
+	}
+	free(buf);
+	(void)close(fd);
+
+	ATF_CHECK_MSG(closes == 1, "%d close records in the log", closes);
+
+	ATF_CHECK_MSG(seen == CLOSE_ORDER_RECORDS,
+	    "a reader saw %d of %d records written before the close",
+	    seen, CLOSE_ORDER_RECORDS);
+	ATF_CHECK_MSG(stray == 0, "%d records follow the close record",
+	    stray);
+}
+
 /**
  * @internal
  * A write error on the log has to reach userland rather than be swallowed.
@@ -447,6 +560,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, log_ops_without_an_owner);
 	ATF_TP_ADD_TC(tp, log_survives_userland_closing_the_fd);
 	ATF_TP_ADD_TC(tp, log_write_error_is_reported);
+	ATF_TP_ADD_TC(tp, close_record_is_last);
 	ATF_TP_ADD_TC(tp, owner_exit_with_log_and_running_pmc);
 
 	return (atf_no_error());
