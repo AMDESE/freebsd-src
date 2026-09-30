@@ -68,6 +68,9 @@
 
 #define curdomain PCPU_GET(domain)
 
+/* Max time to wait for the helper to write one buffer at close. */
+#define	PMCLOG_DRAIN_STALL_MS	500
+
 /*
  * Sysctl tunables
  */
@@ -231,6 +234,8 @@ static int pmclog_get_buffer(struct pmc_owner *po);
 static void pmclog_loop(void *arg);
 static void pmclog_release(struct pmc_owner *po);
 static uint32_t *pmclog_reserve(struct pmc_owner *po, int length);
+static uint32_t *pmclog_reserve_flags(struct pmc_owner *po, int length,
+    bool closing);
 static void pmclog_schedule_io(struct pmc_owner *po, int wakeup);
 static void pmclog_schedule_all(struct pmc_owner *po);
 static void pmclog_stop_kthread(struct pmc_owner *po);
@@ -412,8 +417,9 @@ pmclog_loop(void *arg)
 
 	for (;;) {
 
-		/* check if we've been asked to exit */
-		if ((po->po_flags & PMC_PO_OWNS_LOGFILE) == 0)
+		/* Exit if asked.  After a close, write the queue first. */
+		if ((po->po_flags & PMC_PO_OWNS_LOGFILE) == 0 &&
+		    (po->po_flags & PMC_PO_SHUTDOWN) == 0)
 			break;
 
 		if (lb == NULL) { /* look for a fresh buffer to write */
@@ -423,6 +429,8 @@ pmclog_loop(void *arg)
 
 				/* No more buffers and shutdown required. */
 				if (po->po_flags & PMC_PO_SHUTDOWN)
+					break;
+				if ((po->po_flags & PMC_PO_OWNS_LOGFILE) == 0)
 					break;
 
 				(void) msleep(po, &pmc_kthread_mtx, PWAIT,
@@ -547,6 +555,13 @@ pmclog_release(struct pmc_owner *po)
 static uint32_t *
 pmclog_reserve(struct pmc_owner *po, int length)
 {
+
+	return (pmclog_reserve_flags(po, length, false));
+}
+
+static uint32_t *
+pmclog_reserve_flags(struct pmc_owner *po, int length, bool closing)
+{
 	uintptr_t newptr, oldptr __diagused;
 	struct pmclog_buffer *plb, **pplb;
 
@@ -556,7 +571,7 @@ pmclog_reserve(struct pmc_owner *po, int length)
 	    ("[pmclog,%d] length not a multiple of word size", __LINE__));
 
 	/* No more data when shutdown in progress. */
-	if (po->po_flags & PMC_PO_SHUTDOWN)
+	if ((po->po_flags & PMC_PO_SHUTDOWN) != 0 && !closing)
 		return (NULL);
 
 	pplb = &po->po_curbuf[curcpu];
@@ -660,8 +675,39 @@ pmclog_schedule_io(struct pmc_owner *po, int wakeup)
 static void
 pmclog_stop_kthread(struct pmc_owner *po)
 {
+	TAILQ_HEAD(, pmclog_buffer) unwritten;
+	struct pmclog_buffer *head, *last;
 
+	TAILQ_INIT(&unwritten);
 	mtx_lock(&pmc_kthread_mtx);
+
+	/*
+	 * After a close, let the helper write the queue.  Stop waiting
+	 * if it makes no progress, e.g. nobody reads a pipe.
+	 */
+	mtx_lock_spin(&po->po_mtx);
+	last = TAILQ_FIRST(&po->po_logbuffers);
+	mtx_unlock_spin(&po->po_mtx);
+	while ((po->po_flags & PMC_PO_SHUTDOWN) != 0 &&
+	    po->po_kthread != NULL) {
+		wakeup_one(po);
+		(void)msleep(po->po_kthread, &pmc_kthread_mtx, PPAUSE,
+		    "pmckdrn", MAX(1, PMCLOG_DRAIN_STALL_MS * hz / 1000));
+		if (po->po_kthread == NULL)
+			break;
+		mtx_lock_spin(&po->po_mtx);
+		head = TAILQ_FIRST(&po->po_logbuffers);
+		mtx_unlock_spin(&po->po_mtx);
+		if (head == last)
+			break;
+		last = head;
+	}
+
+	/* Take the unwritten buffers; the caller frees them. */
+	mtx_lock_spin(&po->po_mtx);
+	TAILQ_CONCAT(&unwritten, &po->po_logbuffers, plb_next);
+	mtx_unlock_spin(&po->po_mtx);
+
 	po->po_flags &= ~PMC_PO_OWNS_LOGFILE;
 	if (po->po_kthread != NULL) {
 		PROC_LOCK(po->po_kthread);
@@ -672,6 +718,10 @@ pmclog_stop_kthread(struct pmc_owner *po)
 	while (po->po_kthread)
 		msleep(po->po_kthread, &pmc_kthread_mtx, PPAUSE, "pmckstp", 0);
 	mtx_unlock(&pmc_kthread_mtx);
+
+	mtx_lock_spin(&po->po_mtx);
+	TAILQ_CONCAT(&po->po_logbuffers, &unwritten, plb_next);
+	mtx_unlock_spin(&po->po_mtx);
 }
 
 /*
@@ -883,21 +933,32 @@ pmclog_close(struct pmc_owner *po)
 
 	PMCDBG1(LOG,CLO,1, "po=%p", po);
 
-	pmclog_process_closelog(po);
-
+	/*
+	 * The close record must be the last record: a reader stops there.
+	 * Hold pmc_kthread_mtx so the helper does not exit before it is
+	 * queued.
+	 */
 	mtx_lock(&pmc_kthread_mtx);
+
+	/* Already closed. */
+	if ((po->po_flags & PMC_PO_SHUTDOWN) != 0) {
+		mtx_unlock(&pmc_kthread_mtx);
+		return (0);
+	}
+
+	/* Log pending samples and queue the current buffers. */
+	pmclog_schedule_all(po);
+
 	/*
 	 * Initiate shutdown: no new data queued,
 	 * thread will close file on last block.
 	 */
 	po->po_flags |= PMC_PO_SHUTDOWN;
-	/* give time for all to see */
-	DELAY(50);
-	
-	/*
-	 * Schedule the current buffer.
-	 */
+
+	/* Queue records written before the other CPUs saw the flag. */
 	pmclog_schedule_all(po);
+
+	pmclog_process_closelog(po);
 	wakeup_one(po);
 
 	mtx_unlock(&pmc_kthread_mtx);
@@ -936,9 +997,22 @@ pmclog_process_callchain(struct pmc *pm, struct pmc_sample *ps)
 void
 pmclog_process_closelog(struct pmc_owner *po)
 {
-	PMCLOG_RESERVE(po, PMCLOG_TYPE_CLOSELOG,
-	    sizeof(struct pmclog_closelog));
-	PMCLOG_DESPATCH_SYNC(po);
+	struct pmclog_header *ph;
+	uint32_t *le;
+	int len;
+
+	/* PMC_PO_SHUTDOWN is already set; skip that check. */
+	len = sizeof(struct pmclog_closelog);
+	spinlock_enter();
+	if ((le = pmclog_reserve_flags(po, len, true)) == NULL) {
+		spinlock_exit();
+		return;
+	}
+	ph = (struct pmclog_header *)le;
+	ph->pl_header = _PMCLOG_TO_HEADER(PMCLOG_TYPE_CLOSELOG, len);
+	ph->pl_tsc = pmc_rdtsc();
+	pmclog_schedule_io(po, 1);
+	spinlock_exit();
 }
 
 void
