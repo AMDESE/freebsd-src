@@ -259,6 +259,8 @@ static void	pmc_process_allproc(struct pmc *pm);
 static void	pmc_process_csw_start_all(int cpu);
 static void	pmc_process_csw_stop_all(int cpu);
 static void	pmc_process_csw_in(struct thread *td);
+static void	pmc_process_csw_in_flags(struct thread *td, bool reload);
+static void	pmc_load_running_threads(struct pmc *pm);
 static void	pmc_process_csw_out(struct thread *td);
 static void	pmc_process_exec(struct thread *td,
     struct pmckern_procexec *pk);
@@ -2842,7 +2844,15 @@ pmc_process_csw_stop_all(int cpu)
 static void
 pmc_process_csw_in(struct thread *td)
 {
-	struct pmc *pm;
+
+	pmc_process_csw_in_flags(td, false);
+}
+
+/* With 'reload', the thread is on the CPU: load only missing PMCs. */
+static void
+pmc_process_csw_in_flags(struct thread *td, bool reload)
+{
+	struct pmc *pm, *hwpm;
 	struct pmc_classdep *pcd;
 	struct pmc_cpu *pc;
 	struct pmc_hw *phw __diagused;
@@ -2895,6 +2905,15 @@ pmc_process_csw_in(struct thread *td)
 		if (pm->pm_pmu != NULL && !pmu_group_csw_can_start(pm, td, cpu))
 			continue;
 
+		/* A switch may have loaded it already. */
+		pcd = pmc_ri_to_classdep(md, ri, &adjri);
+		if (reload) {
+			hwpm = NULL;
+			(void)pcd->pcd_get_config(cpu, adjri, &hwpm);
+			if (hwpm == pm)
+				continue;
+		}
+
 		KASSERT(counter_u64_fetch(pm->pm_runcount) >= 0,
 		    ("[pmc,%d] pm=%p runcount %ju", __LINE__, pm,
 		    (uintmax_t)counter_u64_fetch(pm->pm_runcount)));
@@ -2903,7 +2922,6 @@ pmc_process_csw_in(struct thread *td)
 		pmc_runcount_add(pm, 1);
 
 		/* configure the HWPMC we are going to use. */
-		pcd = pmc_ri_to_classdep(md, ri, &adjri);
 		(void)pcd->pcd_config_pmc(cpu, adjri, pm);
 
 		phw = pc->pc_hwpmcs[ri];
@@ -3457,6 +3475,51 @@ pmc_process_csw_out(struct thread *td)
 	pmu_group_csw_out_complete(td, cpu);
 
 	critical_exit();
+}
+
+/*
+ * TDA_HWPMC handler.  Load PMCs started while this thread was running.
+ * The scheduler may keep the thread on the CPU without calling the
+ * switch hooks, so do not wait for a switch.
+ */
+void
+pmc_ast_load(struct thread *td)
+{
+
+	KASSERT(td == curthread, ("[pmc,%d] td != curthread", __LINE__));
+	if (PMC_PROC_IS_USING_PMCS(td->td_proc))
+		pmc_process_csw_in_flags(td, true);
+}
+
+/*
+ * Send the TDA_HWPMC AST to running target threads.  Other threads load
+ * the PMC at switch-in.
+ */
+static void
+pmc_load_running_threads(struct pmc *pm)
+{
+	struct pmc_target *ptgt;
+	struct thread *td;
+	struct proc *p;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	LIST_FOREACH(ptgt, &pm->pm_targets, pt_next) {
+		p = ptgt->pt_process->pp_proc;
+		PROC_LOCK(p);
+		FOREACH_THREAD_IN_PROC(p, td) {
+			if (td == curthread)
+				continue;
+			thread_lock(td);
+			if (TD_IS_RUNNING(td)) {
+				ast_sched_locked(td, TDA_HWPMC);
+#ifdef SMP
+				forward_signal(td);
+#endif
+			}
+			thread_unlock(td);
+		}
+		PROC_UNLOCK(p);
+	}
 }
 
 /*
@@ -5341,6 +5404,7 @@ pmc_start(struct pmc *pm)
 			pm->pm_state = PMC_STATE_RUNNING;
 			if ((pm->pm_flags & PMC_F_ATTACHED_TO_OWNER) != 0)
 				pmc_force_context_switch();
+			pmc_load_running_threads(pm);
 		}
 
 		return (error);

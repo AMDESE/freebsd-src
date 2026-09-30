@@ -1428,6 +1428,7 @@ int	pmc_save_user_callchain(uintptr_t *_cc, int _maxsamples,
 void	pmc_restore_cpu_binding(struct pmc_binding *pb);
 void	pmc_save_cpu_binding(struct pmc_binding *pb);
 void	pmc_select_cpu(int cpu);
+void	pmc_ast_load(struct thread *_td);
 struct pmc_mdep *pmc_mdep_alloc(int nclasses);
 void pmc_mdep_free(struct pmc_mdep *md);
 uint64_t pmc_rdtsc(void);
