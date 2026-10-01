@@ -1203,7 +1203,7 @@ pmu_group_on_stop(struct pmc *pm)
 /* Mark one group on-CPU for the thread that is switching in. */
 static void
 pmu_group_csw_in_one(pmu_group_t *pg, struct thread *td, int cpu,
-    uint64_t now)
+    uint64_t now, bool reload)
 {
 	struct pmu_group_cpu_state *pgcs;
 
@@ -1213,7 +1213,8 @@ pmu_group_csw_in_one(pmu_group_t *pg, struct thread *td, int cpu,
 	/* Do not wait for a snapshot during a context switch. */
 	mtx_lock_spin(&pg->pg_snapshot_lock);
 	mtx_pool_lock_spin(pmc_mtxpool, pg);
-	if (!pg->pg_committed || !pg->pg_running || pg->pg_account_blocked) {
+	if (!pg->pg_committed || !pg->pg_running || pg->pg_account_blocked ||
+	    (reload && pgcs->pgcs_counted)) {
 		mtx_pool_unlock_spin(pmc_mtxpool, pg);
 		mtx_unlock_spin(&pg->pg_snapshot_lock);
 		return;
@@ -1231,8 +1232,9 @@ pmu_group_csw_in_one(pmu_group_t *pg, struct thread *td, int cpu,
 	mtx_unlock_spin(&pg->pg_snapshot_lock);
 }
 
+/* With 'reload', skip groups already on this CPU. */
 void
-pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
+pmu_group_csw_in(struct thread *td, struct pmc_process *pp, bool reload)
 {
 	struct pmu_group_target *pgt;
 	uint64_t now;
@@ -1245,7 +1247,7 @@ pmu_group_csw_in(struct thread *td, struct pmc_process *pp)
 	now = cpu_ticks();
 	mtx_lock_spin(&pp->pp_pmu_lock);
 	LIST_FOREACH(pgt, &pp->pp_pmu_targets, pgt_process_next)
-		pmu_group_csw_in_one(pgt->pgt_group, td, cpu, now);
+		pmu_group_csw_in_one(pgt->pgt_group, td, cpu, now, reload);
 	mtx_unlock_spin(&pp->pp_pmu_lock);
 }
 
