@@ -2883,7 +2883,7 @@ pmc_process_csw_in_flags(struct thread *td, bool reload)
 
 	pc = pmc_pcpu[cpu];
 
-	pmu_group_csw_in(td, pp);
+	pmu_group_csw_in(td, pp, reload);
 
 	for (ri = 0; ri < md->pmd_npmc; ri++) {
 		if ((pm = pp->pp_pmcs[ri].pp_pmc) == NULL)
@@ -3491,35 +3491,48 @@ pmc_ast_load(struct thread *td)
 		pmc_process_csw_in_flags(td, true);
 }
 
+/* Send the TDA_HWPMC AST to the running threads of 'p'. */
+static void
+pmc_load_running_proc(struct proc *p)
+{
+	struct thread *td;
+
+	PROC_LOCK(p);
+	FOREACH_THREAD_IN_PROC(p, td) {
+		if (td == curthread)
+			continue;
+		thread_lock(td);
+		if (TD_IS_RUNNING(td)) {
+			ast_sched_locked(td, TDA_HWPMC);
+#ifdef SMP
+			forward_signal(td);
+#endif
+		}
+		thread_unlock(td);
+	}
+	PROC_UNLOCK(p);
+}
+
 /*
- * Send the TDA_HWPMC AST to running target threads.  Other threads load
- * the PMC at switch-in.
+ * Load a started PMC on running target threads.  Other threads load it
+ * at switch-in.  Group targets are on pg_targets.
  */
 static void
 pmc_load_running_threads(struct pmc *pm)
 {
+	struct pmu_group_target *pgt;
 	struct pmc_target *ptgt;
-	struct thread *td;
-	struct proc *p;
+	pmu_group_t *pg;
 
 	sx_assert(&pmc_sx, SX_XLOCKED);
-	LIST_FOREACH(ptgt, &pm->pm_targets, pt_next) {
-		p = ptgt->pt_process->pp_proc;
-		PROC_LOCK(p);
-		FOREACH_THREAD_IN_PROC(p, td) {
-			if (td == curthread)
-				continue;
-			thread_lock(td);
-			if (TD_IS_RUNNING(td)) {
-				ast_sched_locked(td, TDA_HWPMC);
-#ifdef SMP
-				forward_signal(td);
-#endif
-			}
-			thread_unlock(td);
-		}
-		PROC_UNLOCK(p);
+	pg = pmu_group_from_pmc(pm);
+	if (pg != NULL) {
+		LIST_FOREACH(pgt, &pg->pg_targets, pgt_group_next)
+			pmc_load_running_proc(pgt->pgt_pp->pp_proc);
+		return;
 	}
+	LIST_FOREACH(ptgt, &pm->pm_targets, pt_next)
+		pmc_load_running_proc(ptgt->pt_process->pp_proc);
 }
 
 /*
@@ -5368,6 +5381,7 @@ pmc_start(struct pmc *pm)
 			if (pg != NULL && pg->pg_explicit_target != NULL &&
 			    pg->pg_explicit_target->pgt_pp->pp_proc == po->po_owner)
 				pmc_force_context_switch();
+			pmc_load_running_threads(pm);
 		}
 		return (error);
 	}
@@ -5384,6 +5398,7 @@ pmc_start(struct pmc *pm)
 		if (pg != NULL) {
 			if ((pm->pm_flags & PMC_F_ATTACHED_TO_OWNER) != 0)
 				pmc_force_context_switch();
+			pmc_load_running_threads(pm);
 			return (0);
 		}
 

@@ -306,7 +306,8 @@ int pmu_group_on_attach(struct pmc *pm, struct proc *p);
 int pmu_group_on_start(struct pmc *pm);
 void pmu_group_on_stop(struct pmc *pm);
 void pmu_group_on_release(struct pmc *pm);
-void pmu_group_csw_in(struct thread *td, struct pmc_process *pp);
+void pmu_group_csw_in(struct thread *td, struct pmc_process *pp,
+    bool reload);
 void pmu_group_csw_in_complete(struct thread *td, int cpu);
 bool pmu_group_csw_can_start(struct pmc *pm, struct thread *td, int cpu);
 void pmu_group_csw_out(struct thread *td, int cpu);
