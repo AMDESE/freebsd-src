@@ -546,7 +546,8 @@ struct lbr_log_stats {
 
 /* Decode the log file and account for the LBR payloads of 'id'. */
 static void
-scan_log(const char *path, pmc_id_t id, struct lbr_log_stats *st)
+scan_log_process(const char *path, pmc_id_t id, pid_t pid,
+    struct lbr_log_stats *st)
 {
 	struct pmclog_ev ev;
 	const struct pmclog_ev_callchain *cc;
@@ -567,7 +568,7 @@ scan_log(const char *path, pmc_id_t id, struct lbr_log_stats *st)
 		if (ev.pl_type != PMCLOG_TYPE_CALLCHAIN)
 			continue;
 		cc = &ev.pl_u.pl_cc;
-		if (cc->pl_pmcid != id)
+		if (cc->pl_pmcid != id || (pid != -1 && cc->pl_pid != (uint32_t)pid))
 			continue;
 		st->samples++;
 		if ((cc->pl_cpuflags & PMC_CC_F_MULTIPART) == 0 ||
@@ -613,6 +614,13 @@ scan_log(const char *path, pmc_id_t id, struct lbr_log_stats *st)
 	}
 	pmclog_close(cookie);
 	close(fd);
+}
+
+static void
+scan_log(const char *path, pmc_id_t id, struct lbr_log_stats *st)
+{
+
+	scan_log_process(path, id, -1, st);
 }
 
 /* Run 'iterations' of the workload under a started self-attached PMC. */
@@ -829,6 +837,8 @@ ATF_TC_HEAD(lbr_ss_exec_and_switch, tc)
 ATF_TC_BODY(lbr_ss_exec_and_switch, tc)
 {
 	struct context c;
+	struct lbr_log_stats st;
+	pmc_id_t id;
 	cpuset_t one;
 	pid_t pid;
 	int i, status;
@@ -859,8 +869,60 @@ ATF_TC_BODY(lbr_ss_exec_and_switch, tc)
 			atf_tc_fail("child failed: %#x", status);
 		}
 	}
+	id = c.id[0];
+	CALL(&c, pmc_flush_logfile());
 	stop_slot(&c, 0);
 	cleanup(&c);
+	scan_log("lbr.pmc", id, &st);
+	ATF_CHECK_EQ(0, st.malformed);
+	ATF_CHECK_EQ(st.samples, st.lbr_samples);
+	ATF_CHECK_MSG(st.records > 0, "no branch records across exec/switch");
+}
+
+ATF_TC(lbr_ss_first_run);
+ATF_TC_HEAD(lbr_ss_first_run, tc)
+{
+	metadata(tc, "System-mode LBR records branches in a newly forked "
+	    "unmonitored process, not just the sampler");
+}
+ATF_TC_BODY(lbr_ss_first_run, tc)
+{
+	struct context c;
+	struct lbr_log_stats st;
+	pmc_id_t id;
+	pid_t pid;
+	int status;
+
+	setup(tc, &c, 1);
+	configure_log(&c);
+	allocate(&c, 0, PMC_MODE_SS, c.cpu[0], USER_LBR);
+	CALL(&c, pmc_set(c.id[0], FAST_PERIOD));
+	start_slot(&c, 0, false);
+	pid = fork();
+	if (pid == -1)
+		require_call(&c, -1, "fork");
+	if (pid == 0) {
+		/* CPU affinity is inherited; no PMC is attached to this child. */
+		workload(1000);
+		_exit(0);
+	}
+	if (waitpid(pid, &status, 0) != pid)
+		require_call(&c, -1, "waitpid");
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		cleanup(&c);
+		atf_tc_fail("child failed: %#x", status);
+	}
+	id = c.id[0];
+	CALL(&c, pmc_flush_logfile());
+	stop_slot(&c, 0);
+	cleanup(&c);
+	scan_log_process("lbr.pmc", id, pid, &st);
+	ATF_CHECK_EQ(0, st.malformed);
+	ATF_CHECK_EQ(st.samples, st.lbr_samples);
+	ATF_CHECK_MSG(st.nonempty > 0,
+	    "newly forked child produced %u samples but no branch records",
+	    st.samples);
+	ATF_CHECK_EQ(0, st.kernel_records);
 }
 
 ATF_TC(lbr_empty_sample_counter);
@@ -905,6 +967,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, lbr_user_records_are_user);
 	ATF_TP_ADD_TC(tp, lbr_kernel_records_present);
 	ATF_TP_ADD_TC(tp, lbr_ss_exec_and_switch);
+	ATF_TP_ADD_TC(tp, lbr_ss_first_run);
 	ATF_TP_ADD_TC(tp, lbr_empty_sample_counter);
 	return (atf_no_error());
 }

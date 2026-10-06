@@ -27,8 +27,8 @@ NOTE TO PEOPLE WHO THINK THAT FreeBSD 16.x IS SLOW:
 	world, or to merely disable the most expensive debugging functionality
 	at runtime, run "ln -s 'abort:false,junk:false' /etc/malloc.conf".)
 
-20260923:
-	The hwpmc(4) kernel/module interface version is now 0x0A030000:
+20261006:
+	The hwpmc(4) kernel/module interface version is now 0x0A040000:
 	struct pmc_mdep gained the pmd_lbr_csw and pmd_lbr_exec hooks,
 	struct pmc_multipart grew to 32 payload words and the scheduler
 	calls the context-switch hooks through the new pmc_ss_csw_count.

@@ -2,7 +2,7 @@
 .\"
 .\" Copyright (c) 2026 Advanced Micro Devices, Inc.
 .\"
-.Dd September 23, 2026
+.Dd October 6, 2026
 .Dt PMC.LBR 3
 .Os
 .Sh NAME
@@ -109,6 +109,8 @@ Every sample of an LBR PMC carries an LBR payload part, but the payload
 is empty when the ring could not be read for that interrupt: shortly after
 a context switch or exec reset, while hwpmc updates the recording state, or
 for an overflow of a PMC that was not yet active on the CPU.
+On processors with LbrAndPmcFreeze, a delayed interrupt whose frozen ring
+was invalidated by a reset also carries an empty payload.
 The
 .Va kern.hwpmc.amd_lbr_empty_samples
 sysctl counts samples that were logged empty for these reasons; an

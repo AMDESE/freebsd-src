@@ -1411,7 +1411,7 @@ amd_intr_v2(struct trapframe *tf)
 	uint64_t status, pending;
 	uint32_t active = 0, count = 0;
 	int i, error, len, retval, cpu;
-	bool lbr_sample;
+	bool lbr_frozen, lbr_sample;
 
 	cpu = curcpu;
 	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
@@ -1430,15 +1430,19 @@ amd_intr_v2(struct trapframe *tf)
 
 	/* Read the overflow bitmap once. */
 	status = rdmsr(AMD_PMC_GLOBAL_STATUS);
+	lbr_frozen = (status & AMD_PMC_GLOBAL_STATUS_LBRS_FROZEN) != 0;
 	status &= amd_global_cntr_mask;
 
 	/*
 	 * Never expose an old or partially reset ring during a transition.
 	 * pc_lbr_hw_on implies a nonempty row mask and a CPU that is not
-	 * between a switch-out and a switch-in.
+	 * between a switch-out and a switch-in.  A reset may have cleared
+	 * LBRS_FROZEN while leaving an overflow pending: its delayed NMI
+	 * must log an empty payload, not read the now-running ring.
 	 */
 	lbr_sample = amd_lbr_depth > 0 &&
-	    atomic_load_int(&pac->pc_lbr_busy) == 0 && pac->pc_lbr_hw_on;
+	    atomic_load_int(&pac->pc_lbr_busy) == 0 && pac->pc_lbr_hw_on &&
+	    (!amd_lbr_freeze || lbr_frozen);
 	mpd.pl_type = PMC_CC_MULTIPART_LBR;
 	mpd.pl_length = 0;
 	if (lbr_sample && (status & pac->pc_lbr_mask) != 0) {

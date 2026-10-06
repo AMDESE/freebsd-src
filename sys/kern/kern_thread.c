@@ -997,14 +997,14 @@ thread_exit(void)
 		}
 	} 
 #ifdef	HWPMC_HOOKS
-	/*
-	 * If this thread is part of a process that is being tracked by hwpmc(4),
-	 * inform the module of the thread's impending exit.
-	 */
-	if (PMC_PROC_IS_USING_PMCS(td->td_proc)) {
+	/* sched_throw() bypasses the normal scheduler switch-out path. */
+	if (PMC_PROC_IS_USING_PMCS(td->td_proc) || PMC_SYSTEM_CSW_ACTIVE())
 		PMC_SWITCH_CONTEXT(td, PMC_FN_CSW_OUT);
+
+	/* Inform owners of the thread's impending exit. */
+	if (PMC_PROC_IS_USING_PMCS(td->td_proc))
 		PMC_CALL_HOOK_UNLOCKED(td, PMC_FN_THR_EXIT, NULL);
-	} else if (PMC_SYSTEM_SAMPLING_ACTIVE())
+	else if (PMC_SYSTEM_SAMPLING_ACTIVE())
 		PMC_CALL_HOOK_UNLOCKED(td, PMC_FN_THR_EXIT_LOG, NULL);
 #endif
 
