@@ -2,7 +2,7 @@
 .\"
 .\" Copyright (c) 2026 Advanced Micro Devices, Inc.
 .\"
-.Dd October 6, 2026
+.Dd October 7, 2026
 .Dt PMC.LBR 3
 .Os
 .Sh NAME
@@ -166,6 +166,11 @@ When any LBR PMC is active, hwpmc resets the ring across context switches and
 exec to avoid attributing stale branch addresses to the new address space.
 On CPUs without LbrAndPmcFreeze the ring is stopped while the interrupt handler
 reads it, but records may still include branches taken during interrupt entry.
+.Pp
+Instruction fusion can make the hardware report a From address that points
+several bytes before the actual branch, for example to the comparison in a
+fused compare-and-branch pair.
+Records are exported without adjusting these addresses.
 .Pp
 User-only sampling drops records whose From or To address is a kernel
 address, in addition to using the hardware CPL filter, which does not

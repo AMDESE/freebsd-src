@@ -640,8 +640,10 @@ sample_self(struct context *c, const char *event, unsigned int iterations,
 	require_call(c, result, "allocate fast LBR sampling PMC");
 	start_slot(c, 0, true);
 	workload(iterations);
-	stop_slot(c, 0);
+	/* STOP discards pending samples: allow a sweep and flush while live. */
+	usleep(100000);
 	CALL(c, pmc_flush_logfile());
+	stop_slot(c, 0);
 	/* Keep the ID for filtering; release and close the log. */
 	scan_log_pending_id = c->id[0];
 	cleanup(c);
@@ -903,7 +905,7 @@ ATF_TC_BODY(lbr_ss_first_run, tc)
 		require_call(&c, -1, "fork");
 	if (pid == 0) {
 		/* CPU affinity is inherited; no PMC is attached to this child. */
-		workload(1000);
+		workload(100000);
 		_exit(0);
 	}
 	if (waitpid(pid, &status, 0) != pid)
