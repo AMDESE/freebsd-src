@@ -71,12 +71,22 @@ def generate(directory):
         batch = function(mod, "pmc_process_csw_out_prepare") + batch
     (directory / "exit.inc").write_text(batch)
     (directory / "exit_loop.inc").write_text(exit_fn[start:end])
+    try:
+        unload = function(mod, "pmc_unload")
+    except ValueError:
+        unload = ""
+    (directory / "unload.inc").write_text(unload)
+    (directory / "load.inc").write_text(function(mod, "load").replace("__unused", ""))
+    cleanup = function(mod, "pmc_cleanup")
+    start = cleanup.index('\tPMCDBG0(MOD,INI,0, "cleanup");')
+    end = cleanup.index("\n\t/* deregister event handlers */", start)
+    (directory / "cleanup.inc").write_text(cleanup[start:end])
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sanitize", action="store_true")
-    parser.add_argument("--case", choices=["snapshot", "lifecycle", "exit"])
+    parser.add_argument("--case", choices=["snapshot", "lifecycle", "exit", "unload"])
     args = parser.parse_args()
     flags = ["-std=gnu11", "-O2", "-I", str(ROOT)]
     if args.sanitize:
@@ -84,10 +94,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix="hwpmc-lbr-") as name:
         directory = Path(name)
         generate(directory)
-        fixtures = ["lbr_regression", "pmc_exit_regression"]
+        fixtures = ["lbr_regression", "pmc_exit_regression", "pmc_unload_regression"]
         if args.case:
             fixtures = [
-                "pmc_exit_regression" if args.case == "exit" else "lbr_regression"
+                {"exit": "pmc_exit_regression", "unload": "pmc_unload_regression"}.get(
+                    args.case, "lbr_regression"
+                )
             ]
         for fixture in fixtures:
             binary = directory / fixture
