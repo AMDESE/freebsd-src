@@ -407,6 +407,50 @@ ATF_TC_BODY(ibs_invalid_config_bits, tc)
 	require_exterr("IBS op ctl config");
 }
 
+ATF_TC_WITHOUT_HEAD(ibs_op_period_below_minimum);
+ATF_TC_BODY(ibs_op_period_below_minimum, tc)
+{
+	struct pmc_op_pmcallocate pa;
+
+	ATF_REQUIRE_FEATURE("exterr_strings");
+	require_hwpmc();
+	require_class(PMC_CLASS_IBS, "IBS");
+	clear_exterr();
+
+	memset(&pa, 0, sizeof(pa));
+	pa.pm_caps = PMC_CAP_SYSTEM;
+	pa.pm_class = PMC_CLASS_IBS;
+	pa.pm_mode = PMC_MODE_SS;
+	pa.pm_cpu = 0;
+	pa.pm_md.pm_ibs.ibs_type = IBS_PMC_OP;
+	pa.pm_md.pm_ibs.ibs_ctl = IBS_OP_INTERVAL_TO_CTL(16);
+
+	ATF_REQUIRE_ERRNO(EINVAL, hwpmc_call(PMC_OP_PMCALLOCATE, &pa) == -1);
+	require_exterr("IBS op period 16 is below the minimum");
+}
+
+ATF_TC_WITHOUT_HEAD(ibs_fetch_period_below_minimum);
+ATF_TC_BODY(ibs_fetch_period_below_minimum, tc)
+{
+	struct pmc_op_pmcallocate pa;
+
+	ATF_REQUIRE_FEATURE("exterr_strings");
+	require_hwpmc();
+	require_class(PMC_CLASS_IBS, "IBS");
+	clear_exterr();
+
+	memset(&pa, 0, sizeof(pa));
+	pa.pm_caps = PMC_CAP_SYSTEM;
+	pa.pm_class = PMC_CLASS_IBS;
+	pa.pm_mode = PMC_MODE_SS;
+	pa.pm_cpu = 0;
+	pa.pm_md.pm_ibs.ibs_type = IBS_PMC_FETCH;
+	pa.pm_md.pm_ibs.ibs_ctl = IBS_FETCH_INTERVAL_TO_CTL(16);
+
+	ATF_REQUIRE_ERRNO(EINVAL, hwpmc_call(PMC_OP_PMCALLOCATE, &pa) == -1);
+	require_exterr("IBS fetch period 16 is below the minimum");
+}
+
 ATF_TC_WITHOUT_HEAD(ibs_nonsampling_mode);
 ATF_TC_BODY(ibs_nonsampling_mode, tc)
 {
@@ -438,6 +482,8 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, pmcrw_no_flags);
 	ATF_TP_ADD_TC(tp, pmcrw_write_running);
 	ATF_TP_ADD_TC(tp, amd_invalid_subclass);
+	ATF_TP_ADD_TC(tp, ibs_op_period_below_minimum);
+	ATF_TP_ADD_TC(tp, ibs_fetch_period_below_minimum);
 	ATF_TP_ADD_TC(tp, amd_invalid_config_bits);
 	ATF_TP_ADD_TC(tp, amd_invalid_df_config_bits);
 	ATF_TP_ADD_TC(tp, ibs_missing_system_capability);
