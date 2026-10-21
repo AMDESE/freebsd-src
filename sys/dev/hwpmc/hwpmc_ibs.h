@@ -88,6 +88,10 @@
 #define IBS_OP_MAX_RATE			134217712
 #define IBS_OP_MAX_RATE_PREEXT		1048560
 
+/* Hardware minimum periods, regardless of sysctl limits. */
+#define	IBS_FETCH_HW_MIN_PERIOD		0x10
+#define	IBS_OP_HW_MIN_PERIOD		0x90
+
 /* IBS Fetch Control */
 #define IBS_FETCH_CTL			0xC0011030 /* IBS Fetch Control */
 #define IBS_FETCH_CTL_L3MISS		(1ULL << 61) /* L3 Cache Miss */
