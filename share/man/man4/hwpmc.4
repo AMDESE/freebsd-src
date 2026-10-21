@@ -428,7 +428,7 @@ tunables:
 .Bl -tag -width indent
 .It Va kern.hwpmc.callchaindepth Pq integer, read-only
 The maximum number of call chain records to capture per sample.
-The default is 8.
+The default is 128.
 .It Va kern.hwpmc.debugflags Pq string, read-write
 (Only available if the
 .Nm
@@ -458,6 +458,18 @@ The size in kilobytes of each log buffer used by
 logging function.
 The default buffer size is 256KB.
 The maximum value is 16MB.
+.It Va kern.hwpmc.max_sample_rate Pq integer, read-write
+The maximum number of samples each second for one sampling PMC on one CPU.
+The driver divides this value by
+.Va hz
+to get a limit for each clock tick.
+When a PMC interrupts more times than this limit in one clock tick, the
+driver drops the sample, stops the PMC, and counts the drop.
+The driver starts the PMC again at the next clock tick.
+The value 0 disables the limit.
+Without the limit, a short sample period can use all the CPU time in the
+interrupt handler.
+The default is 100000.
 .It Va kern.hwpmc.mincount Pq integer, read-write
 The minimum sampling rate for sampling mode PMCs.
 The default count is 1000 events.
@@ -476,7 +488,7 @@ and
 must not exceed 32MB per CPU.
 .It Va kern.hwpmc.nsamples Pq integer, read-only
 The number of entries in the per-CPU ring buffer used during sampling.
-The default is 512.
+The default is 256.
 .It Va security.bsd.unprivileged_syspmcs Pq boolean, read-write
 If set to non-zero, allow unprivileged processes to allocate system-wide
 PMCs.
@@ -536,6 +548,10 @@ between the currently executing kernel and the module being loaded.
 The module loading process failed because the currently executing kernel
 was not configured with the required configuration option
 .Dv HWPMC_HOOKS .
+.It "hwpmc: sample rate limit disabled, sampling can stall the system"
+An administrator set
+.Va kern.hwpmc.max_sample_rate
+to 0.
 .It "hwpmc: tunable hashsize=%d must be greater than zero."
 A negative value was supplied for tunable
 .Va kern.hwpmc.hashsize .

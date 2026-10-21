@@ -200,6 +200,7 @@ static struct pmc_classdep **pmc_rowindex_to_classdep;
 static int	pmc_debugflags_sysctl_handler(SYSCTL_HANDLER_ARGS);
 static int	pmc_debugflags_parse(char *newstr, char *fence);
 #endif
+static int	pmc_max_sample_rate_sysctl_handler(SYSCTL_HANDLER_ARGS);
 
 static void	pmc_multipart_add(struct pmc_sample *ps, int type,
     int length);
@@ -265,6 +266,7 @@ static void	pmc_process_thread_userret(struct thread *td);
 static void	pmc_release_pmc_descriptor(struct pmc *pmc);
 static void	pmc_remove_owner(struct pmc_owner *po);
 static void	pmc_remove_process_descriptor(struct pmc_process *pp);
+static void	pmc_restart_stalled(int cpu);
 static int	pmc_start(struct pmc *pm);
 static int	pmc_stop(struct pmc *pm);
 static int	pmc_syscall_handler(struct thread *td, void *syscall_args);
@@ -273,6 +275,7 @@ static void	pmc_thread_descriptor_pool_drain(void);
 static void	pmc_thread_descriptor_pool_free(struct pmc_thread *pt);
 static void	pmc_unlink_target_process(struct pmc *pmc,
     struct pmc_process *pp);
+static void	pmc_update_sample_limit(void);
 
 static int	generic_switch_in(struct pmc_cpu *pc, struct pmc_process *pp);
 static int	generic_switch_out(struct pmc_cpu *pc, struct pmc_process *pp);
@@ -318,6 +321,19 @@ SYSCTL_COUNTER_U64(_kern_hwpmc_stats, OID_AUTO, merges, CTLFLAG_RW,
 SYSCTL_COUNTER_U64(_kern_hwpmc_stats, OID_AUTO, overwrites, CTLFLAG_RW,
     &pmc_stats.pm_overwrites,
     "# of times a sample was overwritten before being logged");
+SYSCTL_COUNTER_U64(_kern_hwpmc_stats, OID_AUTO, intr_throttled, CTLFLAG_RW,
+    &pmc_stats.pm_intr_throttled,
+    "# of times a PMC stopped at the sample rate limit");
+/* Per-PMC, per-CPU sample rate limit. Zero disables it. */
+static u_int pmc_max_sample_rate = PMC_MAX_SAMPLE_RATE;
+static u_int pmc_max_samples_per_tick;
+SYSCTL_PROC(_kern_hwpmc, OID_AUTO, max_sample_rate,
+    CTLTYPE_UINT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, NULL, 0,
+    pmc_max_sample_rate_sysctl_handler, "IU",
+    "maximum samples per second for one PMC on one CPU (0: no limit)");
+
+DPCPU_DEFINE_STATIC(int, pmc_tick_seq);	/* hardclock ticks */
+DPCPU_DEFINE_STATIC(uint8_t, pmc_throttled);	/* restart at next tick */
 
 static int pmc_callchaindepth = PMC_CALLCHAIN_DEPTH;
 SYSCTL_INT(_kern_hwpmc, OID_AUTO, callchaindepth, CTLFLAG_RDTUN,
@@ -611,6 +627,36 @@ pmc_debugflags_sysctl_handler(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 #endif
+
+/* Sample rate limit. */
+static void
+pmc_update_sample_limit(void)
+{
+	u_int rate;
+
+	rate = atomic_load_int(&pmc_max_sample_rate);
+	/* Use 64 bits to prevent wrap near UINT_MAX. */
+	atomic_store_int(&pmc_max_samples_per_tick,
+	    rate == 0 ? 0 : howmany((uint64_t)rate, hz));
+}
+
+static int
+pmc_max_sample_rate_sysctl_handler(SYSCTL_HANDLER_ARGS)
+{
+	u_int rate;
+	int error;
+
+	rate = pmc_max_sample_rate;
+	error = sysctl_handle_int(oidp, &rate, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (rate == 0 && pmc_max_sample_rate != 0)
+		log(LOG_WARNING,
+		    "hwpmc: sample rate limit disabled, sampling can stall the system\n");
+	atomic_store_int(&pmc_max_sample_rate, rate);
+	pmc_update_sample_limit();
+	return (0);
+}
 
 /*
  * Map a row index to a classdep structure and return the adjusted row
@@ -2269,13 +2315,8 @@ pmc_hook_handler(struct thread *td, int function, void *arg)
 		break;
 
 	/*
-	 * Process accumulated PC samples.
-	 *
-	 * This function is expected to be called by hardclock() for
-	 * each CPU that has accumulated PC samples.
-	 *
-	 * This function is to be executed on the CPU whose samples
-	 * are being processed.
+	 * Process this CPU's samples. A non-NULL arg flushes without a clock
+	 * tick.
 	 */
 	case PMC_FN_DO_SAMPLES:
 		/*
@@ -2291,9 +2332,24 @@ pmc_hook_handler(struct thread *td, int function, void *arg)
 		 */
 		DPCPU_SET(pmc_sampled, 0);
 		cpu = PCPU_GET(cpuid);
+		if (arg != NULL) {
+			pmc_process_samples(cpu, PMC_HR);
+			pmc_process_samples(cpu, PMC_SR);
+			pmc_process_samples(cpu, PMC_UR);
+			/* Restart throttled PMCs at the next tick. */
+			if (DPCPU_GET(pmc_throttled) != 0)
+				DPCPU_SET(pmc_sampled, 1);
+			break;
+		}
+		DPCPU_SET(pmc_tick_seq, DPCPU_GET(pmc_tick_seq) + 1);
 		pmc_process_samples(cpu, PMC_HR);
 		pmc_process_samples(cpu, PMC_SR);
 		pmc_process_samples(cpu, PMC_UR);
+		/* Restart throttled PMCs even with an empty ring. */
+		if (DPCPU_GET(pmc_throttled) != 0) {
+			DPCPU_SET(pmc_throttled, 0);
+			pmc_restart_stalled(cpu);
+		}
 		break;
 
 	case PMC_FN_MMAP:
@@ -2787,8 +2843,7 @@ pmc_drain_samples(void)
 }
 
 /*
- * Release process-virtual PMCs on each CPU after pmc_hook is cleared.
- * CPU binding also waits for active hooks.
+ * Release process-virtual PMC runcounts on each CPU after pmc_hook is cleared.
  */
 static void
 pmc_unload_virtual_pmcs(void)
@@ -2844,9 +2899,7 @@ pmc_wait_for_pmc_idle(struct pmc *pm)
 	pmclog_flush(pm->pm_owner, 1);
 	while (counter_u64_fetch(pm->pm_runcount) > 0) {
 		pmclog_flush(pm->pm_owner, 1);
-		/*
-		 * Drain the rings at unload because hardclock no longer does.
-		 */
+		/* Drain rings at unload without hardclock. */
 		if (pmc_hook == NULL)
 			pmc_drain_samples();
 #ifdef INVARIANTS
@@ -2925,9 +2978,7 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 
 		PMCDBG2(PMC,REL,2, "decfg cpu=%d ri=%d", cpu, ri);
 
-		critical_enter();
 		(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
-		critical_exit();
 
 		/* adjust the global and process count of SS mode PMCs */
 		if (mode == PMC_MODE_SS && pm->pm_state == PMC_STATE_RUNNING) {
@@ -4940,7 +4991,7 @@ pmc_add_sample(ring_type_t ring, struct pmc *pm, struct trapframe *tf,
 	ps->ps_flags = inuserspace ? PMC_CC_F_USERSPACE : 0;
 	ps->ps_nsamples_actual = 0;
 
-	callchaindepth = (pm->pm_flags & PMC_F_CALLCHAIN) ?
+	callchaindepth = (pm->pm_flags & PMC_F_CALLCHAIN) != 0 ?
 	    pmc_callchaindepth : 1;
 
 	MPASS(ps->ps_pc != NULL);
@@ -5002,7 +5053,28 @@ int
 pmc_process_interrupt_mp(int ring, struct pmc *pm, struct trapframe *tf,
     struct pmc_multipart *mp)
 {
+	struct pmc_pcpu_state *pps;
 	struct thread *td;
+	u_int limit;
+	int seq;
+
+	/* Drop samples above the tick limit and stop the PMC. */
+	limit = atomic_load_int(&pmc_max_samples_per_tick);
+	if (limit != 0) {
+		pps = &pm->pm_pcpu_state[curcpu];
+		seq = DPCPU_GET(pmc_tick_seq);
+		if (pps->pps_intr_tick != seq) {
+			pps->pps_intr_tick = seq;
+			pps->pps_intr_count = 0;
+		}
+		if (++pps->pps_intr_count > limit) {
+			DPCPU_SET(pmc_throttled, 1);
+			pps->pps_stalled = 1;
+			counter_u64_add(pmc_stats.pm_intr_throttled, 1);
+			DPCPU_SET(pmc_sampled, 1);
+			return (EBUSY);
+		}
+	}
 
 	td = curthread;
 	if ((pm->pm_flags & PMC_F_USERCALLCHAIN) &&
@@ -5142,10 +5214,9 @@ pmc_process_samples(int cpu, ring_type_t ring)
 	struct thread *td;
 	struct pmc_owner *po;
 	struct pmc_sample *ps;
-	struct pmc_classdep *pcd;
 	struct pmc_samplebuffer *psb;
 	uint64_t delta __diagused;
-	int adjri, n;
+	int n;
 
 	KASSERT(PCPU_GET(cpuid) == cpu,
 	    ("[pmc,%d] not on the correct CPU pcpu=%d cpu=%d", __LINE__,
@@ -5235,13 +5306,32 @@ entrydone:
 	if (n == 0)
 		return;
 
-	/*
-	 * Restart any stalled sampling PMCs on this CPU.
-	 *
-	 * If the NMI handler sets the pm_stalled field of a PMC after
-	 * the check below, we'll end up processing the stalled PMC at
-	 * the next hardclock tick.
-	 */
+	pmc_restart_stalled(cpu);
+}
+
+/* Pack flags above the drop count for one atomic read. */
+/* Check whether this PMC exceeded the current tick limit. */
+static bool
+pmc_over_limit(struct pmc *pm, int cpu)
+{
+	struct pmc_pcpu_state *pps;
+	u_int limit;
+
+	limit = atomic_load_int(&pmc_max_samples_per_tick);
+	pps = &pm->pm_pcpu_state[cpu];
+	return (limit != 0 &&
+	    pps->pps_intr_tick == DPCPU_ID_GET(cpu, pmc_tick_seq) &&
+	    pps->pps_intr_count > limit);
+}
+
+/* Restart stalled PMCs. A concurrent stall waits for the next tick. */
+static void
+pmc_restart_stalled(int cpu)
+{
+	struct pmc *pm;
+	struct pmc_classdep *pcd;
+	int adjri, n;
+
 	for (n = 0; n < md->pmd_npmc; n++) {
 		pcd = pmc_ri_to_classdep(md, n, &adjri);
 		KASSERT(pcd != NULL,
@@ -5250,10 +5340,18 @@ entrydone:
 
 		if (pm == NULL ||				/* !cfg'ed */
 		    pm->pm_state != PMC_STATE_RUNNING ||	/* !active */
-		    !PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)) ||	/* !sampling */
-		    !pm->pm_pcpu_state[cpu].pps_cpustate ||	/* !desired */
+		    !PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)))	/* !sampling */
+			continue;
+
+		if (!pm->pm_pcpu_state[cpu].pps_cpustate ||	/* !desired */
 		    !pm->pm_pcpu_state[cpu].pps_stalled)	/* !stalled */
 			continue;
+
+		if (pmc_over_limit(pm, cpu)) {
+			DPCPU_ID_SET(cpu, pmc_throttled, 1);
+			DPCPU_ID_SET(cpu, pmc_sampled, 1);
+			continue;
+		}
 
 		pm->pm_pcpu_state[cpu].pps_stalled = 0;
 		(void)(*pcd->pcd_start_pmc)(cpu, adjri, pm);
@@ -5750,6 +5848,7 @@ pmc_initialize(void)
 	pmc_stats.pm_log_sweeps = counter_u64_alloc(M_WAITOK);
 	pmc_stats.pm_merges = counter_u64_alloc(M_WAITOK);
 	pmc_stats.pm_overwrites = counter_u64_alloc(M_WAITOK);
+	pmc_stats.pm_intr_throttled = counter_u64_alloc(M_WAITOK);
 
 #ifdef HWPMC_DEBUG
 	/* parse debug flags first */
@@ -5789,6 +5888,8 @@ pmc_initialize(void)
 		pmc_nsamples = PMC_NSAMPLES;
 	}
 	pmc_sample_mask = pmc_nsamples - 1;
+
+	pmc_update_sample_limit();
 
 	if (pmc_callchaindepth <= 0 ||
 	    pmc_callchaindepth > PMC_CALLCHAIN_DEPTH_MAX) {
@@ -6162,6 +6263,7 @@ pmc_cleanup(void)
 	counter_u64_free(pmc_stats.pm_log_sweeps);
 	counter_u64_free(pmc_stats.pm_merges);
 	counter_u64_free(pmc_stats.pm_overwrites);
+	counter_u64_free(pmc_stats.pm_intr_throttled);
 	sx_xunlock(&pmc_sx);	/* we are done */
 }
 
