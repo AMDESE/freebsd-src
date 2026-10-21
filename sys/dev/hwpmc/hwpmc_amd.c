@@ -831,7 +831,13 @@ amd_stop_pmc(int cpu __diagused, int ri, struct pmc *pm)
 
 		config = pm->pm_md.pm_amd.pm_amd_evsel & ~AMD_PMC_UMC_ENABLE;
 	} else {
-		KASSERT(!AMD_PMC_IS_STOPPED(pd->pm_evsel),
+		/*
+		 * The local NMI handler can stop this PMC. It must set
+		 * pps_stalled.
+		 */
+		KASSERT(!AMD_PMC_IS_STOPPED(pd->pm_evsel) ||
+		    (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)) &&
+		    pm->pm_pcpu_state[cpu].pps_stalled != 0),
 		    ("[amd,%d] PMC%d, CPU%d \"%s\" already stopped",
 		    __LINE__, ri, cpu, pd->pm_descr.pd_name));
 

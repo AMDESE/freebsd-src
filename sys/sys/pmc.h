@@ -578,6 +578,7 @@ struct pmc_driverstats {
 						   passes */
 	counter_u64_t	pm_merges;		/* merged k+u */
 	counter_u64_t	pm_overwrites;		/* UR overwrites */
+	counter_u64_t	pm_intr_throttled;	/* #stops at the rate limit */
 };
 #endif
 
@@ -669,6 +670,7 @@ struct pmc_op_caps {
 #define	PMC_NLOGBUFFERS_PCPU			32
 #define	PMC_NLOGBUFFERS_PCPU_MEM_MAX		(32 * 1024)
 #define	PMC_NSAMPLES				256
+#define	PMC_MAX_SAMPLE_RATE			100000
 #define	PMC_CALLCHAIN_DEPTH			128
 #define	PMC_THREADLIST_MAX			128
 
@@ -749,6 +751,8 @@ struct pmc_pcpu_state {
 	uint32_t pps_overflowcnt;	/* count overflow interrupts */
 	uint8_t pps_stalled;
 	uint8_t pps_cpustate;
+	int	pps_intr_tick;		/* interrupt count tick */
+	u_int	pps_intr_count;		/* interrupts per tick */
 } __aligned(CACHE_LINE_SIZE);
 struct pmc {
 	LIST_HEAD(,pmc_target)	pm_targets;	/* list of target processes */

@@ -458,6 +458,14 @@ The size in kilobytes of each log buffer used by
 logging function.
 The default buffer size is 256KB.
 The maximum value is 16MB.
+.It Va kern.hwpmc.max_sample_rate Pq integer, read-write
+The maximum number of samples each second for one sampling PMC on one CPU.
+When a PMC reaches the limit in a clock tick, the driver stops the PMC.
+The driver starts the PMC again at the next clock tick.
+The value 0 disables the limit.
+Without the limit, a short sample period can use all the CPU time in the
+interrupt handler.
+The default is 100000.
 .It Va kern.hwpmc.mincount Pq integer, read-write
 The minimum sampling rate for sampling mode PMCs.
 The default count is 1000 events.
