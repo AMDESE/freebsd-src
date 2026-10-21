@@ -635,7 +635,11 @@ pmc_ibs_process_fetch(struct pmc *pm, struct trapframe *tf, uint64_t config)
 		mpd.pl_mpdata[PMC_MPIDX_FETCH_CTL2] = rdmsr(IBS_FETCH_CTL2);
 	}
 
-	pmc_process_interrupt_mp(PMC_HR, pm, tf, &mpd);
+	/* Keep IBS stopped on queue failure. Restart only through hardclock. */
+	if (pmc_process_interrupt_mp(PMC_HR, pm, tf, &mpd) != 0) {
+		wrmsr(IBS_FETCH_CTL, 0);
+		return;
+	}
 
 	wrmsr(IBS_FETCH_CTL, pm->pm_md.pm_ibs.ibs_ctl | IBS_FETCH_CTL_ENABLE);
 }
@@ -672,7 +676,11 @@ pmc_ibs_process_op(struct pmc *pm, struct trapframe *tf, uint64_t config)
 		mpd.pl_mpdata[PMC_MPIDX_OP_CTL2] = rdmsr(IBS_OP_CTL2);
 	}
 
-	pmc_process_interrupt_mp(PMC_HR, pm, tf, &mpd);
+	/* See pmc_ibs_process_fetch(). */
+	if (pmc_process_interrupt_mp(PMC_HR, pm, tf, &mpd) != 0) {
+		wrmsr(IBS_OP_CTL, 0);
+		return;
+	}
 
 	wrmsr(IBS_OP_CTL, pm->pm_md.pm_ibs.ibs_ctl | IBS_OP_CTL_ENABLE);
 }
