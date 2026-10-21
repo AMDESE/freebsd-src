@@ -441,6 +441,17 @@ driver.
 The number of rows in the hash tables used to keep track of owner and
 target processes.
 The default is 16.
+.It Va kern.hwpmc.ibs_fetch_min_period Pq integer, read-write
+The smallest sample period that the kernel accepts for an AMD IBS fetch
+PMC.
+A small period causes an interrupt rate that the system cannot sustain.
+The default is 65536.
+The kernel never accepts a period below 16, the hardware minimum.
+.It Va kern.hwpmc.ibs_op_min_period Pq integer, read-write
+The smallest sample period that the kernel accepts for an AMD IBS op
+PMC.
+The default is 65536.
+The kernel never accepts a period below 144, the hardware minimum.
 .It Va kern.hwpmc.logbuffersize Pq integer, read-only
 The size in kilobytes of each log buffer used by
 .Nm Ns 's

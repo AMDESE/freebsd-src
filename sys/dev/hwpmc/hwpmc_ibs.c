@@ -89,6 +89,17 @@ SYSCTL_U64(_kern_hwpmc, OID_AUTO, ibs_op_ctl2_extra_mask, CTLFLAG_RDTUN,
     &ibs_op_ctl2_extra_mask, 0,
     "Extra allowed bits in the IBS op control 2 MSR (override; default 0)");
 
+/* IBS minimum periods match libpmc. */
+static u_int ibs_fetch_min_period = IBS_FETCH_MIN_RATE;
+SYSCTL_UINT(_kern_hwpmc, OID_AUTO, ibs_fetch_min_period, CTLFLAG_RWTUN,
+    &ibs_fetch_min_period, 0,
+    "Minimum IBS fetch sample period");
+
+static u_int ibs_op_min_period = IBS_OP_MIN_RATE;
+SYSCTL_UINT(_kern_hwpmc, OID_AUTO, ibs_op_min_period, CTLFLAG_RWTUN,
+    &ibs_op_min_period, 0,
+    "Minimum IBS op sample period");
+
 /* Count fetch and op stops. */
 struct ibs_cpu {
 	int		pc_stopping;
@@ -144,6 +155,7 @@ static int
 ibs_validate_fetch_config(uint64_t config)
 {
 	uint64_t allowed_mask;
+	u_int minp;
 
 	allowed_mask = ibs_fetch_allowed_mask | ibs_fetch_extra_mask;
 	if ((config & ~allowed_mask) != 0) {
@@ -152,6 +164,12 @@ ibs_validate_fetch_config(uint64_t config)
 		    " 0x%jx", (uintmax_t)config, (uintmax_t)allowed_mask));
 	}
 
+	minp = MAX(ibs_fetch_min_period, IBS_FETCH_HW_MIN_PERIOD);
+	if (IBS_FETCH_CTL_TO_INTERVAL(config) < minp)
+		return (EXTERROR(EINVAL,
+		    "IBS fetch period %ju is below the minimum %u",
+		    (uintmax_t)IBS_FETCH_CTL_TO_INTERVAL(config), minp));
+
 	return (0);
 }
 
@@ -159,6 +177,7 @@ static int
 ibs_validate_op_config(uint64_t config)
 {
 	uint64_t allowed_mask;
+	u_int minp;
 
 	allowed_mask = ibs_op_allowed_mask;
 
@@ -185,6 +204,12 @@ ibs_validate_op_config(uint64_t config)
 		    "IBS op ctl config 0x%jx has bits outside allowed mask"
 		    " 0x%jx", (uintmax_t)config, (uintmax_t)allowed_mask));
 	}
+
+	minp = MAX(ibs_op_min_period, IBS_OP_HW_MIN_PERIOD);
+	if (IBS_OP_CTL_TO_INTERVAL(config) < minp)
+		return (EXTERROR(EINVAL,
+		    "IBS op period %ju is below the minimum %u",
+		    (uintmax_t)IBS_OP_CTL_TO_INTERVAL(config), minp));
 
 	return (0);
 }
