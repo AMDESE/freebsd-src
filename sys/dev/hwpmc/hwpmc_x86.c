@@ -38,6 +38,7 @@
 #include <vm/vm.h>
 #include <vm/pmap.h>
 
+#include <machine/clock.h>
 #include <machine/cpu.h>
 #include <machine/cputypes.h>
 #include <machine/intr_machdep.h>	/* For x86/apicvar.h */
@@ -224,6 +225,23 @@ pmc_save_kernel_callchain(uintptr_t *cc, int nframes, struct trapframe *tf)
 	return (n);
 }
 
+/* Measure PMC interrupt time with the TSC. The scale is 32.32 ns per cycle. */
+static int (*pmc_x86_md_intr)(struct trapframe *);
+static uint64_t pmc_x86_tsc_scale;
+
+static int
+pmc_x86_intr(struct trapframe *tf)
+{
+	uint64_t t0;
+	int rv;
+
+	t0 = rdtsc();
+	rv = pmc_x86_md_intr(tf);
+	if (rv != 0 && pmc_x86_tsc_scale != 0)
+		pmc_intr_took(((rdtsc() - t0) * pmc_x86_tsc_scale) >> 32);
+	return (rv);
+}
+
 /*
  * Machine dependent initialization for x86 class platforms.
  */
@@ -243,7 +261,10 @@ pmc_md_initialize(void)
 	if (md == NULL)
 		return (NULL);
 
-	nmi_register_handler(md->pmd_intr);
+	pmc_x86_md_intr = md->pmd_intr;
+	pmc_x86_tsc_scale = tsc_freq != 0 ?
+	    ((uint64_t)1000000000 << 32) / tsc_freq : 0;
+	nmi_register_handler(pmc_x86_intr);
 	/* disallow sampling if we do not have an LAPIC */
 	if (!lapic_enable_pcint())
 		for (i = 0; i < md->pmd_nclass; i++) {
@@ -260,7 +281,7 @@ pmc_md_finalize(struct pmc_mdep *md)
 {
 	if (md != NULL) {
 		lapic_disable_pcint();
-		nmi_remove_handler(md->pmd_intr);
+		nmi_remove_handler(pmc_x86_intr);
 	}
 	if (cpu_vendor_id == CPU_VENDOR_AMD ||
 	    cpu_vendor_id == CPU_VENDOR_HYGON)

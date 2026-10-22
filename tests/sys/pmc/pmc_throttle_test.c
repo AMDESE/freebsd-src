@@ -152,6 +152,7 @@ hz_get(void)
 
 struct saved_sysctls {
 	u_int	rate;
+	u_int	pct;
 	u_int	mincount;
 };
 
@@ -163,6 +164,7 @@ sysctls_save(void)
 
 	sv.mincount = hwpmc_get("mincount");
 	sv.rate = hwpmc_get("max_sample_rate");
+	sv.pct = hwpmc_get("cpu_time_max_percent");
 	fd = open(SAVE_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	ATF_REQUIRE(fd >= 0);
 	ATF_REQUIRE(write(fd, &sv, sizeof(sv)) == sizeof(sv));
@@ -180,6 +182,7 @@ sysctls_restore(void)
 		return;
 	if (read(fd, &sv, sizeof(sv)) == sizeof(sv)) {
 		(void)hwpmc_write("max_sample_rate", sv.rate);
+		(void)hwpmc_write("cpu_time_max_percent", sv.pct);
 		(void)hwpmc_write("mincount", sv.mincount);
 	}
 	close(fd);
@@ -350,6 +353,46 @@ ATF_TC_CLEANUP(rate_unlimited, tc)
 	sysctls_restore();
 }
 
+/* A 1% CPU time limit must lower the sample rate and measured rate. */
+ATF_TC_WITH_CLEANUP(time_limited);
+ATF_TC_HEAD(time_limited, tc)
+{
+	atf_tc_set_md_var(tc, "require.user", "root");
+	atf_tc_set_md_var(tc, "timeout", "30");
+}
+ATF_TC_BODY(time_limited, tc)
+{
+	uint64_t lowered0, lowered1, throttled;
+	double rate, bound;
+	u_int newrate;
+	int hz;
+
+	hz = throttle_setup(100);
+	hwpmc_set("cpu_time_max_percent", 1);
+
+	lowered0 = stat_get("rate_lowered");
+	rate = measure(&throttled);
+	lowered1 = stat_get("rate_lowered");
+	newrate = hwpmc_get("max_sample_rate");
+
+	sysctls_restore();
+
+	bound = 1.5 * (newrate + hz);
+	printf("hz %d, rate %.0f/s, new limit %u/s, lowered %ju\n", hz,
+	    rate, newrate, (uintmax_t)(lowered1 - lowered0));
+	ATF_CHECK_MSG(lowered1 > lowered0, "the rate was not lowered");
+	ATF_CHECK_MSG(newrate < 100 * (u_int)hz,
+	    "max_sample_rate %u was not lowered", newrate);
+	ATF_CHECK_MSG(rate <= bound, "rate %.0f/s is above %.0f/s", rate,
+	    bound);
+}
+
+ATF_TC_CLEANUP(time_limited, tc)
+{
+
+	sysctls_restore();
+}
+
 /* Short periods must cause one throttle per tick, not two. */
 ATF_TC_WITH_CLEANUP(short_period);
 ATF_TC_HEAD(short_period, tc)
@@ -423,6 +466,7 @@ ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, rate_limited);
 	ATF_TP_ADD_TC(tp, rate_unlimited);
+	ATF_TP_ADD_TC(tp, time_limited);
 	ATF_TP_ADD_TC(tp, short_period);
 	ATF_TP_ADD_TC(tp, flush_loop);
 	return (atf_no_error());
