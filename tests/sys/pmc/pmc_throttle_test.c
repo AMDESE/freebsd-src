@@ -4,7 +4,7 @@
  * Copyright (c) 2026 Advanced Micro Devices, Inc.
  */
 
-/* Test per-tick sample rate limits with a busy CPU and a short period. */
+/* Test per-tick sample rate and interrupt CPU time limits. */
 
 #include <sys/param.h>
 #include <sys/cpuset.h>
@@ -100,6 +100,28 @@ rate_set(u_int v)
 
 	ATF_REQUIRE_MSG(sysctlbyname("kern.hwpmc.max_sample_rate", NULL, NULL,
 	    &v, sizeof(v)) == 0, "set max_sample_rate: %s", strerror(errno));
+}
+
+static u_int
+pct_get(void)
+{
+	u_int v;
+	size_t len;
+
+	len = sizeof(v);
+	if (sysctlbyname("kern.hwpmc.cpu_time_max_percent", &v, &len, NULL,
+	    0) != 0)
+		atf_tc_skip("kern.hwpmc.cpu_time_max_percent is not available");
+	return (v);
+}
+
+static void
+pct_set(u_int v)
+{
+
+	ATF_REQUIRE_MSG(sysctlbyname("kern.hwpmc.cpu_time_max_percent", NULL,
+	    NULL, &v, sizeof(v)) == 0, "set cpu_time_max_percent: %s",
+	    strerror(errno));
 }
 
 static int
@@ -248,9 +270,51 @@ ATF_TC_BODY(rate_unlimited, tc)
 	    bound);
 }
 
+/* A 1% CPU time limit must lower the sample rate and measured rate. */
+ATF_TC(time_limited);
+ATF_TC_HEAD(time_limited, tc)
+{
+	atf_tc_set_md_var(tc, "require.user", "root");
+	atf_tc_set_md_var(tc, "timeout", "30");
+}
+ATF_TC_BODY(time_limited, tc)
+{
+	uint64_t lowered0, lowered1, throttled;
+	double rate, bound;
+	u_int oldrate, oldpct, oldmin, newrate;
+	int hz;
+
+	require_hwpmc();
+	oldrate = rate_get();
+	oldpct = pct_get();
+	hz = hz_get();
+	oldmin = mincount_set(1);
+	rate_set(100 * hz);
+	pct_set(1);
+
+	lowered0 = stat_get("rate_lowered");
+	rate = measure(&throttled);
+	lowered1 = stat_get("rate_lowered");
+	newrate = rate_get();
+
+	pct_set(oldpct);
+	rate_set(oldrate);
+	(void)mincount_set(oldmin);
+
+	bound = 1.5 * (newrate + hz);
+	printf("hz %d, rate %.0f/s, new limit %u/s, lowered %ju\n", hz,
+	    rate, newrate, (uintmax_t)(lowered1 - lowered0));
+	ATF_CHECK_MSG(lowered1 > lowered0, "the rate was not lowered");
+	ATF_CHECK_MSG(newrate < 100 * (u_int)hz,
+	    "max_sample_rate %u was not lowered", newrate);
+	ATF_CHECK_MSG(rate <= bound, "rate %.0f/s is above %.0f/s", rate,
+	    bound);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, rate_limited);
 	ATF_TP_ADD_TC(tp, rate_unlimited);
+	ATF_TP_ADD_TC(tp, time_limited);
 	return (atf_no_error());
 }

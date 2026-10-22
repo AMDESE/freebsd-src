@@ -429,6 +429,19 @@ tunables:
 .It Va kern.hwpmc.callchaindepth Pq integer, read-only
 The maximum number of call chain records to capture per sample.
 The default is 8.
+.It Va kern.hwpmc.cpu_time_max_percent Pq integer, read-write
+The maximum percentage of CPU time that the PMC interrupt handler can use.
+The driver measures the time of each interrupt.
+When the average time is above this percentage of the time between two
+samples at
+.Va kern.hwpmc.max_sample_rate ,
+the driver decreases
+.Va kern.hwpmc.max_sample_rate
+and logs a message.
+The driver does not increase the rate again.
+The values 0 and 100 disable this limit.
+This limit is available only on x86.
+The default is 25.
 .It Va kern.hwpmc.debugflags Pq string, read-write
 (Only available if the
 .Nm

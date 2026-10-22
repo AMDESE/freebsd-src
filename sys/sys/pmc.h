@@ -579,6 +579,7 @@ struct pmc_driverstats {
 	counter_u64_t	pm_merges;		/* merged k+u */
 	counter_u64_t	pm_overwrites;		/* UR overwrites */
 	counter_u64_t	pm_intr_throttled;	/* #stops at the rate limit */
+	counter_u64_t	pm_rate_lowered;	/* #automatic rate decreases */
 };
 #endif
 
@@ -671,6 +672,7 @@ struct pmc_op_caps {
 #define	PMC_NLOGBUFFERS_PCPU_MEM_MAX		(32 * 1024)
 #define	PMC_NSAMPLES				256
 #define	PMC_MAX_SAMPLE_RATE			100000
+#define	PMC_CPU_TIME_MAX_PERCENT		25
 #define	PMC_CALLCHAIN_DEPTH			128
 #define	PMC_THREADLIST_MAX			128
 
@@ -1270,6 +1272,7 @@ int	pmc_process_interrupt_mp(int _ring, struct pmc *_pm,
     struct trapframe *_tf, struct pmc_multipart *mp);
 int	pmc_process_interrupt(int _ring, struct pmc *_pm,
     struct trapframe *_tf);
+void	pmc_intr_took(uint64_t _ns);
 int	pmc_save_kernel_callchain(uintptr_t *_cc, int _maxsamples,
     struct trapframe *_tf);
 int	pmc_save_user_callchain(uintptr_t *_cc, int _maxsamples,
