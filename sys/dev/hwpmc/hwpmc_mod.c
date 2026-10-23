@@ -2765,6 +2765,67 @@ pmc_destroy_pmc_descriptor(struct pmc *pm)
 	free(pm, M_PMC);
 }
 
+/* Drain CPU sample rings. */
+static void
+pmc_drain_samples(void)
+{
+	struct pmc_binding pb;
+	int cpu;
+
+	pmc_save_cpu_binding(&pb);
+	CPU_FOREACH(cpu) {
+		if (!pmc_cpu_is_active(cpu))
+			continue;
+		pmc_select_cpu(cpu);
+		spinlock_enter();
+		pmc_process_samples(cpu, PMC_HR);
+		pmc_process_samples(cpu, PMC_SR);
+		pmc_process_samples(cpu, PMC_UR);
+		spinlock_exit();
+	}
+	pmc_restore_cpu_binding(&pb);
+}
+
+/* Drain virtual PMCs. CPU binding waits for hooks. */
+static void
+pmc_unload_virtual_pmcs(void)
+{
+	struct pmc_binding pb;
+	struct pmc_classdep *pcd;
+	struct pmc *pm;
+	u_int adjri, ri;
+	int cpu;
+
+	pmc_save_cpu_binding(&pb);
+	CPU_FOREACH(cpu) {
+		if (!pmc_cpu_is_active(cpu))
+			continue;
+		pmc_select_cpu(cpu);
+		critical_enter();
+		pmc_process_csw_stop_all(cpu);
+		for (ri = 0; ri < md->pmd_npmc; ri++) {
+			pcd = pmc_ri_to_classdep(md, ri, &adjri);
+			pm = NULL;
+			(void)(*pcd->pcd_get_config)(cpu, adjri, &pm);
+			if (pm == NULL || !PMC_IS_VIRTUAL_MODE(PMC_TO_MODE(pm)))
+				continue;
+
+			pm->pm_pcpu_state[cpu].pps_cpustate = 0;
+			if (pm->pm_pcpu_state[cpu].pps_stalled == 0)
+				(void)pcd->pcd_stop_pmc(cpu, adjri, pm);
+			KASSERT(counter_u64_fetch(pm->pm_runcount) > 0,
+			    ("[pmc,%d] pm=%p runcount %ju", __LINE__, pm,
+			    (uintmax_t)counter_u64_fetch(pm->pm_runcount)));
+			counter_u64_add(pm->pm_runcount, -1);
+			(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
+		}
+		/* Disable user RDPMC. */
+		(void)md->pmd_switch_out(pmc_pcpu[cpu], NULL);
+		critical_exit();
+	}
+	pmc_restore_cpu_binding(&pb);
+}
+
 static void
 pmc_wait_for_pmc_idle(struct pmc *pm)
 {
@@ -2780,6 +2841,9 @@ pmc_wait_for_pmc_idle(struct pmc *pm)
 	pmclog_flush(pm->pm_owner, 1);
 	while (counter_u64_fetch(pm->pm_runcount) > 0) {
 		pmclog_flush(pm->pm_owner, 1);
+		/* Drain rings without hardclock. */
+		if (pmc_hook == NULL)
+			pmc_drain_samples();
 #ifdef INVARIANTS
 		maxloop--;
 		KASSERT(maxloop > 0,
@@ -5953,6 +6017,7 @@ pmc_cleanup(void)
 	}
 
 	pmc_hook = NULL; /* prevent new threads from entering module */
+	pmc_unload_virtual_pmcs();
 
 	/* deregister event handlers */
 	EVENTHANDLER_DEREGISTER(process_fork, pmc_fork_tag);
