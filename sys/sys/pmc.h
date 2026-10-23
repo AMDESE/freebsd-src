@@ -60,7 +60,7 @@
  * The patch version is incremented for every bug fix.
  */
 #define	PMC_VERSION_MAJOR	0x0A
-#define	PMC_VERSION_MINOR	0x03
+#define	PMC_VERSION_MINOR	0x04
 #define	PMC_VERSION_PATCH	0x0000
 
 #define	PMC_VERSION		(PMC_VERSION_MAJOR << 24 |		\
@@ -753,6 +753,7 @@ struct pmc_pcpu_state {
 	uint32_t pps_overflowcnt;	/* count overflow interrupts */
 	int pps_intr_tick;		/* Tick number. */
 	u_int pps_intr_count;		/* Interrupts per tick. */
+	u_int pps_lost;			/* Drop flags and count. */
 	uint8_t pps_stalled;
 	uint8_t pps_cpustate;
 } __aligned(CACHE_LINE_SIZE);
