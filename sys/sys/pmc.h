@@ -756,6 +756,7 @@ struct pmc_pcpu_state {
 	int	pps_intr_tick;		/* interrupt count tick */
 	u_int	pps_intr_count;		/* interrupts per tick */
 	u_int	pps_lost;		/* drop flags and count */
+	uint8_t	pps_pconly;		/* record only the PC */
 } __aligned(CACHE_LINE_SIZE);
 struct pmc {
 	LIST_HEAD(,pmc_target)	pm_targets;	/* list of target processes */

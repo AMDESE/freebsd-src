@@ -498,6 +498,13 @@ must not exceed 32MB per CPU.
 .It Va kern.hwpmc.nsamples Pq integer, read-only
 The number of entries in the per-CPU ring buffer used during sampling.
 The default is 512.
+.It Va kern.hwpmc.throttle_pconly Pq integer, read-write
+If set to non-zero, a PMC that reached
+.Va kern.hwpmc.max_sample_rate
+in the previous clock tick records only the program counter.
+The driver does not walk the call stack for these samples.
+This decreases the cost of each interrupt while the sample rate is high.
+The default is 1.
 .It Va security.bsd.unprivileged_syspmcs Pq boolean, read-write
 If set to non-zero, allow unprivileged processes to allocate system-wide
 PMCs.
