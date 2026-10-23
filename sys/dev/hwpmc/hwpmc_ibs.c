@@ -100,15 +100,9 @@ SYSCTL_UINT(_kern_hwpmc, OID_AUTO, ibs_op_min_period, CTLFLAG_RWTUN,
     &ibs_op_min_period, 0,
     "Minimum IBS op sample period");
 
-/*
- * Per-processor information
- */
-#define	IBS_CPU_RUNNING		1
-#define	IBS_CPU_STOPPING	2
-#define	IBS_CPU_STOPPED		3
-
+/* pc_stopping counts fetch and op stops. Claim stray NMIs while nonzero. */
 struct ibs_cpu {
-	int		pc_status;
+	int		pc_stopping;
 	int		pc_nmi_credit;	/* owed NMIs already serviced */
 	struct pmc_hw	pc_ibspmcs[IBS_NPMCS];
 };
@@ -505,12 +499,6 @@ ibs_start_pmc(int cpu __diagused, int ri, struct pmc *pm)
 	PMCDBG2(MDP, STA, 1, "ibs-start cpu=%d ri=%d", cpu, ri);
 
 	/*
-	 * This is used to handle spurious NMIs.  All that matters is that it
-	 * is not in the stopping state.
-	 */
-	atomic_store_int(&ibs_pcpu[cpu]->pc_status, IBS_CPU_RUNNING);
-
-	/*
 	 * Turn on the ENABLE bit.  Zeroing out the control register eliminates
 	 * stale valid bits from spurious NMIs and it resets the counter.  This
 	 * is safe here because the counter is not yet enabled; the NMI re-arm
@@ -575,7 +563,7 @@ ibs_stop_pmc(int cpu __diagused, int ri, struct pmc *pm)
 	config2 = pm->pm_md.pm_ibs.ibs_ctl2;
 	use_alt_disable = (ibs_features & CPUID_IBSID_IBSDIS) != 0;
 
-	atomic_store_int(&ibs_pcpu[cpu]->pc_status, IBS_CPU_STOPPING);
+	atomic_add_int(&ibs_pcpu[cpu]->pc_stopping, 1);
 
 	/*
 	 * On Zen 6, ctl2 DISABLE is the authoritative stop switch; skip
@@ -627,7 +615,7 @@ ibs_stop_pmc(int cpu __diagused, int ri, struct pmc *pm)
 		}
 	}
 
-	atomic_store_int(&ibs_pcpu[cpu]->pc_status, IBS_CPU_STOPPED);
+	atomic_subtract_int(&ibs_pcpu[cpu]->pc_stopping, 1);
 
 	return (0);
 }
@@ -777,12 +765,9 @@ pmc_ibs_intr(struct trapframe *tf)
 	if (retval > 1)
 		retval = 1;
 
-	if (retval == 0) {
-		// Lets check for a stray NMI when stopping
-		if (atomic_load_int(&pac->pc_status) == IBS_CPU_STOPPING) {
-			return (1);
-		}
-	}
+	/* Claim stray NMIs while an IBS unit stops. */
+	if (retval == 0 && atomic_load_int(&pac->pc_stopping) != 0)
+		return (1);
 
 	/* The caller updates the interrupt statistics. */
 
