@@ -313,6 +313,7 @@ struct pmcstat_stats {
 	int ps_samples_indeterminable;	/* #samples in indeterminable images */
 	int ps_samples_unknown_function;/* #samples with unknown function at offset */
 	int ps_callchain_dubious_frames;/* #dubious frame pointers seen */
+	int ps_samples_dropped;	/* #dropped samples */
 };
 
 __BEGIN_DECLS

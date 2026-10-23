@@ -497,7 +497,7 @@ static int
 pmcstat_print_log(void)
 {
 	struct pmclog_ev ev;
-	uint32_t npc;
+	uint32_t dnf, npc;
 
 	while (pmclog_read(args.pa_logparser, &ev) == 0) {
 		assert(ev.pl_state == PMCLOG_OK);
@@ -524,7 +524,17 @@ pmcstat_print_log(void)
 			PMCSTAT_PRINT_ENTRY("closelog",);
 			break;
 		case PMCLOG_TYPE_DROPNOTIFY:
-			PMCSTAT_PRINT_ENTRY("drop",);
+			dnf = ev.pl_u.pl_dn.pl_flags;
+			PMCSTAT_PRINT_ENTRY("drop",
+			    "0x%x cpu=%u count=%u%s%s%s",
+			    ev.pl_u.pl_dn.pl_pmcid, ev.pl_u.pl_dn.pl_cpu,
+			    ev.pl_u.pl_dn.pl_count,
+			    (dnf & PMCLOG_DROP_BUFFERFULL) != 0 ?
+			    " bufferfull" : "",
+			    (dnf & PMCLOG_DROP_THROTTLED) != 0 ?
+			    " throttled" : "",
+			    (dnf & PMCLOG_DROP_USERCC) != 0 ?
+			    " usercallchain" : "");
 			break;
 		case PMCLOG_TYPE_INITIALIZE:
 			PMCSTAT_PRINT_ENTRY("initlog",
