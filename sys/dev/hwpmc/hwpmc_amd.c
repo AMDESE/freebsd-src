@@ -851,12 +851,16 @@ amd_stop_pmc(int cpu __diagused, int ri, struct pmc *pm)
 	 * panic or messages based on kernel configuration
 	 */
 
-	/* Wait for the count to be reset */
-	for (i = 0; i < OVERFLOW_WAIT_COUNT; i++) {
-		if (rdmsr(pd->pm_perfctr) & (1 << (pd->pm_descr.pd_width - 1)))
-			break;
+	/* Wait for the overflow NMI reload. A clear top bit shows overflow. */
+	if (pd->pm_subclass == PMC_AMD_SUB_CLASS_CORE &&
+	    PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm))) {
+		for (i = 0; i < OVERFLOW_WAIT_COUNT; i++) {
+			if ((rdmsr(pd->pm_perfctr) &
+			    (1ULL << (pd->pm_descr.pd_width - 1))) != 0)
+				break;
 
-		DELAY(1);
+			DELAY(1);
+		}
 	}
 
 	return (0);
