@@ -756,6 +756,7 @@ struct pmc_pcpu_state {
 	u_int pps_lost;			/* Drop flags and count. */
 	uint8_t pps_stalled;
 	uint8_t pps_cpustate;
+	uint8_t pps_pconly;		/* PC only. */
 } __aligned(CACHE_LINE_SIZE);
 struct pmc {
 	LIST_HEAD(,pmc_target)	pm_targets;	/* list of target processes */

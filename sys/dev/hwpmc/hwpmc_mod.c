@@ -340,6 +340,12 @@ SYSCTL_PROC(_kern_hwpmc, OID_AUTO, max_sample_rate,
     pmc_max_sample_rate_sysctl_handler, "IU",
     "maximum samples per second for one PMC on one CPU (0: no limit)");
 
+/* Skip callchains after a rate stop. */
+static int pmc_throttle_pconly = 1;
+SYSCTL_INT(_kern_hwpmc, OID_AUTO, throttle_pconly, CTLFLAG_RWTUN,
+    &pmc_throttle_pconly, 0,
+    "record only the PC after a tick at the sample rate limit");
+
 /* Interrupt CPU budget. Zero and 100 disable it. */
 static u_int pmc_cpu_time_max_percent = PMC_CPU_TIME_MAX_PERCENT;
 static u_int pmc_intr_allowed_ns;	/* 0: limit disabled */
@@ -5108,8 +5114,8 @@ pmc_add_sample(ring_type_t ring, struct pmc *pm, struct trapframe *tf,
 	ps->ps_flags = inuserspace ? PMC_CC_F_USERSPACE : 0;
 	ps->ps_nsamples_actual = 0;
 
-	callchaindepth = (pm->pm_flags & PMC_F_CALLCHAIN) != 0 ?
-	    pmc_callchaindepth : 1;
+	callchaindepth = (pm->pm_flags & PMC_F_CALLCHAIN) != 0 &&
+	    pm->pm_pcpu_state[cpu].pps_pconly == 0 ? pmc_callchaindepth : 1;
 
 	MPASS(ps->ps_pc != NULL);
 
@@ -5122,7 +5128,9 @@ pmc_add_sample(ring_type_t ring, struct pmc *pm, struct trapframe *tf,
 	}
 
 	if (callchaindepth == 1) {
+		/* Keep multipart data before the PC. */
 		ps->ps_pc[ps->ps_nsamples_actual] = PMC_TRAPFRAME_TO_PC(tf);
+		callchaindepth = ps->ps_nsamples_actual + 1;
 	} else {
 		/*
 		 * Kernel stack traversals can be done immediately, while we
@@ -5181,6 +5189,10 @@ pmc_process_interrupt_mp(int ring, struct pmc *pm, struct trapframe *tf,
 		pps = &pm->pm_pcpu_state[curcpu];
 		seq = DPCPU_GET(pmc_tick_seq);
 		if (pps->pps_intr_tick != seq) {
+			/* Skip stack walks after a rate stop. */
+			pps->pps_pconly = pmc_throttle_pconly != 0 &&
+			    pps->pps_intr_tick == seq - 1 &&
+			    pps->pps_intr_count > limit;
 			pps->pps_intr_tick = seq;
 			pps->pps_intr_count = 0;
 		}
@@ -5191,6 +5203,8 @@ pmc_process_interrupt_mp(int ring, struct pmc *pm, struct trapframe *tf,
 			DPCPU_SET(pmc_sampled, 1);
 			return (EBUSY);
 		}
+	} else {
+		pm->pm_pcpu_state[curcpu].pps_pconly = 0;
 	}
 
 	td = curthread;
