@@ -320,7 +320,15 @@ pmclog_get_event(void *cookie, char **data, ssize_t *len,
 		ev->pl_state = PMCLOG_EOF;
 		return (-1);
 	case PMCLOG_TYPE_DROPNOTIFY:
-		/* nothing to do */
+		/* Older records have no payload. */
+		if (evlen < (int)sizeof(struct pmclog_dropnotify)) {
+			memset(&ev->pl_u.pl_dn, 0, sizeof(ev->pl_u.pl_dn));
+			break;
+		}
+		PMCLOG_READ32(le, ev->pl_u.pl_dn.pl_pmcid);
+		PMCLOG_READ32(le, ev->pl_u.pl_dn.pl_cpu);
+		PMCLOG_READ32(le, ev->pl_u.pl_dn.pl_flags);
+		PMCLOG_READ32(le, ev->pl_u.pl_dn.pl_count);
 		break;
 	case PMCLOG_TYPE_INITIALIZE:
 		PMCLOG_READ32(le,ev->pl_u.pl_i.pl_version);

@@ -258,6 +258,8 @@ static void	pmc_process_fork(void *arg, struct proc *p1,
 static void	pmc_process_proccreate(struct proc *p);
 static void	pmc_process_samples(int cpu, ring_type_t soft);
 static void	pmc_restart_stalled(int cpu);
+static void	pmc_note_lost(struct pmc *pm, int cpu, u_int flag);
+static void	pmc_log_lost(struct pmc *pm, int cpu);
 static void	pmc_process_threadcreate(struct thread *td);
 static void	pmc_process_threadexit(struct thread *td);
 static void	pmc_process_thread_add(struct thread *td);
@@ -4992,6 +4994,7 @@ pmc_add_sample(ring_type_t ring, struct pmc *pm, struct trapframe *tf,
 	ps = PMC_PROD_SAMPLE(psb);
 	if (psb->ps_considx != psb->ps_prodidx &&
 		ps->ps_nsamples) {	/* in use, reader hasn't caught up */
+		pmc_note_lost(pm, cpu, PMCLOG_DROP_BUFFERFULL);
 		pm->pm_pcpu_state[cpu].pps_stalled = 1;
 		counter_u64_add(pmc_stats.pm_intr_bufferfull, 1);
 		PMCDBG6(SAM,INT,1,"(spc) cpu=%d pm=%p tf=%p um=%d wr=%d rd=%d",
@@ -5096,9 +5099,9 @@ pmc_process_interrupt_mp(int ring, struct pmc *pm, struct trapframe *tf,
 			pps->pps_intr_count = 0;
 		}
 		if (++pps->pps_intr_count > limit) {
+			pmc_note_lost(pm, curcpu, PMCLOG_DROP_THROTTLED);
 			pps->pps_stalled = 1;
 			counter_u64_add(pmc_stats.pm_intr_throttled, 1);
-			DPCPU_SET(pmc_throttled, 1);
 			DPCPU_SET(pmc_sampled, 1);
 			return (EBUSY);
 		}
@@ -5288,6 +5291,7 @@ pmc_process_samples(int cpu, ring_type_t ring)
 				 * for long running system calls.
 				 */
 				counter_u64_add(pmc_stats.pm_overwrites, 1);
+				pmc_note_lost(pm, cpu, PMCLOG_DROP_USERCC);
 				goto entrydone;
 			}
 			/* Need a rescan at a later time. */
@@ -5337,6 +5341,47 @@ entrydone:
 	pmc_restart_stalled(cpu);
 }
 
+/* Pack flags above the drop count for atomic read and clear. */
+#define	PMC_LOST_FLAG_SHIFT	29
+#define	PMC_LOST_COUNT_MASK	((1U << PMC_LOST_FLAG_SHIFT) - 1)
+CTASSERT(((PMCLOG_DROP_BUFFERFULL | PMCLOG_DROP_THROTTLED |
+    PMCLOG_DROP_USERCC) >> (32 - PMC_LOST_FLAG_SHIFT)) == 0);
+
+/* Count a drop and request a hardclock log record. NMI-safe. */
+static void
+pmc_note_lost(struct pmc *pm, int cpu, u_int flag)
+{
+	struct pmc_pcpu_state *pps;
+	u_int old;
+
+	pps = &pm->pm_pcpu_state[cpu];
+	do {
+		old = atomic_load_int(&pps->pps_lost);
+		if ((old & PMC_LOST_COUNT_MASK) == PMC_LOST_COUNT_MASK)
+			break;
+	} while (atomic_cmpset_int(&pps->pps_lost, old,
+	    (old | flag << PMC_LOST_FLAG_SHIFT) + 1) == 0);
+	DPCPU_SET(pmc_throttled, 1);
+}
+
+/* Atomically read and clear drops. Log them unless the owner has no log. */
+static void
+pmc_log_lost(struct pmc *pm, int cpu)
+{
+	struct pmc_pcpu_state *pps;
+	u_int v;
+
+	pps = &pm->pm_pcpu_state[cpu];
+	if (atomic_load_int(&pps->pps_lost) == 0)
+		return;
+	v = atomic_readandclear_int(&pps->pps_lost);
+	if ((pm->pm_flags & PMC_F_ATTACHED_TO_OWNER) != 0 ||
+	    (pm->pm_owner->po_flags & PMC_PO_OWNS_LOGFILE) == 0)
+		return;
+	pmclog_process_dropnotify(pm, cpu, v >> PMC_LOST_FLAG_SHIFT,
+	    v & PMC_LOST_COUNT_MASK);
+}
+
 /* Restart stalled PMCs. A concurrent stall waits for the next tick. */
 static void
 pmc_restart_stalled(int cpu)
@@ -5353,8 +5398,12 @@ pmc_restart_stalled(int cpu)
 
 		if (pm == NULL ||				/* !cfg'ed */
 		    pm->pm_state != PMC_STATE_RUNNING ||	/* !active */
-		    !PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)) ||	/* !sampling */
-		    !pm->pm_pcpu_state[cpu].pps_cpustate ||	/* !desired */
+		    !PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pm)))	/* !sampling */
+			continue;
+
+		pmc_log_lost(pm, cpu);
+
+		if (!pm->pm_pcpu_state[cpu].pps_cpustate ||	/* !desired */
 		    !pm->pm_pcpu_state[cpu].pps_stalled)	/* !stalled */
 			continue;
 

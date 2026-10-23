@@ -27,6 +27,14 @@ NOTE TO PEOPLE WHO THINK THAT FreeBSD 16.x IS SLOW:
 	world, or to merely disable the most expensive debugging functionality
 	at runtime, run "ln -s 'abort:false,junk:false' /etc/malloc.conf".)
 
+20261022:
+	The hwpmc(4) PMCLOG_TYPE_DROPNOTIFY log record now has a payload
+	with the PMC ID, the CPU, the reason and the number of dropped
+	samples.  PMC_VERSION_MINOR is now 4.  An older libpmc(3) reads
+	the new record but ignores the payload.  Rebuild libpmc and
+	pmcstat(8) to see the counts.  The new libpmc reads logs from older
+	kernels.
+
 20260919:
 	less(1) has been updated to version 710, which removes the obsolete
 	lesskey(1) utility.  It is no longer built or installed, and the

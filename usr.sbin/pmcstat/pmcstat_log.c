@@ -524,7 +524,16 @@ pmcstat_print_log(void)
 			PMCSTAT_PRINT_ENTRY("closelog",);
 			break;
 		case PMCLOG_TYPE_DROPNOTIFY:
-			PMCSTAT_PRINT_ENTRY("drop",);
+			PMCSTAT_PRINT_ENTRY("drop",
+			    "0x%x cpu=%u count=%u%s%s%s",
+			    ev.pl_u.pl_dn.pl_pmcid, ev.pl_u.pl_dn.pl_cpu,
+			    ev.pl_u.pl_dn.pl_count,
+			    (ev.pl_u.pl_dn.pl_flags & PMCLOG_DROP_BUFFERFULL) ?
+			    " bufferfull" : "",
+			    (ev.pl_u.pl_dn.pl_flags & PMCLOG_DROP_THROTTLED) ?
+			    " throttled" : "",
+			    (ev.pl_u.pl_dn.pl_flags & PMCLOG_DROP_USERCC) ?
+			    " usercallchain" : "");
 			break;
 		case PMCLOG_TYPE_INITIALIZE:
 			PMCSTAT_PRINT_ENTRY("initlog",

@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pmc.h>
+#include <pmclog.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -148,8 +149,19 @@ mincount_set(u_int v)
 }
 
 /* Measure interrupts per second on TEST_CPU and report *throttled. */
+static double measure_log(uint64_t *throttled, const char *logpath,
+    pmc_id_t *idp);
+
 static double
 measure(uint64_t *throttled)
+{
+
+	return (measure_log(throttled, NULL, NULL));
+}
+
+/* Optionally write logpath and return the PMC ID in *idp. */
+static double
+measure_log(uint64_t *throttled, const char *logpath, pmc_id_t *idp)
 {
 	struct timeval t0, t1;
 	pthread_t thr;
@@ -174,9 +186,14 @@ measure(uint64_t *throttled)
 	if (!ok)
 		atf_tc_skip("no cycle event for a system sampling PMC");
 
-	fd = open("/dev/null", O_WRONLY);
+	if (logpath != NULL)
+		fd = open(logpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	else
+		fd = open("/dev/null", O_WRONLY);
 	ATF_REQUIRE(fd >= 0);
 	ATF_REQUIRE(pmc_configure_logfile(fd) == 0);
+	if (idp != NULL)
+		*idp = id;
 
 	atomic_store(&spin_stop, false);
 	ATF_REQUIRE(pthread_create(&thr, NULL, spin_main, NULL) == 0);
@@ -195,6 +212,8 @@ measure(uint64_t *throttled)
 	atomic_store(&spin_stop, true);
 	pthread_join(thr, NULL);
 	ATF_REQUIRE(pmc_release(id) == 0);
+	if (logpath != NULL)
+		ATF_REQUIRE(pmc_close_logfile() == 0);
 	(void)pmc_configure_logfile(-1);
 	close(fd);
 
@@ -311,10 +330,73 @@ ATF_TC_BODY(time_limited, tc)
 	    bound);
 }
 
+/* DROPNOTIFY counts must approximate the intr_throttled delta. */
+ATF_TC(drop_records);
+ATF_TC_HEAD(drop_records, tc)
+{
+	atf_tc_set_md_var(tc, "require.user", "root");
+	atf_tc_set_md_var(tc, "timeout", "30");
+}
+ATF_TC_BODY(drop_records, tc)
+{
+	struct pmclog_ev ev;
+	uint64_t throttled, dropped, nrec, other;
+	pmc_id_t id;
+	u_int oldrate, oldmin;
+	void *parser;
+	int fd, hz;
+
+	require_hwpmc();
+	oldrate = rate_get();
+	hz = hz_get();
+	oldmin = mincount_set(1);
+	rate_set(10 * hz);
+
+	(void)measure_log(&throttled, "drop.log", &id);
+
+	rate_set(oldrate);
+	(void)mincount_set(oldmin);
+
+	fd = open("drop.log", O_RDONLY);
+	ATF_REQUIRE(fd >= 0);
+	parser = pmclog_open(fd);
+	ATF_REQUIRE(parser != NULL);
+	dropped = nrec = other = 0;
+	while (pmclog_read(parser, &ev) == 0) {
+		if (ev.pl_type != PMCLOG_TYPE_DROPNOTIFY)
+			continue;
+		nrec++;
+		if (ev.pl_u.pl_dn.pl_pmcid != id ||
+		    ev.pl_u.pl_dn.pl_cpu != TEST_CPU ||
+		    (ev.pl_u.pl_dn.pl_flags & PMCLOG_DROP_THROTTLED) == 0) {
+			other++;
+			continue;
+		}
+		dropped += ev.pl_u.pl_dn.pl_count;
+	}
+	ATF_CHECK_MSG(ev.pl_state == PMCLOG_EOF, "log state %d",
+	    ev.pl_state);
+	pmclog_close(parser);
+	close(fd);
+
+	printf("throttled %ju, records %ju, dropped %ju, other %ju\n",
+	    (uintmax_t)throttled, (uintmax_t)nrec, (uintmax_t)dropped,
+	    (uintmax_t)other);
+	ATF_CHECK_MSG(throttled > 0, "the PMC never reached the limit");
+	ATF_CHECK_MSG(nrec > 0, "no DROPNOTIFY record in the log");
+	ATF_CHECK_EQ_MSG(other, 0, "%ju records with wrong fields",
+	    (uintmax_t)other);
+	/* Allow for unlogged drops after the last tick. */
+	ATF_CHECK_MSG(dropped <= throttled && dropped + 10 >= throttled,
+	    "dropped %ju, throttled %ju", (uintmax_t)dropped,
+	    (uintmax_t)throttled);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, rate_limited);
 	ATF_TP_ADD_TC(tp, rate_unlimited);
 	ATF_TP_ADD_TC(tp, time_limited);
+	ATF_TP_ADD_TC(tp, drop_records);
 	return (atf_no_error());
 }

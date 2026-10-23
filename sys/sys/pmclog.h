@@ -143,9 +143,19 @@ struct pmclog_closelog {
 	PMCLOG_ENTRY_HEADER
 };
 
+/* Per-PMC, per-CPU drops since the previous record. pl_flags gives reasons. */
 struct pmclog_dropnotify {
 	PMCLOG_ENTRY_HEADER
+	uint32_t		pl_pmcid;
+	uint32_t		pl_cpu;
+	uint32_t		pl_flags;	/* PMCLOG_DROP_* */
+	uint32_t		pl_count;	/* drop count */
 };
+
+#define	PMCLOG_DROP_BUFFERFULL	0x0001	/* sample ring full */
+#define	PMCLOG_DROP_THROTTLED	0x0002	/* sample rate limit */
+#define	PMCLOG_DROP_USERCC	0x0004	/* late user callchain */
+/* Flags occupy 3 bits in pps_lost. */
 
 struct pmclog_initialize {
 	PMCLOG_ENTRY_HEADER
@@ -324,7 +334,8 @@ int	pmclog_proc_create(struct thread *td, void **handlep);
 void	pmclog_proc_ignite(void *handle, struct pmc_owner *po);
 void	pmclog_process_callchain(struct pmc *_pm, struct pmc_sample *_ps);
 void	pmclog_process_closelog(struct pmc_owner *po);
-void	pmclog_process_dropnotify(struct pmc_owner *po);
+void	pmclog_process_dropnotify(struct pmc *_pm, int _cpu, uint32_t _flags,
+    uint32_t _count);
 void	pmclog_process_map_in(struct pmc_owner *po, pid_t pid,
     uintfptr_t start, const char *path);
 void	pmclog_process_map_out(struct pmc_owner *po, pid_t pid,

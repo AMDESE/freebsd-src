@@ -54,6 +54,10 @@ struct pmclog_ev_callchain {
 };
 
 struct pmclog_ev_dropnotify {
+	uint32_t	pl_pmcid;
+	uint32_t	pl_cpu;
+	uint32_t	pl_flags;	/* PMCLOG_DROP_* */
+	uint32_t	pl_count;
 };
 
 struct pmclog_ev_closelog {

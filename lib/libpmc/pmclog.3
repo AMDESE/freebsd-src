@@ -21,7 +21,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd March 26, 2006
+.Dd October 22, 2026
 .Dt PMCLOG 3
 .Os
 .Sh NAME
@@ -85,7 +85,7 @@ struct pmclog_ev {
        union {				/* log entry data */
 		struct pmclog_ev_callchain   pl_cc;
 		struct pmclog_ev_closelog    pl_cl;
-		struct pmclog_ev_dropnotify  pl_d;
+		struct pmclog_ev_dropnotify  pl_dn;
 		struct pmclog_ev_initialize  pl_i;
 		struct pmclog_ev_map_in      pl_mi;
 		struct pmclog_ev_map_out     pl_mo;
@@ -173,9 +173,34 @@ and is one of the following:
 A marker indicating a successful close of a log file.
 This record will be the last record of a log file.
 .It Dv PMCLOG_TYPE_DROPNOTIFY
-A marker indicating that
+A record that reports samples that
 .Xr hwpmc 4
-had to drop data due to a resource constraint.
+dropped for one PMC on one CPU since the previous record.
+Field
+.Va pl_u.pl_dn.pl_pmcid
+contains the PMC ID,
+.Va pl_u.pl_dn.pl_cpu
+contains the CPU, and
+.Va pl_u.pl_dn.pl_count
+contains the number of dropped samples.
+Field
+.Va pl_u.pl_dn.pl_flags
+contains one or more of these flags:
+.Bl -tag -width ".Dv PMCLOG_DROP_BUFFERFULL"
+.It Dv PMCLOG_DROP_BUFFERFULL
+The per-CPU sample buffer was full.
+.It Dv PMCLOG_DROP_THROTTLED
+The PMC was at the
+.Va kern.hwpmc.max_sample_rate
+limit.
+.It Dv PMCLOG_DROP_USERCC
+The user callchain of a sample was not available in time.
+.El
+.Pp
+Logs from kernels before
+.Dv PMC_VERSION_MINOR
+4 contain no payload in this record.
+For these records, all fields are zero.
 .It Dv PMCLOG_TYPE_INITIALIZE
 An initialization record.
 This is the first record in a log file.

@@ -192,7 +192,7 @@ static struct mtx pmc_kthread_mtx;	/* sleep lock */
 CTASSERT(sizeof(struct pmclog_callchain) == 7*4 + TSDELTA +
     PMC_CALLCHAIN_DEPTH_MAX*sizeof(uintfptr_t));
 CTASSERT(sizeof(struct pmclog_closelog) == 3*4 + TSDELTA);
-CTASSERT(sizeof(struct pmclog_dropnotify) == 3*4 + TSDELTA);
+CTASSERT(sizeof(struct pmclog_dropnotify) == 7 * 4 + TSDELTA);
 CTASSERT(sizeof(struct pmclog_map_in) == PATH_MAX + TSDELTA +
     5*4 + sizeof(uintfptr_t));
 CTASSERT(offsetof(struct pmclog_map_in,pl_pathname) ==
@@ -1005,12 +1005,21 @@ pmclog_process_closelog(struct pmc_owner *po)
 	spinlock_exit();
 }
 
+/* Report per-PMC, per-CPU drops from the clock interrupt. */
 void
-pmclog_process_dropnotify(struct pmc_owner *po)
+pmclog_process_dropnotify(struct pmc *pm, int cpu, uint32_t flags,
+    uint32_t count)
 {
-	PMCLOG_RESERVE(po, PMCLOG_TYPE_DROPNOTIFY,
-	    sizeof(struct pmclog_dropnotify));
-	PMCLOG_DESPATCH(po);
+	struct pmc_owner *po;
+
+	po = pm->pm_owner;
+	PMCLOG_RESERVE_SAFE(po, PMCLOG_TYPE_DROPNOTIFY,
+	    sizeof(struct pmclog_dropnotify), pmc_rdtsc());
+	PMCLOG_EMIT32(pm->pm_id);
+	PMCLOG_EMIT32(cpu);
+	PMCLOG_EMIT32(flags);
+	PMCLOG_EMIT32(count);
+	PMCLOG_DESPATCH_SAFE(po);
 }
 
 void

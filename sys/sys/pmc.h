@@ -60,7 +60,7 @@
  * The patch version is incremented for every bug fix.
  */
 #define	PMC_VERSION_MAJOR	0x0A
-#define	PMC_VERSION_MINOR	0x03
+#define	PMC_VERSION_MINOR	0x04
 #define	PMC_VERSION_PATCH	0x0000
 
 #define	PMC_VERSION		(PMC_VERSION_MAJOR << 24 |		\
@@ -755,6 +755,7 @@ struct pmc_pcpu_state {
 	uint8_t pps_cpustate;
 	int	pps_intr_tick;		/* interrupt count tick */
 	u_int	pps_intr_count;		/* interrupts per tick */
+	u_int	pps_lost;		/* drop flags and count */
 } __aligned(CACHE_LINE_SIZE);
 struct pmc {
 	LIST_HEAD(,pmc_target)	pm_targets;	/* list of target processes */

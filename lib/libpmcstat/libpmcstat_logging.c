@@ -265,6 +265,11 @@ pmcstat_analyze_log(struct pmcstat_args *args,
 			    ev.pl_u.pl_mo.pl_end);
 			break;
 
+		case PMCLOG_TYPE_DROPNOTIFY:
+			pmcstat_stats->ps_samples_dropped +=
+			    ev.pl_u.pl_dn.pl_count;
+			break;
+
 		case PMCLOG_TYPE_CALLCHAIN:
 			pmcstat_stats->ps_samples_total++;
 			*ps_samples_period += 1;
@@ -671,6 +676,7 @@ pmcstat_shutdown_logging(struct pmcstat_args *args,
 		PRINT("#exec/unknown", exec_indeterminable);
 		PRINT("#exec handling errors", exec_errors);
 		PRINT("#samples/total", samples_total);
+		PRINT("#samples/dropped", samples_dropped);
 		PRINT("#samples/unclaimed", samples_unknown_offset);
 		PRINT("#samples/unknown-object", samples_indeterminable);
 		PRINT("#samples/unknown-function", samples_unknown_function);
