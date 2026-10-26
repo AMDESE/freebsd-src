@@ -2412,13 +2412,8 @@ pmc_hook_handler(struct thread *td, int function, void *arg)
 		break;
 
 	/*
-	 * Process accumulated PC samples.
-	 *
-	 * This function is expected to be called by hardclock() for
-	 * each CPU that has accumulated PC samples.
-	 *
-	 * This function is to be executed on the CPU whose samples
-	 * are being processed.
+	 * Process this CPU's samples. A non-NULL arg flushes without a clock
+	 * tick.
 	 */
 	case PMC_FN_DO_SAMPLES:
 		/*
@@ -2433,8 +2428,17 @@ pmc_hook_handler(struct thread *td, int function, void *arg)
 		 * lose the interrupt sample.
 		 */
 		DPCPU_SET(pmc_sampled, 0);
-		DPCPU_SET(pmc_tick_seq, DPCPU_GET(pmc_tick_seq) + 1);
 		cpu = PCPU_GET(cpuid);
+		if (arg != NULL) {
+			pmc_process_samples(cpu, PMC_HR);
+			pmc_process_samples(cpu, PMC_SR);
+			pmc_process_samples(cpu, PMC_UR);
+			/* Restart throttled PMCs at the next tick. */
+			if (DPCPU_GET(pmc_throttled) != 0)
+				DPCPU_SET(pmc_sampled, 1);
+			break;
+		}
+		DPCPU_SET(pmc_tick_seq, DPCPU_GET(pmc_tick_seq) + 1);
 		pmc_process_samples(cpu, PMC_HR);
 		pmc_process_samples(cpu, PMC_SR);
 		pmc_process_samples(cpu, PMC_UR);
@@ -5465,7 +5469,24 @@ pmc_log_lost(struct pmc *pm, int cpu)
 	    v & PMC_LOST_COUNT_MASK);
 }
 
-/* Restart stalled PMCs. A concurrent stall waits for the next tick. */
+/* Check whether this PMC exceeded the current tick limit. */
+static bool
+pmc_over_limit(struct pmc *pm, int cpu)
+{
+	struct pmc_pcpu_state *pps;
+	u_int limit;
+
+	limit = atomic_load_int(&pmc_max_samples_per_tick);
+	pps = &pm->pm_pcpu_state[cpu];
+	return (limit != 0 &&
+	    pps->pps_intr_tick == DPCPU_ID_GET(cpu, pmc_tick_seq) &&
+	    pps->pps_intr_count > limit);
+}
+
+/*
+ * Restart stalled PMCs, except those above the current tick limit.
+ * A concurrent stall waits for the next tick.
+ */
 static void
 pmc_restart_stalled(int cpu)
 {
@@ -5489,6 +5510,12 @@ pmc_restart_stalled(int cpu)
 		if (!pm->pm_pcpu_state[cpu].pps_cpustate ||	/* !desired */
 		    !pm->pm_pcpu_state[cpu].pps_stalled)	/* !stalled */
 			continue;
+
+		if (pmc_over_limit(pm, cpu)) {
+			DPCPU_ID_SET(cpu, pmc_throttled, 1);
+			DPCPU_ID_SET(cpu, pmc_sampled, 1);
+			continue;
+		}
 
 		pm->pm_pcpu_state[cpu].pps_stalled = 0;
 		(void)(*pcd->pcd_start_pmc)(cpu, adjri, pm);

@@ -896,9 +896,9 @@ pmclog_schedule_one_cond(struct pmc_owner *po)
 
 	spinlock_enter();
 	cpu = curcpu;
-	/* tell hardclock not to run again */
+	/* A non-NULL arg marks a flush, not a clock tick. */
 	if (PMC_CPU_HAS_SAMPLES(cpu))
-		PMC_CALL_HOOK_UNLOCKED(curthread, PMC_FN_DO_SAMPLES, NULL);
+		PMC_CALL_HOOK_UNLOCKED(curthread, PMC_FN_DO_SAMPLES, po);
 
 	plb = po->po_curbuf[cpu];
 	if (plb && plb->plb_ptr != plb->plb_base)

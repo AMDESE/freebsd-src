@@ -36,6 +36,11 @@ static const char *cycle_events[] = {
 };
 
 static atomic_bool spin_stop;
+static atomic_bool flush_stop;
+static atomic_ulong nflush;
+static bool use_flush;
+static int test_period = TEST_PERIOD;
+static double test_secs;
 
 static void
 require_hwpmc(void)
@@ -65,6 +70,17 @@ spin_main(void *arg __unused)
 	x = 1;
 	while (!atomic_load(&spin_stop))
 		x = x * 6364136223846793005ULL + 1;
+	return (NULL);
+}
+
+static void *
+flush_main(void *arg __unused)
+{
+
+	while (!atomic_load(&flush_stop)) {
+		if (pmc_flush_logfile() == 0)
+			atomic_fetch_add(&nflush, 1);
+	}
 	return (NULL);
 }
 
@@ -164,7 +180,7 @@ static double
 measure_log(uint64_t *throttled, const char *logpath, pmc_id_t *idp)
 {
 	struct timeval t0, t1;
-	pthread_t thr;
+	pthread_t fthr, thr;
 	pmc_id_t id;
 	uint64_t p0, p1, th0, th1;
 	double secs;
@@ -178,7 +194,7 @@ measure_log(uint64_t *throttled, const char *logpath, pmc_id_t *idp)
 	ok = false;
 	for (i = 0; i < nitems(cycle_events); i++) {
 		if (pmc_allocate(cycle_events[i], PMC_MODE_SS, 0, TEST_CPU,
-		    &id, TEST_PERIOD) == 0) {
+		    &id, test_period) == 0) {
 			ok = true;
 			break;
 		}
@@ -198,6 +214,10 @@ measure_log(uint64_t *throttled, const char *logpath, pmc_id_t *idp)
 	atomic_store(&spin_stop, false);
 	ATF_REQUIRE(pthread_create(&thr, NULL, spin_main, NULL) == 0);
 	usleep(100000);
+	atomic_store(&flush_stop, false);
+	atomic_store(&nflush, 0);
+	if (use_flush)
+		ATF_REQUIRE(pthread_create(&fthr, NULL, flush_main, NULL) == 0);
 
 	p0 = stat_get("intr_processed");
 	th0 = stat_get("intr_throttled");
@@ -211,6 +231,10 @@ measure_log(uint64_t *throttled, const char *logpath, pmc_id_t *idp)
 
 	atomic_store(&spin_stop, true);
 	pthread_join(thr, NULL);
+	if (use_flush) {
+		atomic_store(&flush_stop, true);
+		pthread_join(fthr, NULL);
+	}
 	ATF_REQUIRE(pmc_release(id) == 0);
 	if (logpath != NULL)
 		ATF_REQUIRE(pmc_close_logfile() == 0);
@@ -218,6 +242,7 @@ measure_log(uint64_t *throttled, const char *logpath, pmc_id_t *idp)
 	close(fd);
 
 	secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) / 1e6;
+	test_secs = secs;
 	*throttled = th1 - th0;
 	return ((p1 - p0) / secs);
 }
@@ -392,11 +417,82 @@ ATF_TC_BODY(drop_records, tc)
 	    (uintmax_t)throttled);
 }
 
+/* Short periods must cause one throttle per tick, not two. */
+ATF_TC(short_period);
+ATF_TC_HEAD(short_period, tc)
+{
+	atf_tc_set_md_var(tc, "require.user", "root");
+	atf_tc_set_md_var(tc, "timeout", "30");
+}
+ATF_TC_BODY(short_period, tc)
+{
+	uint64_t throttled;
+	double per_tick, rate;
+	u_int oldrate, oldmin;
+	int hz;
+
+	require_hwpmc();
+	oldrate = rate_get();
+	hz = hz_get();
+	oldmin = mincount_set(1);
+	rate_set(100 * hz);
+	test_period = 100;
+
+	rate = measure(&throttled);
+
+	rate_set(oldrate);
+	(void)mincount_set(oldmin);
+
+	per_tick = throttled / test_secs / hz;
+	printf("hz %d, rate %.0f/s, throttled %ju, %.2f each tick\n", hz,
+	    rate, (uintmax_t)throttled, per_tick);
+	ATF_CHECK_MSG(throttled > 0, "the PMC never reached the limit");
+	ATF_CHECK_MSG(per_tick < 1.5, "%.2f throttles in each tick",
+	    per_tick);
+}
+
+/* Log flushes must not reset the tick limit. */
+ATF_TC(flush_loop);
+ATF_TC_HEAD(flush_loop, tc)
+{
+	atf_tc_set_md_var(tc, "require.user", "root");
+	atf_tc_set_md_var(tc, "timeout", "30");
+}
+ATF_TC_BODY(flush_loop, tc)
+{
+	uint64_t throttled;
+	double rate, bound;
+	u_int oldrate, oldmin;
+	int hz;
+
+	require_hwpmc();
+	oldrate = rate_get();
+	hz = hz_get();
+	oldmin = mincount_set(1);
+	rate_set(10 * hz);
+	use_flush = true;
+
+	rate = measure(&throttled);
+
+	rate_set(oldrate);
+	(void)mincount_set(oldmin);
+
+	bound = 1.5 * 11 * hz;
+	printf("hz %d, rate %.0f/s, bound %.0f/s, flushes %lu, "
+	    "throttled %ju\n", hz, rate, bound, atomic_load(&nflush),
+	    (uintmax_t)throttled);
+	ATF_CHECK_MSG(atomic_load(&nflush) > 0, "no flush succeeded");
+	ATF_CHECK_MSG(rate <= bound, "rate %.0f/s is above %.0f/s", rate,
+	    bound);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, rate_limited);
 	ATF_TP_ADD_TC(tp, rate_unlimited);
 	ATF_TP_ADD_TC(tp, time_limited);
 	ATF_TP_ADD_TC(tp, drop_records);
+	ATF_TP_ADD_TC(tp, short_period);
+	ATF_TP_ADD_TC(tp, flush_loop);
 	return (atf_no_error());
 }
