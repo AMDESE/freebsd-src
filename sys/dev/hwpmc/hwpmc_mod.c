@@ -355,21 +355,23 @@ DPCPU_DEFINE_STATIC(uint8_t, pmc_throttled);
 static void
 pmc_update_sample_limit(void)
 {
-	u_int allowed, pct, rate;
+	uint64_t allowed;
+	u_int pct, rate;
 
 	rate = atomic_load_int(&pmc_max_sample_rate);
 	pct = atomic_load_int(&pmc_cpu_time_max_percent);
+	/* Use 64 bits to prevent wrap near UINT_MAX. */
 	atomic_store_int(&pmc_max_samples_per_tick,
-	    rate == 0 ? 0 : howmany(rate, hz));
+	    rate == 0 ? 0 : howmany((uint64_t)rate, hz));
 
 	/* Limit interrupt time to a fraction of the sample interval. */
 	allowed = 0;
 	if (rate != 0 && pct != 0 && pct < 100) {
-		allowed = (1000000000 / rate) * pct / 100;
+		allowed = 1000000000ULL / rate * pct / 100;
 		if (allowed == 0)
 			allowed = 1;
 	}
-	atomic_store_int(&pmc_intr_allowed_ns, allowed);
+	atomic_store_int(&pmc_intr_allowed_ns, MIN(allowed, UINT_MAX));
 }
 
 static int
