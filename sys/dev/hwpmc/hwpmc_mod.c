@@ -200,6 +200,8 @@ static struct pmc_classdep **pmc_rowindex_to_classdep;
 static int	pmc_debugflags_sysctl_handler(SYSCTL_HANDLER_ARGS);
 static int	pmc_debugflags_parse(char *newstr, char *fence);
 #endif
+static int	pmc_cpu_time_max_percent_sysctl_handler(SYSCTL_HANDLER_ARGS);
+static int	pmc_max_sample_rate_sysctl_handler(SYSCTL_HANDLER_ARGS);
 
 static void	pmc_multipart_add(struct pmc_sample *ps, int type,
     int length);
@@ -277,6 +279,7 @@ static void	pmc_thread_descriptor_pool_drain(void);
 static void	pmc_thread_descriptor_pool_free(struct pmc_thread *pt);
 static void	pmc_unlink_target_process(struct pmc *pmc,
     struct pmc_process *pp);
+static void	pmc_update_sample_limit(void);
 
 static int	generic_switch_in(struct pmc_cpu *pc, struct pmc_process *pp);
 static int	generic_switch_out(struct pmc_cpu *pc, struct pmc_process *pp);
@@ -332,6 +335,10 @@ SYSCTL_COUNTER_U64(_kern_hwpmc_stats, OID_AUTO, rate_lowered, CTLFLAG_RW,
 /* Per-PMC, per-CPU sample rate limit. Zero disables it. */
 static u_int pmc_max_sample_rate = PMC_MAX_SAMPLE_RATE;
 static u_int pmc_max_samples_per_tick;
+SYSCTL_PROC(_kern_hwpmc, OID_AUTO, max_sample_rate,
+    CTLTYPE_UINT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, NULL, 0,
+    pmc_max_sample_rate_sysctl_handler, "IU",
+    "maximum samples per second for one PMC on one CPU (0: no limit)");
 
 /* Skip callchains after a tick at the rate limit. */
 static int pmc_throttle_pconly = 1;
@@ -344,126 +351,17 @@ static u_int pmc_cpu_time_max_percent = PMC_CPU_TIME_MAX_PERCENT;
 static u_int pmc_intr_allowed_ns;	/* 0: limit disabled */
 static u_int pmc_rate_lowered;		/* 1: log a message */
 static u_int pmc_report_avg_ns, pmc_report_allowed_ns;
+SYSCTL_PROC(_kern_hwpmc, OID_AUTO, cpu_time_max_percent,
+    CTLTYPE_UINT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, NULL, 0,
+    pmc_cpu_time_max_percent_sysctl_handler, "IU",
+    "maximum percent of CPU time for the PMC interrupt (0, 100: no limit)");
 
 /* Decaying per-CPU interrupt time sum, in ns. */
 #define	PMC_INTR_NSAMPLES	128
 DPCPU_DEFINE_STATIC(uint64_t, pmc_intr_running_ns);
 
-/* Count samples per tick. Restart throttled PMCs even with an empty ring. */
-DPCPU_DEFINE_STATIC(int, pmc_tick_seq);
-DPCPU_DEFINE_STATIC(uint8_t, pmc_throttled);
-
-static void
-pmc_update_sample_limit(void)
-{
-	uint64_t allowed;
-	u_int pct, rate;
-
-	rate = atomic_load_int(&pmc_max_sample_rate);
-	pct = atomic_load_int(&pmc_cpu_time_max_percent);
-	/* Use 64 bits to prevent wrap near UINT_MAX. */
-	atomic_store_int(&pmc_max_samples_per_tick,
-	    rate == 0 ? 0 : howmany((uint64_t)rate, hz));
-
-	/* Limit interrupt time to a fraction of the sample interval. */
-	allowed = 0;
-	if (rate != 0 && pct != 0 && pct < 100) {
-		allowed = 1000000000ULL / rate * pct / 100;
-		if (allowed == 0)
-			allowed = 1;
-	}
-	atomic_store_int(&pmc_intr_allowed_ns, MIN(allowed, UINT_MAX));
-}
-
-static int
-pmc_max_sample_rate_sysctl(SYSCTL_HANDLER_ARGS)
-{
-	u_int rate;
-	int error;
-
-	rate = pmc_max_sample_rate;
-	error = sysctl_handle_int(oidp, &rate, 0, req);
-	if (error != 0 || req->newptr == NULL)
-		return (error);
-	if (rate == 0 && pmc_max_sample_rate != 0)
-		log(LOG_WARNING,
-		    "hwpmc: sample rate limit disabled, sampling can stall the system\n");
-	atomic_store_int(&pmc_max_sample_rate, rate);
-	pmc_update_sample_limit();
-	return (0);
-}
-SYSCTL_PROC(_kern_hwpmc, OID_AUTO, max_sample_rate,
-    CTLTYPE_UINT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, NULL, 0,
-    pmc_max_sample_rate_sysctl, "IU",
-    "maximum samples per second for one PMC on one CPU (0: no limit)");
-
-static int
-pmc_cpu_time_max_percent_sysctl(SYSCTL_HANDLER_ARGS)
-{
-	u_int pct;
-	int error;
-
-	pct = pmc_cpu_time_max_percent;
-	error = sysctl_handle_int(oidp, &pct, 0, req);
-	if (error != 0 || req->newptr == NULL)
-		return (error);
-	if (pct > 100)
-		return (EINVAL);
-	if ((pct == 0 || pct == 100) && pmc_cpu_time_max_percent != 0 &&
-	    pmc_cpu_time_max_percent != 100)
-		log(LOG_WARNING,
-		    "hwpmc: interrupt time limit disabled, sampling can stall the system\n");
-	atomic_store_int(&pmc_cpu_time_max_percent, pct);
-	pmc_update_sample_limit();
-	return (0);
-}
-SYSCTL_PROC(_kern_hwpmc, OID_AUTO, cpu_time_max_percent,
-    CTLTYPE_UINT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, NULL, 0,
-    pmc_cpu_time_max_percent_sysctl, "IU",
-    "maximum percent of CPU time for the PMC interrupt (0, 100: no limit)");
-
-/*
- * Lower the rate from a decaying interrupt-time average, with a 25% margin.
- * NMI-safe, without locks.
- */
-void
-pmc_intr_took(uint64_t ns)
-{
-	uint64_t avg, budget, running;
-	u_int allowed, old, per_tick, pct;
-
-	allowed = atomic_load_int(&pmc_intr_allowed_ns);
-	if (allowed == 0)
-		return;
-
-	running = DPCPU_GET(pmc_intr_running_ns);
-	running -= running / PMC_INTR_NSAMPLES;
-	running += ns;
-	DPCPU_SET(pmc_intr_running_ns, running);
-
-	avg = running / PMC_INTR_NSAMPLES;
-	if (avg <= allowed)
-		return;
-
-	pct = atomic_load_int(&pmc_cpu_time_max_percent);
-	avg += avg / 4;
-	budget = (1000000000 / hz / 100) * pct;
-	per_tick = avg < budget ? budget / avg : 1;
-	old = atomic_load_int(&pmc_max_samples_per_tick);
-	atomic_store_int(&pmc_intr_allowed_ns, MIN(avg, UINT_MAX));
-	if (old != 0 && per_tick >= old)
-		return;
-
-	atomic_store_int(&pmc_max_samples_per_tick, per_tick);
-	atomic_store_int(&pmc_max_sample_rate, per_tick * hz);
-	counter_u64_add(pmc_stats.pm_rate_lowered, 1);
-
-	/* Defer NMI diagnostics to hardclock. */
-	pmc_report_avg_ns = MIN(running / PMC_INTR_NSAMPLES, UINT_MAX);
-	pmc_report_allowed_ns = allowed;
-	atomic_store_int(&pmc_rate_lowered, 1);
-	DPCPU_SET(pmc_sampled, 1);
-}
+DPCPU_DEFINE_STATIC(int, pmc_tick_seq);	/* hardclock ticks */
+DPCPU_DEFINE_STATIC(uint8_t, pmc_throttled);	/* restart at next tick */
 
 static int pmc_callchaindepth = PMC_CALLCHAIN_DEPTH;
 SYSCTL_INT(_kern_hwpmc, OID_AUTO, callchaindepth, CTLFLAG_RDTUN,
@@ -757,6 +655,111 @@ pmc_debugflags_sysctl_handler(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 #endif
+
+/* Sample rate and interrupt time limits. */
+static void
+pmc_update_sample_limit(void)
+{
+	uint64_t allowed;
+	u_int pct, rate;
+
+	rate = atomic_load_int(&pmc_max_sample_rate);
+	pct = atomic_load_int(&pmc_cpu_time_max_percent);
+	/* Use 64 bits to prevent wrap near UINT_MAX. */
+	atomic_store_int(&pmc_max_samples_per_tick,
+	    rate == 0 ? 0 : howmany((uint64_t)rate, hz));
+
+	/* Fraction of the sample interval. */
+	allowed = 0;
+	if (rate != 0 && pct != 0 && pct < 100) {
+		allowed = 1000000000ULL / rate * pct / 100;
+		if (allowed == 0)
+			allowed = 1;
+	}
+	atomic_store_int(&pmc_intr_allowed_ns, MIN(allowed, UINT_MAX));
+}
+
+static int
+pmc_max_sample_rate_sysctl_handler(SYSCTL_HANDLER_ARGS)
+{
+	u_int rate;
+	int error;
+
+	rate = pmc_max_sample_rate;
+	error = sysctl_handle_int(oidp, &rate, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (rate == 0 && pmc_max_sample_rate != 0)
+		log(LOG_WARNING,
+		    "hwpmc: sample rate limit disabled, sampling can stall the system\n");
+	atomic_store_int(&pmc_max_sample_rate, rate);
+	pmc_update_sample_limit();
+	return (0);
+}
+
+static int
+pmc_cpu_time_max_percent_sysctl_handler(SYSCTL_HANDLER_ARGS)
+{
+	u_int pct;
+	int error;
+
+	pct = pmc_cpu_time_max_percent;
+	error = sysctl_handle_int(oidp, &pct, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (pct > 100)
+		return (EINVAL);
+	if ((pct == 0 || pct == 100) && pmc_cpu_time_max_percent != 0 &&
+	    pmc_cpu_time_max_percent != 100)
+		log(LOG_WARNING,
+		    "hwpmc: interrupt time limit disabled, sampling can stall the system\n");
+	atomic_store_int(&pmc_cpu_time_max_percent, pct);
+	pmc_update_sample_limit();
+	return (0);
+}
+
+/*
+ * Lower the rate when average interrupt time exceeds the limit.
+ * NMI-safe, without locks.
+ */
+void
+pmc_intr_took(uint64_t ns)
+{
+	uint64_t avg, budget, running;
+	u_int allowed, old, per_tick, pct;
+
+	allowed = atomic_load_int(&pmc_intr_allowed_ns);
+	if (allowed == 0)
+		return;
+
+	running = DPCPU_GET(pmc_intr_running_ns);
+	running -= running / PMC_INTR_NSAMPLES;
+	running += ns;
+	DPCPU_SET(pmc_intr_running_ns, running);
+
+	avg = running / PMC_INTR_NSAMPLES;
+	if (avg <= allowed)
+		return;
+
+	pct = atomic_load_int(&pmc_cpu_time_max_percent);
+	avg += avg / 4;
+	budget = (1000000000 / hz / 100) * pct;
+	per_tick = avg < budget ? budget / avg : 1;
+	old = atomic_load_int(&pmc_max_samples_per_tick);
+	atomic_store_int(&pmc_intr_allowed_ns, MIN(avg, UINT_MAX));
+	if (old != 0 && per_tick >= old)
+		return;
+
+	atomic_store_int(&pmc_max_samples_per_tick, per_tick);
+	atomic_store_int(&pmc_max_sample_rate, per_tick * hz);
+	counter_u64_add(pmc_stats.pm_rate_lowered, 1);
+
+	/* Defer NMI diagnostics to hardclock. */
+	pmc_report_avg_ns = MIN(running / PMC_INTR_NSAMPLES, UINT_MAX);
+	pmc_report_allowed_ns = allowed;
+	atomic_store_int(&pmc_rate_lowered, 1);
+	DPCPU_SET(pmc_sampled, 1);
+}
 
 /*
  * Map a row index to a classdep structure and return the adjusted row
@@ -2956,8 +2959,7 @@ pmc_drain_samples(void)
 }
 
 /*
- * Release process-virtual PMCs on each CPU after pmc_hook is cleared.
- * CPU binding also waits for active hooks.
+ * Release process-virtual PMC runcounts on each CPU after pmc_hook is cleared.
  */
 static void
 pmc_unload_virtual_pmcs(void)
@@ -3013,9 +3015,7 @@ pmc_wait_for_pmc_idle(struct pmc *pm)
 	pmclog_flush(pm->pm_owner, 1);
 	while (counter_u64_fetch(pm->pm_runcount) > 0) {
 		pmclog_flush(pm->pm_owner, 1);
-		/*
-		 * Drain the rings at unload because hardclock no longer does.
-		 */
+		/* Drain rings at unload without hardclock. */
 		if (pmc_hook == NULL)
 			pmc_drain_samples();
 #ifdef INVARIANTS
@@ -5185,13 +5185,13 @@ pmc_process_interrupt_mp(int ring, struct pmc *pm, struct trapframe *tf,
 	u_int limit;
 	int seq;
 
-	/* Drop samples above the tick limit. Hardclock restarts the PMC. */
+	/* Drop samples above the tick limit and stop the PMC. */
 	limit = atomic_load_int(&pmc_max_samples_per_tick);
 	if (limit != 0) {
 		pps = &pm->pm_pcpu_state[curcpu];
 		seq = DPCPU_GET(pmc_tick_seq);
 		if (pps->pps_intr_tick != seq) {
-			/* Skip costly stack walks after a tick at the limit. */
+			/* Skip stack walks after a tick at the limit. */
 			pps->pps_pconly = pmc_throttle_pconly != 0 &&
 			    pps->pps_intr_tick == seq - 1 &&
 			    pps->pps_intr_count > limit;
@@ -5444,7 +5444,7 @@ entrydone:
 	pmc_restart_stalled(cpu);
 }
 
-/* Pack flags above the drop count for atomic read and clear. */
+/* Pack flags above the drop count for one atomic read. */
 #define	PMC_LOST_FLAG_SHIFT	29
 #define	PMC_LOST_COUNT_MASK	((1U << PMC_LOST_FLAG_SHIFT) - 1)
 CTASSERT(((PMCLOG_DROP_BUFFERFULL | PMCLOG_DROP_THROTTLED |
@@ -5467,7 +5467,7 @@ pmc_note_lost(struct pmc *pm, int cpu, u_int flag)
 	DPCPU_SET(pmc_throttled, 1);
 }
 
-/* Atomically read and clear drops. Log them unless the owner has no log. */
+/* Log per-PMC, per-CPU drops. */
 static void
 pmc_log_lost(struct pmc *pm, int cpu)
 {
@@ -5525,10 +5525,7 @@ pmc_over_limit(struct pmc *pm, int cpu)
 	    pps->pps_intr_count > limit);
 }
 
-/*
- * Restart stalled PMCs, except those above the current tick limit.
- * A concurrent stall waits for the next tick.
- */
+/* Restart stalled PMCs. A concurrent stall waits for the next tick. */
 static void
 pmc_restart_stalled(int cpu)
 {

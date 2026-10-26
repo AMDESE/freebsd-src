@@ -101,47 +101,36 @@ stat_get(const char *name)
 	return (v);
 }
 
+/* Read a kern.hwpmc u_int sysctl, or skip if absent. */
 static u_int
-rate_get(void)
+hwpmc_get(const char *name)
 {
-	u_int v;
+	char full[64];
 	size_t len;
+	u_int v;
 
+	snprintf(full, sizeof(full), "kern.hwpmc.%s", name);
 	len = sizeof(v);
-	if (sysctlbyname("kern.hwpmc.max_sample_rate", &v, &len, NULL,
-	    0) != 0)
-		atf_tc_skip("kern.hwpmc.max_sample_rate is not available");
+	if (sysctlbyname(full, &v, &len, NULL, 0) != 0)
+		atf_tc_skip("%s is not available", full);
 	return (v);
 }
 
-static void
-rate_set(u_int v)
+static int
+hwpmc_write(const char *name, u_int v)
 {
+	char full[64];
 
-	ATF_REQUIRE_MSG(sysctlbyname("kern.hwpmc.max_sample_rate", NULL, NULL,
-	    &v, sizeof(v)) == 0, "set max_sample_rate: %s", strerror(errno));
-}
-
-static u_int
-pct_get(void)
-{
-	u_int v;
-	size_t len;
-
-	len = sizeof(v);
-	if (sysctlbyname("kern.hwpmc.cpu_time_max_percent", &v, &len, NULL,
-	    0) != 0)
-		atf_tc_skip("kern.hwpmc.cpu_time_max_percent is not available");
-	return (v);
+	snprintf(full, sizeof(full), "kern.hwpmc.%s", name);
+	return (sysctlbyname(full, NULL, NULL, &v, sizeof(v)));
 }
 
 static void
-pct_set(u_int v)
+hwpmc_set(const char *name, u_int v)
 {
 
-	ATF_REQUIRE_MSG(sysctlbyname("kern.hwpmc.cpu_time_max_percent", NULL,
-	    NULL, &v, sizeof(v)) == 0, "set cpu_time_max_percent: %s",
-	    strerror(errno));
+	ATF_REQUIRE_MSG(hwpmc_write(name, v) == 0, "set kern.hwpmc.%s: %s",
+	    name, strerror(errno));
 }
 
 static int
@@ -153,18 +142,6 @@ hz_get(void)
 	len = sizeof(ci);
 	ATF_REQUIRE(sysctlbyname("kern.clockrate", &ci, &len, NULL, 0) == 0);
 	return (ci.hz);
-}
-
-static u_int
-mincount_set(u_int v)
-{
-	u_int old;
-	size_t len;
-
-	len = sizeof(old);
-	ATF_REQUIRE(sysctlbyname("kern.hwpmc.mincount", &old, &len, &v,
-	    sizeof(v)) == 0);
-	return (old);
 }
 
 /* Save sysctls in a file for cleanup in a separate ATF process. */
@@ -180,14 +157,11 @@ static void
 sysctls_save(void)
 {
 	struct saved_sysctls sv;
-	size_t len;
 	int fd;
 
-	len = sizeof(sv.mincount);
-	ATF_REQUIRE(sysctlbyname("kern.hwpmc.mincount", &sv.mincount, &len,
-	    NULL, 0) == 0);
-	sv.rate = rate_get();
-	sv.pct = pct_get();
+	sv.mincount = hwpmc_get("mincount");
+	sv.rate = hwpmc_get("max_sample_rate");
+	sv.pct = hwpmc_get("cpu_time_max_percent");
 	fd = open(SAVE_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	ATF_REQUIRE(fd >= 0);
 	ATF_REQUIRE(write(fd, &sv, sizeof(sv)) == sizeof(sv));
@@ -204,15 +178,26 @@ sysctls_restore(void)
 	if (fd < 0)
 		return;
 	if (read(fd, &sv, sizeof(sv)) == sizeof(sv)) {
-		(void)sysctlbyname("kern.hwpmc.max_sample_rate", NULL, NULL,
-		    &sv.rate, sizeof(sv.rate));
-		(void)sysctlbyname("kern.hwpmc.cpu_time_max_percent", NULL,
-		    NULL, &sv.pct, sizeof(sv.pct));
-		(void)sysctlbyname("kern.hwpmc.mincount", NULL, NULL,
-		    &sv.mincount, sizeof(sv.mincount));
+		(void)hwpmc_write("max_sample_rate", sv.rate);
+		(void)hwpmc_write("cpu_time_max_percent", sv.pct);
+		(void)hwpmc_write("mincount", sv.mincount);
 	}
 	close(fd);
 	(void)unlink(SAVE_FILE);
+}
+
+/* Save sysctls. Set mincount to 1 and the per-tick limit. */
+static int
+throttle_setup(u_int rate_per_tick)
+{
+	int hz;
+
+	require_hwpmc();
+	sysctls_save();
+	hz = hz_get();
+	hwpmc_set("mincount", 1);
+	hwpmc_set("max_sample_rate", rate_per_tick * hz);
+	return (hz);
 }
 
 /* Measure interrupts per second on TEST_CPU and report *throttled. */
@@ -305,11 +290,7 @@ ATF_TC_BODY(rate_limited, tc)
 	double rate, bound;
 	int hz;
 
-	require_hwpmc();
-	sysctls_save();
-	hz = hz_get();
-	(void)mincount_set(1);
-	rate_set(10 * hz);
+	hz = throttle_setup(10);
 
 	rate = measure(&throttled);
 
@@ -342,11 +323,7 @@ ATF_TC_BODY(rate_unlimited, tc)
 	double rate, bound;
 	int hz;
 
-	require_hwpmc();
-	sysctls_save();
-	hz = hz_get();
-	(void)mincount_set(1);
-	rate_set(0);
+	hz = throttle_setup(0);
 
 	rate = measure(&throttled);
 
@@ -381,17 +358,13 @@ ATF_TC_BODY(time_limited, tc)
 	u_int newrate;
 	int hz;
 
-	require_hwpmc();
-	sysctls_save();
-	hz = hz_get();
-	(void)mincount_set(1);
-	rate_set(100 * hz);
-	pct_set(1);
+	hz = throttle_setup(100);
+	hwpmc_set("cpu_time_max_percent", 1);
 
 	lowered0 = stat_get("rate_lowered");
 	rate = measure(&throttled);
 	lowered1 = stat_get("rate_lowered");
-	newrate = rate_get();
+	newrate = hwpmc_get("max_sample_rate");
 
 	sysctls_restore();
 
@@ -424,13 +397,9 @@ ATF_TC_BODY(drop_records, tc)
 	uint64_t throttled, dropped, nrec, other;
 	pmc_id_t id;
 	void *parser;
-	int fd, hz;
+	int fd;
 
-	require_hwpmc();
-	sysctls_save();
-	hz = hz_get();
-	(void)mincount_set(1);
-	rate_set(10 * hz);
+	(void)throttle_setup(10);
 
 	(void)measure_log(&throttled, "drop.log", &id);
 
@@ -520,14 +489,10 @@ ATF_TC_BODY(drop_records_process, tc)
 	uint64_t dropped, nrec, th0, th1;
 	pmc_id_t id;
 	pid_t pid;
-	int fd, hz, i, pfd[2], status;
+	int fd, i, pfd[2], status;
 	char c;
 
-	require_hwpmc();
-	sysctls_save();
-	hz = hz_get();
-	(void)mincount_set(1);
-	rate_set(10 * hz);
+	(void)throttle_setup(10);
 
 	ATF_REQUIRE(pipe(pfd) == 0);
 	pid = fork();
@@ -604,11 +569,7 @@ ATF_TC_BODY(short_period, tc)
 	double per_tick, rate;
 	int hz;
 
-	require_hwpmc();
-	sysctls_save();
-	hz = hz_get();
-	(void)mincount_set(1);
-	rate_set(100 * hz);
+	hz = throttle_setup(100);
 	test_period = 100;
 
 	rate = measure(&throttled);
@@ -642,11 +603,7 @@ ATF_TC_BODY(flush_loop, tc)
 	double rate, bound;
 	int hz;
 
-	require_hwpmc();
-	sysctls_save();
-	hz = hz_get();
-	(void)mincount_set(1);
-	rate_set(10 * hz);
+	hz = throttle_setup(10);
 	use_flush = true;
 
 	rate = measure(&throttled);
