@@ -216,16 +216,6 @@ sysctls_restore(void)
 }
 
 /* Measure interrupts per second on TEST_CPU and report *throttled. */
-static double measure_log(uint64_t *throttled, const char *logpath,
-    pmc_id_t *idp);
-
-static double
-measure(uint64_t *throttled)
-{
-
-	return (measure_log(throttled, NULL, NULL));
-}
-
 /* Optionally write logpath and return the PMC ID in *idp. */
 static double
 measure_log(uint64_t *throttled, const char *logpath, pmc_id_t *idp)
@@ -293,6 +283,13 @@ measure_log(uint64_t *throttled, const char *logpath, pmc_id_t *idp)
 	test_secs = secs;
 	*throttled = th1 - th0;
 	return ((p1 - p0) / secs);
+}
+
+static double
+measure(uint64_t *throttled)
+{
+
+	return (measure_log(throttled, NULL, NULL));
 }
 
 /* Allow one stop interrupt per tick and a margin for other PMCs. */

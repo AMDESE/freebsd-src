@@ -751,12 +751,12 @@ struct pmc_target {
  */
 struct pmc_pcpu_state {
 	uint32_t pps_overflowcnt;	/* count overflow interrupts */
+	int pps_intr_tick;		/* interrupt count tick */
+	u_int pps_intr_count;		/* interrupts per tick */
+	u_int pps_lost;			/* drop flags and count */
 	uint8_t pps_stalled;
 	uint8_t pps_cpustate;
-	int	pps_intr_tick;		/* interrupt count tick */
-	u_int	pps_intr_count;		/* interrupts per tick */
-	u_int	pps_lost;		/* drop flags and count */
-	uint8_t	pps_pconly;		/* record only the PC */
+	uint8_t pps_pconly;		/* record only the PC */
 } __aligned(CACHE_LINE_SIZE);
 struct pmc {
 	LIST_HEAD(,pmc_target)	pm_targets;	/* list of target processes */

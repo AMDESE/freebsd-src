@@ -246,6 +246,7 @@ static void	pmc_log_lost(struct pmc *pm, int cpu);
 static void	pmc_log_lost_off_cpu(struct pmc *pm, int cpu);
 static void	pmc_log_process_mappings(struct pmc_owner *po, struct proc *p);
 static void	pmc_maybe_remove_owner(struct pmc_owner *po);
+static void	pmc_note_lost(struct pmc *pm, int cpu, u_int flag);
 static void	pmc_post_callchain_callback(void);
 static void	pmc_process_allproc(struct pmc *pm);
 static void	pmc_process_csw_in(struct thread *td);
@@ -259,9 +260,6 @@ static void	pmc_process_fork(void *arg, struct proc *p1,
     struct proc *p2, int n);
 static void	pmc_process_proccreate(struct proc *p);
 static void	pmc_process_samples(int cpu, ring_type_t soft);
-static void	pmc_restart_stalled(int cpu);
-static void	pmc_note_lost(struct pmc *pm, int cpu, u_int flag);
-static void	pmc_log_lost(struct pmc *pm, int cpu);
 static void	pmc_process_threadcreate(struct thread *td);
 static void	pmc_process_threadexit(struct thread *td);
 static void	pmc_process_thread_add(struct thread *td);
@@ -270,6 +268,7 @@ static void	pmc_process_thread_userret(struct thread *td);
 static void	pmc_release_pmc_descriptor(struct pmc *pmc);
 static void	pmc_remove_owner(struct pmc_owner *po);
 static void	pmc_remove_process_descriptor(struct pmc_process *pp);
+static void	pmc_restart_stalled(int cpu);
 static int	pmc_start(struct pmc *pm);
 static int	pmc_stop(struct pmc *pm);
 static int	pmc_syscall_handler(struct thread *td, void *syscall_args);
@@ -387,8 +386,8 @@ pmc_max_sample_rate_sysctl(SYSCTL_HANDLER_ARGS)
 	if (error != 0 || req->newptr == NULL)
 		return (error);
 	if (rate == 0 && pmc_max_sample_rate != 0)
-		log(LOG_WARNING, "hwpmc: sample rate limit disabled, "
-		    "sampling can stall the system\n");
+		log(LOG_WARNING,
+		    "hwpmc: sample rate limit disabled, sampling can stall the system\n");
 	atomic_store_int(&pmc_max_sample_rate, rate);
 	pmc_update_sample_limit();
 	return (0);
@@ -412,8 +411,8 @@ pmc_cpu_time_max_percent_sysctl(SYSCTL_HANDLER_ARGS)
 		return (EINVAL);
 	if ((pct == 0 || pct == 100) && pmc_cpu_time_max_percent != 0 &&
 	    pmc_cpu_time_max_percent != 100)
-		log(LOG_WARNING, "hwpmc: interrupt time limit disabled, "
-		    "sampling can stall the system\n");
+		log(LOG_WARNING,
+		    "hwpmc: interrupt time limit disabled, sampling can stall the system\n");
 	atomic_store_int(&pmc_cpu_time_max_percent, pct);
 	pmc_update_sample_limit();
 	return (0);
@@ -2460,9 +2459,8 @@ pmc_hook_handler(struct thread *td, int function, void *arg)
 		}
 		if (atomic_load_int(&pmc_rate_lowered) != 0 &&
 		    atomic_cmpset_int(&pmc_rate_lowered, 1, 0))
-			log(LOG_INFO, "hwpmc: interrupt took too long "
-			    "(%u ns > %u ns), lowering "
-			    "kern.hwpmc.max_sample_rate to %u\n",
+			log(LOG_INFO,
+			    "hwpmc: interrupt took too long (%u ns > %u ns), lowering kern.hwpmc.max_sample_rate to %u\n",
 			    pmc_report_avg_ns, pmc_report_allowed_ns,
 			    atomic_load_int(&pmc_max_sample_rate));
 		break;
