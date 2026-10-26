@@ -48,6 +48,8 @@ require_hwpmc(void)
 
 	if (pmc_init() != 0)
 		atf_tc_skip("hwpmc(4) is not available");
+	if (sysconf(_SC_NPROCESSORS_ONLN) <= TEST_CPU)
+		atf_tc_skip("needs at least %d CPUs", TEST_CPU + 1);
 }
 
 static void
@@ -164,6 +166,54 @@ mincount_set(u_int v)
 	return (old);
 }
 
+/* Save sysctls in a file for cleanup in a separate ATF process. */
+#define	SAVE_FILE	"sysctl.saved"
+
+struct saved_sysctls {
+	u_int	rate;
+	u_int	pct;
+	u_int	mincount;
+};
+
+static void
+sysctls_save(void)
+{
+	struct saved_sysctls sv;
+	size_t len;
+	int fd;
+
+	len = sizeof(sv.mincount);
+	ATF_REQUIRE(sysctlbyname("kern.hwpmc.mincount", &sv.mincount, &len,
+	    NULL, 0) == 0);
+	sv.rate = rate_get();
+	sv.pct = pct_get();
+	fd = open(SAVE_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	ATF_REQUIRE(fd >= 0);
+	ATF_REQUIRE(write(fd, &sv, sizeof(sv)) == sizeof(sv));
+	close(fd);
+}
+
+static void
+sysctls_restore(void)
+{
+	struct saved_sysctls sv;
+	int fd;
+
+	fd = open(SAVE_FILE, O_RDONLY);
+	if (fd < 0)
+		return;
+	if (read(fd, &sv, sizeof(sv)) == sizeof(sv)) {
+		(void)sysctlbyname("kern.hwpmc.max_sample_rate", NULL, NULL,
+		    &sv.rate, sizeof(sv.rate));
+		(void)sysctlbyname("kern.hwpmc.cpu_time_max_percent", NULL,
+		    NULL, &sv.pct, sizeof(sv.pct));
+		(void)sysctlbyname("kern.hwpmc.mincount", NULL, NULL,
+		    &sv.mincount, sizeof(sv.mincount));
+	}
+	close(fd);
+	(void)unlink(SAVE_FILE);
+}
+
 /* Measure interrupts per second on TEST_CPU and report *throttled. */
 static double measure_log(uint64_t *throttled, const char *logpath,
     pmc_id_t *idp);
@@ -187,9 +237,6 @@ measure_log(uint64_t *throttled, const char *logpath, pmc_id_t *idp)
 	u_int i;
 	int fd;
 	bool ok;
-
-	if (sysconf(_SC_NPROCESSORS_ONLN) <= TEST_CPU)
-		atf_tc_skip("needs at least %d CPUs", TEST_CPU + 1);
 
 	ok = false;
 	for (i = 0; i < nitems(cycle_events); i++) {
@@ -248,7 +295,7 @@ measure_log(uint64_t *throttled, const char *logpath, pmc_id_t *idp)
 }
 
 /* Allow one stop interrupt per tick and a margin for other PMCs. */
-ATF_TC(rate_limited);
+ATF_TC_WITH_CLEANUP(rate_limited);
 ATF_TC_HEAD(rate_limited, tc)
 {
 	atf_tc_set_md_var(tc, "require.user", "root");
@@ -258,19 +305,17 @@ ATF_TC_BODY(rate_limited, tc)
 {
 	uint64_t throttled;
 	double rate, bound;
-	u_int oldrate, oldmin;
 	int hz;
 
 	require_hwpmc();
-	oldrate = rate_get();
+	sysctls_save();
 	hz = hz_get();
-	oldmin = mincount_set(1);
+	(void)mincount_set(1);
 	rate_set(10 * hz);
 
 	rate = measure(&throttled);
 
-	rate_set(oldrate);
-	(void)mincount_set(oldmin);
+	sysctls_restore();
 
 	bound = 1.5 * 11 * hz;
 	printf("hz %d, rate %.0f/s, bound %.0f/s, throttled %ju\n", hz, rate,
@@ -280,8 +325,14 @@ ATF_TC_BODY(rate_limited, tc)
 	    bound);
 }
 
+ATF_TC_CLEANUP(rate_limited, tc)
+{
+
+	sysctls_restore();
+}
+
 /* Without throttling, the same PMC must exceed the rate limit. */
-ATF_TC(rate_unlimited);
+ATF_TC_WITH_CLEANUP(rate_unlimited);
 ATF_TC_HEAD(rate_unlimited, tc)
 {
 	atf_tc_set_md_var(tc, "require.user", "root");
@@ -291,19 +342,17 @@ ATF_TC_BODY(rate_unlimited, tc)
 {
 	uint64_t throttled;
 	double rate, bound;
-	u_int oldrate, oldmin;
 	int hz;
 
 	require_hwpmc();
-	oldrate = rate_get();
+	sysctls_save();
 	hz = hz_get();
-	oldmin = mincount_set(1);
+	(void)mincount_set(1);
 	rate_set(0);
 
 	rate = measure(&throttled);
 
-	rate_set(oldrate);
-	(void)mincount_set(oldmin);
+	sysctls_restore();
 
 	bound = 1.5 * 11 * hz;
 	printf("hz %d, rate %.0f/s, throttled %ju\n", hz, rate,
@@ -314,8 +363,14 @@ ATF_TC_BODY(rate_unlimited, tc)
 	    bound);
 }
 
+ATF_TC_CLEANUP(rate_unlimited, tc)
+{
+
+	sysctls_restore();
+}
+
 /* A 1% CPU time limit must lower the sample rate and measured rate. */
-ATF_TC(time_limited);
+ATF_TC_WITH_CLEANUP(time_limited);
 ATF_TC_HEAD(time_limited, tc)
 {
 	atf_tc_set_md_var(tc, "require.user", "root");
@@ -325,14 +380,13 @@ ATF_TC_BODY(time_limited, tc)
 {
 	uint64_t lowered0, lowered1, throttled;
 	double rate, bound;
-	u_int oldrate, oldpct, oldmin, newrate;
+	u_int newrate;
 	int hz;
 
 	require_hwpmc();
-	oldrate = rate_get();
-	oldpct = pct_get();
+	sysctls_save();
 	hz = hz_get();
-	oldmin = mincount_set(1);
+	(void)mincount_set(1);
 	rate_set(100 * hz);
 	pct_set(1);
 
@@ -341,9 +395,7 @@ ATF_TC_BODY(time_limited, tc)
 	lowered1 = stat_get("rate_lowered");
 	newrate = rate_get();
 
-	pct_set(oldpct);
-	rate_set(oldrate);
-	(void)mincount_set(oldmin);
+	sysctls_restore();
 
 	bound = 1.5 * (newrate + hz);
 	printf("hz %d, rate %.0f/s, new limit %u/s, lowered %ju\n", hz,
@@ -355,8 +407,14 @@ ATF_TC_BODY(time_limited, tc)
 	    bound);
 }
 
+ATF_TC_CLEANUP(time_limited, tc)
+{
+
+	sysctls_restore();
+}
+
 /* DROPNOTIFY counts must approximate the intr_throttled delta. */
-ATF_TC(drop_records);
+ATF_TC_WITH_CLEANUP(drop_records);
 ATF_TC_HEAD(drop_records, tc)
 {
 	atf_tc_set_md_var(tc, "require.user", "root");
@@ -367,20 +425,18 @@ ATF_TC_BODY(drop_records, tc)
 	struct pmclog_ev ev;
 	uint64_t throttled, dropped, nrec, other;
 	pmc_id_t id;
-	u_int oldrate, oldmin;
 	void *parser;
 	int fd, hz;
 
 	require_hwpmc();
-	oldrate = rate_get();
+	sysctls_save();
 	hz = hz_get();
-	oldmin = mincount_set(1);
+	(void)mincount_set(1);
 	rate_set(10 * hz);
 
 	(void)measure_log(&throttled, "drop.log", &id);
 
-	rate_set(oldrate);
-	(void)mincount_set(oldmin);
+	sysctls_restore();
 
 	fd = open("drop.log", O_RDONLY);
 	ATF_REQUIRE(fd >= 0);
@@ -417,8 +473,14 @@ ATF_TC_BODY(drop_records, tc)
 	    (uintmax_t)throttled);
 }
 
+ATF_TC_CLEANUP(drop_records, tc)
+{
+
+	sysctls_restore();
+}
+
 /* Short periods must cause one throttle per tick, not two. */
-ATF_TC(short_period);
+ATF_TC_WITH_CLEANUP(short_period);
 ATF_TC_HEAD(short_period, tc)
 {
 	atf_tc_set_md_var(tc, "require.user", "root");
@@ -428,20 +490,18 @@ ATF_TC_BODY(short_period, tc)
 {
 	uint64_t throttled;
 	double per_tick, rate;
-	u_int oldrate, oldmin;
 	int hz;
 
 	require_hwpmc();
-	oldrate = rate_get();
+	sysctls_save();
 	hz = hz_get();
-	oldmin = mincount_set(1);
+	(void)mincount_set(1);
 	rate_set(100 * hz);
 	test_period = 100;
 
 	rate = measure(&throttled);
 
-	rate_set(oldrate);
-	(void)mincount_set(oldmin);
+	sysctls_restore();
 
 	per_tick = throttled / test_secs / hz;
 	printf("hz %d, rate %.0f/s, throttled %ju, %.2f each tick\n", hz,
@@ -451,8 +511,14 @@ ATF_TC_BODY(short_period, tc)
 	    per_tick);
 }
 
+ATF_TC_CLEANUP(short_period, tc)
+{
+
+	sysctls_restore();
+}
+
 /* Log flushes must not reset the tick limit. */
-ATF_TC(flush_loop);
+ATF_TC_WITH_CLEANUP(flush_loop);
 ATF_TC_HEAD(flush_loop, tc)
 {
 	atf_tc_set_md_var(tc, "require.user", "root");
@@ -462,20 +528,18 @@ ATF_TC_BODY(flush_loop, tc)
 {
 	uint64_t throttled;
 	double rate, bound;
-	u_int oldrate, oldmin;
 	int hz;
 
 	require_hwpmc();
-	oldrate = rate_get();
+	sysctls_save();
 	hz = hz_get();
-	oldmin = mincount_set(1);
+	(void)mincount_set(1);
 	rate_set(10 * hz);
 	use_flush = true;
 
 	rate = measure(&throttled);
 
-	rate_set(oldrate);
-	(void)mincount_set(oldmin);
+	sysctls_restore();
 
 	bound = 1.5 * 11 * hz;
 	printf("hz %d, rate %.0f/s, bound %.0f/s, flushes %lu, "
@@ -484,6 +548,12 @@ ATF_TC_BODY(flush_loop, tc)
 	ATF_CHECK_MSG(atomic_load(&nflush) > 0, "no flush succeeded");
 	ATF_CHECK_MSG(rate <= bound, "rate %.0f/s is above %.0f/s", rate,
 	    bound);
+}
+
+ATF_TC_CLEANUP(flush_loop, tc)
+{
+
+	sysctls_restore();
 }
 
 ATF_TP_ADD_TCS(tp)
