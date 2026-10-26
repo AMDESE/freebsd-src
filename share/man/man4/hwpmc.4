@@ -428,7 +428,7 @@ tunables:
 .Bl -tag -width indent
 .It Va kern.hwpmc.callchaindepth Pq integer, read-only
 The maximum number of call chain records to capture per sample.
-The default is 8.
+The default is 128.
 .It Va kern.hwpmc.cpu_time_max_percent Pq integer, read-write
 The maximum percentage of CPU time that the PMC interrupt handler can use.
 The driver measures the time of each interrupt.
@@ -473,9 +473,14 @@ The default buffer size is 256KB.
 The maximum value is 16MB.
 .It Va kern.hwpmc.max_sample_rate Pq integer, read-write
 The maximum number of samples each second for one sampling PMC on one CPU.
-When a PMC reaches the limit in a clock tick, the driver stops the PMC.
+The driver divides this value by
+.Va hz
+to get a limit for each clock tick.
+When a PMC interrupts more times than this limit in one clock tick, the
+driver drops the sample, stops the PMC, and counts the drop.
 The driver starts the PMC again at the next clock tick.
-The value 0 disables the limit.
+The value 0 disables the limit and the limit of
+.Va kern.hwpmc.cpu_time_max_percent .
 Without the limit, a short sample period can use all the CPU time in the
 interrupt handler.
 The default is 100000.
@@ -497,7 +502,7 @@ and
 must not exceed 32MB per CPU.
 .It Va kern.hwpmc.nsamples Pq integer, read-only
 The number of entries in the per-CPU ring buffer used during sampling.
-The default is 512.
+The default is 256.
 .It Va kern.hwpmc.throttle_pconly Pq integer, read-write
 If set to non-zero, a PMC that reached
 .Va kern.hwpmc.max_sample_rate
@@ -564,6 +569,19 @@ between the currently executing kernel and the module being loaded.
 The module loading process failed because the currently executing kernel
 was not configured with the required configuration option
 .Dv HWPMC_HOOKS .
+.It "hwpmc: sample rate limit disabled, sampling can stall the system"
+An administrator set
+.Va kern.hwpmc.max_sample_rate
+to 0.
+.It "hwpmc: interrupt time limit disabled, sampling can stall the system"
+An administrator set
+.Va kern.hwpmc.cpu_time_max_percent
+to 0 or 100.
+.It "hwpmc: interrupt took too long (%u ns > %u ns), lowering kern.hwpmc.max_sample_rate to %u"
+The average time of the PMC interrupt handler was above the limit of
+.Va kern.hwpmc.cpu_time_max_percent .
+The driver decreased
+.Va kern.hwpmc.max_sample_rate .
 .It "hwpmc: tunable hashsize=%d must be greater than zero."
 A negative value was supplied for tunable
 .Va kern.hwpmc.hashsize .

@@ -35,6 +35,12 @@ NOTE TO PEOPLE WHO THINK THAT FreeBSD 16.x IS SLOW:
 	pmcstat(8) to see the counts.  The new libpmc reads logs from older
 	kernels.
 
+	The kernel and the hwpmc module must have the same PMC_VERSION, so
+	rebuild both.  A module of a different version does not load.  A
+	new libpmc that runs against an older hwpmc module gets
+	EPROGMISMATCH from pmc_init(3).  Thus build and install world and
+	kernel together.
+
 20260919:
 	less(1) has been updated to version 710, which removes the obsolete
 	lesskey(1) utility.  It is no longer built or installed, and the
