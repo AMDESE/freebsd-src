@@ -334,7 +334,7 @@ int	pmclog_proc_create(struct thread *td, void **handlep);
 void	pmclog_proc_ignite(void *handle, struct pmc_owner *po);
 void	pmclog_process_callchain(struct pmc *_pm, struct pmc_sample *_ps);
 void	pmclog_process_closelog(struct pmc_owner *po);
-void	pmclog_process_dropnotify(struct pmc *_pm, int _cpu, uint32_t _flags,
+int	pmclog_process_dropnotify(struct pmc *_pm, int _cpu, uint32_t _flags,
     uint32_t _count);
 void	pmclog_process_map_in(struct pmc_owner *po, pid_t pid,
     uintfptr_t start, const char *path);

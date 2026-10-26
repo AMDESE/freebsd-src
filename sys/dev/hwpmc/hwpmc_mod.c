@@ -242,6 +242,8 @@ static void	pmc_link_target_process(struct pmc *pm,
     struct pmc_process *pp);
 static void	pmc_log_all_process_mappings(struct pmc_owner *po);
 static void	pmc_log_kernel_mappings(struct pmc *pm);
+static void	pmc_log_lost(struct pmc *pm, int cpu);
+static void	pmc_log_lost_off_cpu(struct pmc *pm, int cpu);
 static void	pmc_log_process_mappings(struct pmc_owner *po, struct proc *p);
 static void	pmc_maybe_remove_owner(struct pmc_owner *po);
 static void	pmc_post_callchain_callback(void);
@@ -1830,6 +1832,10 @@ pmc_reclaim_pmc_from_cpu(struct pmc *pm, struct pmc_process *pp, int cpu)
 		}
 	}
 
+	/* Log drops before CPU departure. Exclude hardclock. */
+	spinlock_enter();
+	pmc_log_lost(pm, cpu);
+	spinlock_exit();
 	counter_u64_add(pm->pm_runcount, -1);
 	(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
 }
@@ -1921,6 +1927,9 @@ pmc_process_csw_out(struct thread *td)
 		KASSERT(counter_u64_fetch(pm->pm_runcount) > 0,
 		    ("[pmc,%d] pm=%p runcount %ju", __LINE__, pm,
 		    (uintmax_t)counter_u64_fetch(pm->pm_runcount)));
+
+		/* Log drops before CPU departure. */
+		pmc_log_lost(pm, cpu);
 
 		/* reduce this PMC's runcount */
 		counter_u64_add(pm->pm_runcount, -1);
@@ -3087,9 +3096,10 @@ pmc_release_pmc_descriptor(struct pmc *pm)
 
 		PMCDBG2(PMC,REL,2, "decfg cpu=%d ri=%d", cpu, ri);
 
-		critical_enter();
+		spinlock_enter();
+		pmc_log_lost(pm, cpu);
 		(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
-		critical_exit();
+		spinlock_exit();
 
 		/* adjust the global and process count of SS mode PMCs */
 		if (mode == PMC_MODE_SS && pm->pm_state == PMC_STATE_RUNNING) {
@@ -3553,6 +3563,11 @@ pmc_stop(struct pmc *pm)
 		    &pm->pm_sc.pm_initial);
 	}
 	critical_exit();
+
+	/* Log final-tick drops. Exclude hardclock. */
+	spinlock_enter();
+	pmc_log_lost(pm, cpu);
+	spinlock_exit();
 
 	pmc_restore_cpu_binding(&pb);
 
@@ -5381,6 +5396,7 @@ pmc_process_samples(int cpu, ring_type_t ring)
 				 */
 				counter_u64_add(pmc_stats.pm_overwrites, 1);
 				pmc_note_lost(pm, cpu, PMCLOG_DROP_USERCC);
+				pmc_log_lost_off_cpu(pm, cpu);
 				goto entrydone;
 			}
 			/* Need a rescan at a later time. */
@@ -5458,7 +5474,7 @@ static void
 pmc_log_lost(struct pmc *pm, int cpu)
 {
 	struct pmc_pcpu_state *pps;
-	u_int v;
+	u_int count, new, old, v;
 
 	pps = &pm->pm_pcpu_state[cpu];
 	if (atomic_load_int(&pps->pps_lost) == 0)
@@ -5467,8 +5483,34 @@ pmc_log_lost(struct pmc *pm, int cpu)
 	if ((pm->pm_flags & PMC_F_ATTACHED_TO_OWNER) != 0 ||
 	    (pm->pm_owner->po_flags & PMC_PO_OWNS_LOGFILE) == 0)
 		return;
-	pmclog_process_dropnotify(pm, cpu, v >> PMC_LOST_FLAG_SHIFT,
-	    v & PMC_LOST_COUNT_MASK);
+	if (pmclog_process_dropnotify(pm, cpu, v >> PMC_LOST_FLAG_SHIFT,
+	    v & PMC_LOST_COUNT_MASK) == 0)
+		return;
+
+	/* Retain drops until the log can accept records. */
+	do {
+		old = atomic_load_int(&pps->pps_lost);
+		count = (old & PMC_LOST_COUNT_MASK) + (v & PMC_LOST_COUNT_MASK);
+		if (count > PMC_LOST_COUNT_MASK)
+			count = PMC_LOST_COUNT_MASK;
+		new = ((old | v) & ~PMC_LOST_COUNT_MASK) | count;
+	} while (atomic_cmpset_int(&pps->pps_lost, old, new) == 0);
+	DPCPU_ID_SET(cpu, pmc_throttled, 1);
+}
+
+/* Log retained drops for PMCs absent from this CPU. */
+static void
+pmc_log_lost_off_cpu(struct pmc *pm, int cpu)
+{
+	struct pmc_classdep *pcd;
+	struct pmc *phw_pm;
+	int adjri;
+
+	pcd = pmc_ri_to_classdep(md, PMC_TO_ROWINDEX(pm), &adjri);
+	phw_pm = NULL;
+	(void)(*pcd->pcd_get_config)(cpu, adjri, &phw_pm);
+	if (phw_pm != pm)
+		pmc_log_lost(pm, cpu);
 }
 
 /* Check whether this PMC exceeded the current tick limit. */
@@ -5666,6 +5708,10 @@ pmc_process_exit(void *arg __unused, struct proc *p)
 		KASSERT(counter_u64_fetch(pm->pm_runcount) > 0,
 		    ("[pmc,%d] runcount is %d", __LINE__, ri));
 
+		/* Log drops before CPU departure. */
+		spinlock_enter();
+		pmc_log_lost(pm, cpu);
+		spinlock_exit();
 		counter_u64_add(pm->pm_runcount, -1);
 		(void)pcd->pcd_config_pmc(cpu, adjri, NULL);
 	}

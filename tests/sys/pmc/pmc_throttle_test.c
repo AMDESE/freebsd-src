@@ -10,6 +10,7 @@
 #include <sys/cpuset.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 
 #include <atf-c.h>
 #include <errno.h>
@@ -467,13 +468,127 @@ ATF_TC_BODY(drop_records, tc)
 	ATF_CHECK_MSG(nrec > 0, "no DROPNOTIFY record in the log");
 	ATF_CHECK_EQ_MSG(other, 0, "%ju records with wrong fields",
 	    (uintmax_t)other);
-	/* Allow for unlogged drops after the last tick. */
-	ATF_CHECK_MSG(dropped <= throttled && dropped + 10 >= throttled,
+	/* pmc_stop() must log all final-tick drops. */
+	ATF_CHECK_MSG(dropped == throttled,
 	    "dropped %ju, throttled %ju", (uintmax_t)dropped,
 	    (uintmax_t)throttled);
 }
 
 ATF_TC_CLEANUP(drop_records, tc)
+{
+
+	sysctls_restore();
+}
+
+/* Sum THROTTLED DROPNOTIFY counts for PMC id. */
+static uint64_t
+log_drops(const char *logpath, pmc_id_t id, uint64_t *nrec)
+{
+	struct pmclog_ev ev;
+	uint64_t dropped;
+	void *parser;
+	int fd;
+
+	fd = open(logpath, O_RDONLY);
+	ATF_REQUIRE(fd >= 0);
+	parser = pmclog_open(fd);
+	ATF_REQUIRE(parser != NULL);
+	dropped = *nrec = 0;
+	while (pmclog_read(parser, &ev) == 0) {
+		if (ev.pl_type != PMCLOG_TYPE_DROPNOTIFY ||
+		    ev.pl_u.pl_dn.pl_pmcid != id ||
+		    (ev.pl_u.pl_dn.pl_flags & PMCLOG_DROP_THROTTLED) == 0)
+			continue;
+		(*nrec)++;
+		dropped += ev.pl_u.pl_dn.pl_count;
+	}
+	ATF_CHECK_MSG(ev.pl_state == PMCLOG_EOF, "log state %d",
+	    ev.pl_state);
+	pmclog_close(parser);
+	close(fd);
+	return (dropped);
+}
+
+/* Process PMCs must log all drops at context switches and exit. */
+ATF_TC_WITH_CLEANUP(drop_records_process);
+ATF_TC_HEAD(drop_records_process, tc)
+{
+	atf_tc_set_md_var(tc, "require.user", "root");
+	atf_tc_set_md_var(tc, "timeout", "30");
+}
+ATF_TC_BODY(drop_records_process, tc)
+{
+	struct timespec t, t0;
+	volatile uint64_t x;
+	uint64_t dropped, nrec, th0, th1;
+	pmc_id_t id;
+	pid_t pid;
+	int fd, hz, i, pfd[2], status;
+	char c;
+
+	require_hwpmc();
+	sysctls_save();
+	hz = hz_get();
+	(void)mincount_set(1);
+	rate_set(10 * hz);
+
+	ATF_REQUIRE(pipe(pfd) == 0);
+	pid = fork();
+	ATF_REQUIRE(pid >= 0);
+	if (pid == 0) {
+		/* 300 bursts of 2 ms, with 1 ms sleeps. */
+		pin(TEST_CPU);
+		if (read(pfd[0], &c, 1) != 1)
+			_exit(1);
+		x = 1;
+		for (i = 0; i < 300; i++) {
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			do {
+				x = x * 6364136223846793005ULL + 1;
+				clock_gettime(CLOCK_MONOTONIC, &t);
+			} while ((t.tv_sec - t0.tv_sec) * 1000000000L +
+			    (t.tv_nsec - t0.tv_nsec) < 2000000L);
+			usleep(1000);
+		}
+		_exit(0);
+	}
+
+	ATF_REQUIRE(pmc_allocate("ls_not_halted_cyc", PMC_MODE_TS, 0,
+	    PMC_CPU_ANY, &id, TEST_PERIOD) == 0 ||
+	    pmc_allocate("unhalted-cycles", PMC_MODE_TS, 0, PMC_CPU_ANY,
+	    &id, TEST_PERIOD) == 0);
+	fd = open("dropp.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	ATF_REQUIRE(fd >= 0);
+	ATF_REQUIRE(pmc_configure_logfile(fd) == 0);
+	ATF_REQUIRE(pmc_attach(id, pid) == 0);
+	th0 = stat_get("intr_throttled");
+	ATF_REQUIRE(pmc_start(id) == 0);
+	ATF_REQUIRE(write(pfd[1], "g", 1) == 1);
+	ATF_REQUIRE(waitpid(pid, &status, 0) == pid);
+	th1 = stat_get("intr_throttled");
+	(void)pmc_stop(id);
+	ATF_REQUIRE(pmc_release(id) == 0);
+	ATF_REQUIRE(pmc_close_logfile() == 0);
+	(void)pmc_configure_logfile(-1);
+	close(fd);
+	close(pfd[0]);
+	close(pfd[1]);
+
+	sysctls_restore();
+
+	dropped = log_drops("dropp.log", id, &nrec);
+	printf("throttled %ju, records %ju, dropped %ju\n",
+	    (uintmax_t)(th1 - th0), (uintmax_t)nrec, (uintmax_t)dropped);
+	ATF_CHECK_MSG(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	    "child status %d", status);
+	ATF_CHECK_MSG(th1 - th0 > 0, "the PMC never reached the limit");
+	/* An in-flight NMI can count one unlogged drop after exit. */
+	ATF_CHECK_MSG(dropped <= th1 - th0 && dropped + 1 >= th1 - th0,
+	    "dropped %ju, throttled %ju", (uintmax_t)dropped,
+	    (uintmax_t)(th1 - th0));
+}
+
+ATF_TC_CLEANUP(drop_records_process, tc)
 {
 
 	sysctls_restore();
@@ -562,6 +677,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, rate_unlimited);
 	ATF_TP_ADD_TC(tp, time_limited);
 	ATF_TP_ADD_TC(tp, drop_records);
+	ATF_TP_ADD_TC(tp, drop_records_process);
 	ATF_TP_ADD_TC(tp, short_period);
 	ATF_TP_ADD_TC(tp, flush_loop);
 	return (atf_no_error());

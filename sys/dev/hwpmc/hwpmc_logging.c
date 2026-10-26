@@ -1005,21 +1005,23 @@ pmclog_process_closelog(struct pmc_owner *po)
 	spinlock_exit();
 }
 
-/* Report per-PMC, per-CPU drops from the clock interrupt. */
-void
+/* Report per-PMC, per-CPU drops. Return ENOMEM if the log is full. */
+int
 pmclog_process_dropnotify(struct pmc *pm, int cpu, uint32_t flags,
     uint32_t count)
 {
 	struct pmc_owner *po;
 
 	po = pm->pm_owner;
-	PMCLOG_RESERVE_SAFE(po, PMCLOG_TYPE_DROPNOTIFY,
-	    sizeof(struct pmclog_dropnotify), pmc_rdtsc());
+	_PMCLOG_RESERVE_SAFE(po, PMCLOG_TYPE_DROPNOTIFY,
+	    sizeof(struct pmclog_dropnotify), return (ENOMEM), pmc_rdtsc());
 	PMCLOG_EMIT32(pm->pm_id);
 	PMCLOG_EMIT32(cpu);
 	PMCLOG_EMIT32(flags);
 	PMCLOG_EMIT32(count);
-	PMCLOG_DESPATCH_SAFE(po);
+	/* Do not wake the log thread while the thread lock is held. */
+	PMCLOG_DESPATCH_SCHED_LOCK(po);
+	return (0);
 }
 
 void
