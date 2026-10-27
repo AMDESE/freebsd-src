@@ -86,6 +86,7 @@ static struct soft_descr soft_pmcdesc[SOFT_NPMCS] =
 struct soft_cpu {
 	struct pmc_hw	soft_hw[SOFT_NPMCS];
 	pmc_value_t	soft_values[SOFT_NPMCS];
+	u_int		soft_running[SOFT_NPMCS];	/* in ps_running */
 };
 
 
@@ -329,7 +330,9 @@ soft_start_pmc(int cpu, int ri, struct pmc *pm)
 	ps = pmc_soft_ev_acquire(pm->pm_event);
 	if (ps == NULL)
 		return (EINVAL);
-	atomic_add_int(&ps->ps_running, 1);
+	/* Count each row once in ps_running. */
+	if (atomic_cmpset_int(&soft_pcpu[cpu]->soft_running[ri], 0, 1))
+		atomic_add_int(&ps->ps_running, 1);
 	pmc_soft_ev_release(ps);
 
 	return (0);
@@ -345,6 +348,9 @@ soft_stop_pmc(int cpu, int ri, struct pmc *pm)
 	KASSERT(ri >= 0 && ri < SOFT_NPMCS,
 	    ("[soft,%d] illegal row-index %d", __LINE__, ri));
 
+	/* Allow a stop after pmc_soft_intr() stopped the row. */
+	if (!atomic_cmpset_int(&soft_pcpu[cpu]->soft_running[ri], 1, 0))
+		return (0);
 	ps = pmc_soft_ev_acquire(pm->pm_event);
 	/* event unregistered ? */
 	if (ps != NULL) {
