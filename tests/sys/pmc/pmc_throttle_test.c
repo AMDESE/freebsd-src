@@ -1,7 +1,7 @@
-/*-
- * SPDX-License-Identifier: BSD-2-Clause
- *
+/*
  * Copyright (c) 2026 Advanced Micro Devices, Inc.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
  */
 
 /* Test per-tick sample rate and interrupt CPU time limits. */
@@ -18,6 +18,7 @@
 #include <pmc.h>
 #include <pmclog.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -200,8 +201,10 @@ throttle_setup(u_int rate_per_tick)
 	return (hz);
 }
 
-/* Measure interrupts per second on TEST_CPU and report *throttled. */
-/* Optionally write logpath and return the PMC ID in *idp. */
+/*
+ * Measure interrupts per second and throttle count on TEST_CPU.
+ * Optionally write logpath and return the PMC ID in *idp.
+ */
 static double
 measure_log(uint64_t *throttled, const char *logpath, pmc_id_t *idp)
 {
@@ -515,10 +518,16 @@ ATF_TC_BODY(drop_records_process, tc)
 		_exit(0);
 	}
 
-	ATF_REQUIRE(pmc_allocate("ls_not_halted_cyc", PMC_MODE_TS, 0,
-	    PMC_CPU_ANY, &id, TEST_PERIOD) == 0 ||
-	    pmc_allocate("unhalted-cycles", PMC_MODE_TS, 0, PMC_CPU_ANY,
-	    &id, TEST_PERIOD) == 0);
+	for (i = 0; i < (int)nitems(cycle_events); i++) {
+		if (pmc_allocate(cycle_events[i], PMC_MODE_TS, 0, PMC_CPU_ANY,
+		    &id, TEST_PERIOD) == 0)
+			break;
+	}
+	if (i == (int)nitems(cycle_events)) {
+		(void)kill(pid, SIGKILL);
+		(void)waitpid(pid, NULL, 0);
+		atf_tc_skip("no cycle event for a process sampling PMC");
+	}
 	fd = open("dropp.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	ATF_REQUIRE(fd >= 0);
 	ATF_REQUIRE(pmc_configure_logfile(fd) == 0);
