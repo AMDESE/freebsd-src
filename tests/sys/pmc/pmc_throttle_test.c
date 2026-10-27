@@ -42,6 +42,8 @@ static atomic_bool flush_stop;
 static atomic_ulong nflush;
 static bool use_flush;
 static int test_period = TEST_PERIOD;
+static const char *test_event;		/* NULL: a cycle event */
+static uint32_t test_flags;
 static double test_secs;
 
 static void
@@ -218,12 +220,16 @@ measure_log(uint64_t *throttled, const char *logpath, pmc_id_t *idp)
 	bool ok;
 
 	ok = false;
-	for (i = 0; i < nitems(cycle_events); i++) {
-		if (pmc_allocate(cycle_events[i], PMC_MODE_SS, 0, TEST_CPU,
-		    &id, test_period) == 0) {
+	if (test_event != NULL) {
+		ok = pmc_allocate(test_event, PMC_MODE_SS, test_flags,
+		    TEST_CPU, &id, test_period) == 0;
+		if (!ok)
+			atf_tc_skip("no %s event", test_event);
+	}
+	for (i = 0; !ok && i < nitems(cycle_events); i++) {
+		if (pmc_allocate(cycle_events[i], PMC_MODE_SS, test_flags,
+		    TEST_CPU, &id, test_period) == 0)
 			ok = true;
-			break;
-		}
 	}
 	if (!ok)
 		atf_tc_skip("no cycle event for a system sampling PMC");
@@ -634,6 +640,78 @@ ATF_TC_CLEANUP(flush_loop, tc)
 	sysctls_restore();
 }
 
+/* PC-only IBS samples must retain multipart data and a PC. */
+ATF_TC_WITH_CLEANUP(pconly_ibs);
+ATF_TC_HEAD(pconly_ibs, tc)
+{
+	atf_tc_set_md_var(tc, "require.user", "root");
+	atf_tc_set_md_var(tc, "timeout", "30");
+}
+ATF_TC_BODY(pconly_ibs, tc)
+{
+	struct pmclog_ev ev;
+	uint64_t bad, nrec, throttled;
+	pmc_id_t id;
+	uint8_t *hdr;
+	void *parser;
+	u_int i, len;
+	int fd;
+
+	if (hwpmc_get("throttle_pconly") == 0)
+		atf_tc_skip("kern.hwpmc.throttle_pconly is 0");
+	(void)throttle_setup(10);
+	test_event = "ibs-op";
+	test_flags = PMC_F_CALLCHAIN;
+	test_period = 65536;
+
+	(void)measure_log(&throttled, "ibs.log", &id);
+
+	sysctls_restore();
+
+	fd = open("ibs.log", O_RDONLY);
+	ATF_REQUIRE(fd >= 0);
+	parser = pmclog_open(fd);
+	ATF_REQUIRE(parser != NULL);
+	bad = nrec = 0;
+	while (pmclog_read(parser, &ev) == 0) {
+		if (ev.pl_type != PMCLOG_TYPE_CALLCHAIN ||
+		    ev.pl_u.pl_cc.pl_pmcid != id)
+			continue;
+		nrec++;
+		if ((ev.pl_u.pl_cc.pl_cpuflags & PMC_CC_F_MULTIPART) == 0) {
+			bad++;
+			continue;
+		}
+		/* Header, multipart data, and at least one PC. */
+		len = PMC_MULTIPART_HEADER_LENGTH / sizeof(uintptr_t);
+		hdr = (uint8_t *)&ev.pl_u.pl_cc.pl_pc[0];
+		for (i = 0; i < PMC_MULTIPART_HEADER_ENTRIES; i++) {
+			if (hdr[2 * i] == PMC_CC_MULTIPART_NONE)
+				break;
+			len += hdr[2 * i + 1];
+		}
+		if (ev.pl_u.pl_cc.pl_npc <= len)
+			bad++;
+	}
+	ATF_CHECK_MSG(ev.pl_state == PMCLOG_EOF, "log state %d",
+	    ev.pl_state);
+	pmclog_close(parser);
+	close(fd);
+
+	printf("throttled %ju, records %ju, bad %ju\n", (uintmax_t)throttled,
+	    (uintmax_t)nrec, (uintmax_t)bad);
+	ATF_CHECK_MSG(throttled > 0, "the PMC never reached the limit");
+	ATF_CHECK_MSG(nrec > 0, "no sample in the log");
+	ATF_CHECK_EQ_MSG(bad, 0, "%ju of %ju samples lost the IBS data",
+	    (uintmax_t)bad, (uintmax_t)nrec);
+}
+
+ATF_TC_CLEANUP(pconly_ibs, tc)
+{
+
+	sysctls_restore();
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, rate_limited);
@@ -643,5 +721,6 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, drop_records_process);
 	ATF_TP_ADD_TC(tp, short_period);
 	ATF_TP_ADD_TC(tp, flush_loop);
+	ATF_TP_ADD_TC(tp, pconly_ibs);
 	return (atf_no_error());
 }
