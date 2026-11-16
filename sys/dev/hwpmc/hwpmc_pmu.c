@@ -66,6 +66,12 @@ static int pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg);
 static void pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
     bool drain_samples);
 static void pmu_pp_kick_rotate(struct pmc_process *pp);
+static void pmu_syscpu_rotate_thread(void *arg);
+static int pmu_sys_schedule_in(int cpu, pmu_group_t *pg);
+static void pmu_sys_schedule_out(int cpu, pmu_group_t *pg);
+static void pmu_sys_stop_rows(int cpu, pmu_group_t *pg, u_int nmembers);
+static void pmu_syscpu_kick_rotate(int cpu);
+static void pmu_syscpu_rotate_one(int cpu);
 static void pmu_pp_unlink_group(pmu_group_t *pg, struct pmc_process *pp);
 static void pmu_group_attach_siblings(pmu_group_t *pg,
     struct pmc_process *pp);
@@ -917,6 +923,8 @@ pmu_group_prepare_release(pmu_group_t *pg, struct pmc **members,
 		*released_pp = NULL;
 
 	if (pg->pg_system) {
+		if (pg->pg_leader != NULL)
+			pmu_sys_group_pre_release(pg->pg_leader->pe_pmc);
 		if (pg->pg_committed && !pg->pg_account_blocked)
 			pmu_group_accounting_prepare_release(pg);
 	} else {
@@ -2297,6 +2305,542 @@ pmu_pp_rotate_thread(void *arg)
 	pp->pp_pmu_rot_running = false;
 	pp->pp_pmu_rot_td = NULL;
 	wakeup(&pp->pp_pmu_rot_td);
+	sx_xunlock(&pmc_sx);
+	kthread_exit();
+}
+
+/*
+ * This is system-mode (PMC_MODE_SC) grouping and per-CPU multiplexing.
+ */
+
+/* Update the system-mode active count for the CPU. */
+static void
+pmu_sys_residency_mark(pmu_group_t *pg, bool admit)
+{
+
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_time_update_locked(pg, cpu_ticks());
+	pg->pg_account_placement_admit = admit;
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+}
+
+/*
+ * Schedule a system group in and start hardware counters.
+ */
+static int
+pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
+{
+	pmu_event_t *pe;
+	struct proc *owner;
+	int error;
+	u_int nstarted;
+
+	if (pg == NULL || pg->pg_assigned)
+		return (0);
+
+	/* Check the owner process's allocation permission. */
+	owner = pg->pg_owner != NULL ? pg->pg_owner->po_owner : NULL;
+	if (owner == NULL)
+		return (EINVAL);
+
+	error = pmu_group_can_place(pg, owner, cpu);
+	if (error != 0)
+		return (error);
+
+	error = pmu_assign_group(pg, owner, cpu);
+	if (error == EBUSY)
+		error = ENOSPC;
+	if (error != 0) {
+		PMCDBG3(PMC, OPS, 1,
+		    "sys_schedule_in: assign gid=%u cpu=%d err=%d",
+		    pg->pg_id, cpu, error);
+		return (error);
+	}
+
+	/*
+	 * Every member starts or none does (§2.4).  A class whose configure
+	 * can fail would otherwise leave a row running unpublished, which is
+	 * the occupancy hole of §5.4 in per-class form.
+	 */
+	nstarted = 0;
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
+		error = hwpmc_pmu_sys_start_row(cpu, pe->pe_pmc);
+		if (error != 0) {
+			PMCDBG3(PMC, OPS, 1,
+			    "sys_schedule_in: start gid=%u cpu=%d err=%d",
+			    pg->pg_id, cpu, error);
+			pmu_sys_stop_rows(cpu, pg, nstarted);
+			pmu_unassign_group(pg, cpu);
+			return (error);
+		}
+		nstarted++;
+	}
+	pmu_sys_residency_mark(pg, true);
+	PMCDBG3(PMC, OPS, 4, "sys_schedule_in: gid=%u cpu=%d nevents=%u IN",
+	    pg->pg_id, cpu, pg->pg_nevents);
+	return (0);
+}
+
+/* Does any member of this group sample? */
+static bool
+pmu_group_has_sampling(pmu_group_t *pg)
+{
+	pmu_event_t *pe;
+
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pe->pe_pmc)))
+			return (true);
+	}
+	return (false);
+}
+
+/*
+ * Process every sample still queued for this group's members.  A queued
+ * sample holds a pointer to its PMC, so none may be left behind when a row
+ * is reused or a member released (spec §6.7).
+ */
+static void
+pmu_sys_group_prepare_drain(pmu_group_t *pg, u_int nmembers)
+{
+	pmu_event_t *pe;
+	u_int member;
+	bool marked;
+
+	marked = false;
+	member = 0;
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (member == nmembers)
+			break;
+		if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pe->pe_pmc))) {
+			pmc_rotation_drain_set(pe->pe_pmc, true);
+			marked = true;
+		}
+		member++;
+	}
+	KASSERT(member == nmembers,
+	    ("[pmu] group %u drain member mismatch %u/%u", pg->pg_id,
+	    member, nmembers));
+	if (marked)
+		wmb();
+}
+
+static void
+pmu_sys_group_drain_samples(int cpu, pmu_group_t *pg, u_int nmembers)
+{
+	pmu_event_t *pe;
+	u_int member;
+
+	if (pg->pg_owner != NULL &&
+	    (pg->pg_owner->po_flags & PMC_PO_OWNS_LOGFILE) != 0)
+		(void)pmclog_flush(pg->pg_owner, 1);
+	member = 0;
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (member == nmembers)
+			break;
+		if (PMC_IS_SAMPLING_MODE(PMC_TO_MODE(pe->pe_pmc)))
+			pmc_rotation_drain_cpu(pe->pe_pmc, cpu);
+		member++;
+	}
+	KASSERT(member == nmembers,
+	    ("[pmu] group %u drained member mismatch %u/%u", pg->pg_id,
+	    member, nmembers));
+}
+
+/*
+ * This function stops and drains the first nmembers rows.
+ * Do this before you unpublish or reuse any row.
+ * Normal eviction and partial-start rollback both use this function.
+ */
+static void
+pmu_sys_stop_rows(int cpu, pmu_group_t *pg, u_int nmembers)
+{
+	pmu_event_t *pe;
+	u_int member;
+
+	pmu_sys_group_prepare_drain(pg, nmembers);
+	member = 0;
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
+		if (member == nmembers)
+			break;
+		hwpmc_pmu_sys_stop_row(cpu, pe->pe_pmc);
+		member++;
+	}
+	KASSERT(member == nmembers,
+	    ("[pmu] group %u stopped member mismatch %u/%u", pg->pg_id,
+	    member, nmembers));
+
+	pmu_sys_group_drain_samples(cpu, pg, nmembers);
+}
+
+/*
+ * Schedule a system group out and stop hardware counters.
+ */
+static void
+pmu_sys_schedule_out(int cpu, pmu_group_t *pg)
+{
+	if (pg == NULL || !pg->pg_assigned)
+		return;
+
+	pmu_sys_stop_rows(cpu, pg, pg->pg_nevents);
+	pmu_sys_residency_mark(pg, false);
+	pmu_unassign_group(pg, cpu);
+	PMCDBG2(PMC, OPS, 4, "sys_schedule_out: gid=%u cpu=%d OUT",
+	    pg->pg_id, cpu);
+}
+
+/* Drop the group from the owner's system-sample accounting. */
+static void
+pmu_sys_group_sscount_drop(pmu_group_t *pg)
+{
+
+	if (!pg->pg_sscounted)
+		return;
+	pg->pg_sscounted = false;
+	if (pg->pg_owner != NULL)
+		hwpmc_sscount_sub(pg->pg_owner);
+}
+
+/*
+ * Start a system group on its bound CPU.
+ */
+int
+pmu_sys_group_on_start(struct pmc *pm)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+	enum pmc_state prior_state;
+	bool added_sscount, was_running;
+	int cpu;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || pe->pe_group == NULL)
+		return (0);
+	pg = pe->pe_group;
+	if (!pg->pg_committed)
+		return (EDOOFUS);
+	if (!pg->pg_system)
+		return (EINVAL);
+
+	cpu = pg->pg_cpu;
+	if (cpu < 0 || cpu >= MAXCPU)
+		return (EINVAL);
+	if (!pmc_cpu_is_active(cpu))
+		return (ENXIO);
+
+	prior_state = pm->pm_state;
+	added_sscount = false;
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	if (pg->pg_account_blocked) {
+		mtx_pool_unlock_spin(pmc_mtxpool, pg);
+		return (EBUSY);
+	}
+	was_running = pg->pg_running;
+	pmu_group_running_start_locked(pg, cpu_ticks());
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+	if (!was_running) {
+		int sin_err;
+
+		/*
+		 * Publish system-sampling ownership before the hardware can
+		 * accept a sample.  pmc_start() already sent the kernel mappings.
+		 */
+		if (!pg->pg_sscounted && pmu_group_has_sampling(pg) &&
+		    pg->pg_owner != NULL) {
+			hwpmc_sscount_add(pg->pg_owner);
+			pg->pg_sscounted = true;
+			added_sscount = true;
+		}
+		sin_err = pmu_sys_schedule_in(cpu, pg);
+		PMCDBG3(PMC, OPS, 2,
+		    "sys_on_start: gid=%u cpu=%d schedule_in=%d",
+		    pg->pg_id, cpu, sin_err);
+		/* Fail if a non-multiplex group cannot fit. */
+		if (sin_err != 0 && (sin_err != ENOSPC || !pg->pg_defer_ok)) {
+			mtx_pool_lock_spin(pmc_mtxpool, pg);
+			pmu_group_running_stop_locked(pg, cpu_ticks());
+			mtx_pool_unlock_spin(pmc_mtxpool, pg);
+			if (added_sscount)
+				pmu_sys_group_sscount_drop(pg);
+			TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+				pe->pe_pmc->pm_state = prior_state;
+			return (sin_err);
+		}
+	}
+
+	/*
+	 * List the group for rotation only once it is running.  A group
+	 * left listed after a failed start would be walked by the rotation
+	 * thread while it owns nothing.
+	 */
+	if (!pg->pg_sys_listed) {
+		LIST_INSERT_HEAD(&pmu_syscpu[cpu].sc_groups, pg, pg_proc_next);
+		pg->pg_sys_listed = true;
+	}
+
+	/* Publish the logical start for every member of the group. */
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
+
+	pmu_syscpu_kick_rotate(cpu);
+	return (0);
+}
+
+/*
+ * Stop a system group and release its hardware rows.
+ */
+void
+pmu_sys_group_on_stop(struct pmc *pm)
+{
+	pmu_event_t *pe;
+	pmu_group_t *pg;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || pe->pe_group == NULL)
+		return;
+	pg = pe->pe_group;
+	if (!pg->pg_system || !pg->pg_running)
+		return;
+
+	if (pg->pg_assigned)
+		pmu_sys_schedule_out(pg->pg_cpu, pg);
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_running_stop_locked(pg, cpu_ticks());
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+	pmu_sys_group_sscount_drop(pg);
+
+	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
+		pe->pe_pmc->pm_state = PMC_STATE_STOPPED;
+}
+
+static void
+pmu_syscpu_stop_rotate(struct pmu_syscpu *sc, const char *wmesg)
+{
+
+	mtx_pool_lock_spin(pmc_mtxpool, sc);
+	sc->sc_quiesce++;
+	sc->sc_running = false;
+	sc->sc_needed = false;
+	mtx_pool_unlock_spin(pmc_mtxpool, sc);
+	wakeup(&sc->sc_needed);
+	while (sc->sc_td != NULL)
+		(void)sx_sleep(&sc->sc_td, &pmc_sx, 0, wmesg, 1);
+	mtx_pool_lock_spin(pmc_mtxpool, sc);
+	KASSERT(sc->sc_quiesce > 0,
+	    ("[pmu] system rotation quiesce underflow"));
+	sc->sc_quiesce--;
+	mtx_pool_unlock_spin(pmc_mtxpool, sc);
+}
+
+/*
+ * Prepare a system group for descriptor release.
+ */
+void
+pmu_sys_group_pre_release(struct pmc *pm)
+{
+	pmu_event_t *pe;
+	pmu_group_t *other, *pg;
+	struct pmu_syscpu *sc;
+	int cpu;
+
+	pe = pmu_event_from_pmc(pm);
+	if (pe == NULL || pe->pe_group == NULL)
+		return;
+	pg = pe->pe_group;
+	if (!pg->pg_system)
+		return;
+
+	cpu = pg->pg_cpu;
+	if (cpu < 0 || cpu >= MAXCPU)
+		return;
+	sc = &pmu_syscpu[cpu];
+
+	/* Stop rotation before you change the group list. */
+	if (pg->pg_sys_listed)
+		pmu_syscpu_stop_rotate(sc, "muxsrel");
+
+	if (pg->pg_assigned)
+		pmu_sys_schedule_out(cpu, pg);
+	else {
+		pmu_sys_group_prepare_drain(pg, pg->pg_nevents);
+		pmu_sys_group_drain_samples(cpu, pg, pg->pg_nevents);
+	}
+	mtx_pool_lock_spin(pmc_mtxpool, pg);
+	pmu_group_running_stop_locked(pg, cpu_ticks());
+	mtx_pool_unlock_spin(pmc_mtxpool, pg);
+
+	pmu_sys_group_sscount_drop(pg);
+
+	if (pg->pg_sys_listed) {
+		if (sc->sc_cursor == pg)
+			sc->sc_cursor = LIST_NEXT(pg, pg_proc_next);
+		LIST_REMOVE(pg, pg_proc_next);
+		pg->pg_sys_listed = false;
+	}
+	LIST_FOREACH(other, &sc->sc_groups, pg_proc_next) {
+		if (other->pg_running && !other->pg_assigned)
+			(void)pmu_sys_schedule_in(cpu, other);
+	}
+	pmu_syscpu_kick_rotate(cpu);
+}
+
+/*
+ * Start or wake the CPU rotation thread.
+ */
+static void
+pmu_syscpu_kick_rotate(int cpu)
+{
+	struct pmu_syscpu *sc;
+	int error;
+
+	sc = &pmu_syscpu[cpu];
+	if (sc->sc_quiesce != 0)
+		return;
+	if (!pmu_list_has_deferred(&sc->sc_groups))
+		return;
+
+	sc->sc_needed = true;
+	if (sc->sc_running || sc->sc_td != NULL) {
+		wakeup(&sc->sc_needed);
+		return;
+	}
+
+	sc->sc_running = true;
+	error = kthread_add(pmu_syscpu_rotate_thread,
+	    (void *)(intptr_t)cpu, NULL, &sc->sc_td, 0, 0,
+	    "pmu_rot_cpu_%d", cpu);
+	if (error != 0) {
+		sc->sc_running = false;
+		sc->sc_td = NULL;
+		PMCDBG2(PMC, OPS, 1,
+		    "syscpu_kick_rotate: cpu=%d kthread_add err=%d",
+		    cpu, error);
+	}
+}
+
+/*
+ * Run one rotation tick on the bound CPU.
+ */
+static void
+pmu_syscpu_rotate_one(int cpu)
+{
+	struct pmu_syscpu *sc;
+	pmu_group_t *cursor, *pg, *victim, *vpg;
+	struct proc *owner;
+	uint64_t evictable;
+	u_int ngroups, seen, vseen;
+	int sin_err;
+	bool found_cursor, placed_any, satisfiable;
+
+	sc = &pmu_syscpu[cpu];
+	if (LIST_EMPTY(&sc->sc_groups)) {
+		sc->sc_needed = false;
+		return;
+	}
+
+	ngroups = 0;
+	cursor = sc->sc_cursor;
+	found_cursor = false;
+	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
+		if (pg == cursor)
+			found_cursor = true;
+		ngroups++;
+	}
+	if (!found_cursor)
+		cursor = LIST_FIRST(&sc->sc_groups);
+
+	evictable = pmu_list_evictable_rows(&sc->sc_groups);
+	satisfiable = false;
+	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
+		if (!pg->pg_running || pg->pg_assigned || !pg->pg_defer_ok)
+			continue;
+		owner = pg->pg_owner != NULL ? pg->pg_owner->po_owner : NULL;
+		if (owner != NULL && pmu_group_satisfiable(pg, owner, cpu,
+		    evictable) == 0) {
+			satisfiable = true;
+			break;
+		}
+	}
+	if (!satisfiable)
+		goto out;
+
+	/* Evict group at cursor and advance cursor. */
+	vpg = cursor;
+	vseen = 0;
+	victim = pmu_list_next_victim(&sc->sc_groups, &vpg, &vseen, ngroups);
+	if (victim != NULL) {
+		PMCDBG3(PMC, OPS, 4, "sysrotate: cpu=%d evict gid=%u "
+		    "nevents=%u", cpu, victim->pg_id, victim->pg_nevents);
+		pmu_sys_schedule_out(cpu, victim);
+		cursor = LIST_NEXT(victim, pg_proc_next);
+		if (cursor == NULL)
+			cursor = LIST_FIRST(&sc->sc_groups);
+	}
+
+	/* Assign deferred MUX groups in order. */
+	placed_any = false;
+	pg = cursor;
+	seen = 0;
+	while (seen < ngroups) {
+		if (pg == NULL)
+			pg = LIST_FIRST(&sc->sc_groups);
+		seen++;
+		if (!pg->pg_running || pg->pg_assigned || !pg->pg_defer_ok)
+			goto next;
+		owner = pg->pg_owner != NULL ? pg->pg_owner->po_owner : NULL;
+		if (owner == NULL || pmu_group_satisfiable(pg, owner, cpu,
+		    evictable) != 0)
+			goto next;
+		sin_err = pmu_sys_schedule_in(cpu, pg);
+		while (sin_err == ENOSPC && !placed_any) {
+			victim = pmu_list_next_victim(&sc->sc_groups, &vpg,
+			    &vseen, ngroups);
+			if (victim == NULL)
+				break;
+			PMCDBG2(PMC, OPS, 4,
+			    "sysrotate: cpu=%d escalate evict gid=%u",
+			    cpu, victim->pg_id);
+			pmu_sys_schedule_out(cpu, victim);
+			sin_err = pmu_sys_schedule_in(cpu, pg);
+		}
+		if (sin_err == 0) {
+			placed_any = true;
+		} else if (sin_err == ENOSPC) {
+			sc->sc_cursor = pg;
+			goto out;
+		}
+		/* Skip group on hard error. */
+next:
+		pg = LIST_NEXT(pg, pg_proc_next);
+	}
+	sc->sc_cursor = cursor;
+out:
+	/* Stop thread if all groups are assigned. */
+	sc->sc_needed = pmu_list_has_deferred(&sc->sc_groups);
+}
+
+/*
+ * Rotation thread for system-mode groups on a CPU.
+ */
+static void
+pmu_syscpu_rotate_thread(void *arg)
+{
+	int cpu = (int)(intptr_t)arg;
+	struct pmu_syscpu *sc = &pmu_syscpu[cpu];
+
+	sx_xlock(&pmc_sx);
+	while (sc->sc_running) {
+		(void)sx_sleep(&sc->sc_needed, &pmc_sx, 0, "muxsys",
+		    pmu_rot_period_ticks());
+		if (!sc->sc_running)
+			break;
+		pmu_syscpu_rotate_one(cpu);
+		if (!sc->sc_needed)
+			break;
+	}
+	sc->sc_running = false;
+	sc->sc_td = NULL;
+	wakeup(&sc->sc_td);
 	sx_xunlock(&pmc_sx);
 	kthread_exit();
 }
