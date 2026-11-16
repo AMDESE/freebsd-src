@@ -15,6 +15,7 @@ ATF_TESTS_C+=	pmc_log_test
 ATF_TESTS_C+=	pmc_pidtrack_test
 ATF_TESTS_C+=	pmc_residual_test
 ATF_TESTS_C+=	pmc_sys_group_test
+ATF_TESTS_C+=	pmc_sys_sampling_test
 ATF_TESTS_C+=	pmc_wrap_test
 
 ATF_TESTS_SH+=	pmc_callchain_ur_test
@@ -43,6 +44,7 @@ LIBADD+=			pmc
 LIBADD.pmc_detach_test+=	pthread
 LIBADD.pmc_fork_test+=	pthread
 LIBADD.pmc_residual_test+=	pthread
+LIBADD.pmc_sys_sampling_test+=	pthread
 
 CFLAGS.pmc_exterr_test.c+=	-I${SRCTOP}/tests
 
