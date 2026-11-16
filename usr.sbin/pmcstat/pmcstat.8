@@ -23,7 +23,7 @@
 .\" out of the use of this software, even if advised of the possibility of
 .\" such damage.
 .\"
-.Dd August 14, 2026
+.Dd October 6, 2026
 .Dt PMCSTAT 8
 .Os
 .Sh NAME
@@ -49,6 +49,7 @@
 .Op Fl U
 .Op Fl W
 .Op Fl a Ar pathname
+.Op Fl b
 .Op Fl c Ar cpu-spec
 .Op Fl d
 .Op Fl e
@@ -309,6 +310,40 @@ option to read in samples that were previously collected and
 saved with the
 .Fl O
 option.
+.It Fl b
+Enable PMU event grouping for subsequent
+.Fl p ,
+.Fl P ,
+.Fl s ,
+and
+.Fl S
+options.
+Specify the members of a group as a comma-separated list enclosed in
+braces, for example
+.Sq {instructions,unhalted-cycles} .
+Quote the list to prevent the shell from expanding the braces.
+Each list containing two or more events forms a separate group whose
+members run together and whose counter values are read together.
+A list containing a single event is treated as an ordinary event.
+.Pp
+The
+.Fl b
+option must precede the event options it applies to;
+it does not affect event specifications that appeared earlier on the
+command line.
+Grouping is disabled by default.
+For example, to count instructions and cycles as one process-mode group:
+.Bd -literal -offset indent
+pmcstat -b -p '{instructions,unhalted-cycles}' sleep 10
+.Ed
+.Pp
+Groups are committed before they are attached to a target.
+If the kernel cannot accommodate a group, the commit fails without
+partially installing its members.
+Groups request multiplexing with
+.Dv PMC_F_GROUP_MUX ,
+allowing the kernel to rotate groups that cannot all remain on hardware.
+Each group must still fit the hardware constraints as a whole.
 .It Fl c Ar cpu-spec
 Set the cpus for subsequent system mode PMCs specified on the
 command line to
