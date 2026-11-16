@@ -66,12 +66,6 @@ static int pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg);
 static void pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
     bool drain_samples);
 static void pmu_pp_kick_rotate(struct pmc_process *pp);
-static void pmu_syscpu_rotate_thread(void *arg);
-static int pmu_sys_schedule_in(int cpu, pmu_group_t *pg);
-static void pmu_sys_schedule_out(int cpu, pmu_group_t *pg);
-static void pmu_sys_stop_rows(int cpu, pmu_group_t *pg, u_int nmembers);
-static void pmu_syscpu_kick_rotate(int cpu);
-static void pmu_syscpu_rotate_one(int cpu);
 static void pmu_pp_unlink_group(pmu_group_t *pg, struct pmc_process *pp);
 static void pmu_group_attach_siblings(pmu_group_t *pg,
     struct pmc_process *pp);
@@ -98,6 +92,12 @@ struct pmu_syscpu {
 };
 static struct pmu_syscpu pmu_syscpu[MAXCPU];
 
+static void pmu_syscpu_rotate_thread(void *arg);
+static int pmu_sys_schedule_in(int cpu, pmu_group_t *pg);
+static void pmu_sys_schedule_out(int cpu, pmu_group_t *pg);
+static void pmu_sys_stop_rows(int cpu, pmu_group_t *pg, u_int nmembers);
+static void pmu_syscpu_kick_rotate(int cpu);
+static void pmu_syscpu_rotate_one(int cpu);
 
 void
 pmu_group_accounting_initialize(void)
@@ -460,9 +460,12 @@ pmu_group_target_alloc(pmu_group_t *pg, struct pmc_process *pp, bool explicit,
 	sx_assert(&pmc_sx, SX_XLOCKED);
 	KASSERT(pg != NULL && pp != NULL,
 	    ("[pmu] invalid target allocation pg=%p pp=%p", pg, pp));
+	if (pmc_test_should_fail(PMC_TEST_FAIL_GROUP_TARGET_ALLOC))
+		return (NULL);
 	pgt = malloc(sizeof(*pgt), M_PMU, malloc_flags | M_ZERO);
 	if (pgt == NULL)
 		return (NULL);
+	pmc_test_counter_add(PMC_TEST_LIVE_GROUP_TARGETS, 1);
 	pgt->pgt_pp = pp;
 	pgt->pgt_group = pg;
 	pgt->pgt_explicit = explicit;
@@ -501,6 +504,7 @@ pmu_group_target_discard(struct pmu_group_target *pgt)
 
 	if (pgt == NULL)
 		return;
+	pmc_test_counter_add(PMC_TEST_LIVE_GROUP_TARGETS, -1);
 	free(pgt, M_PMU);
 }
 
@@ -565,7 +569,7 @@ pmu_group_add_inherited(pmu_group_t *pg, struct pmc_process *pp)
 			if (pp->pp_pmcs[ri].pp_pmc != NULL)
 				goto fail;
 			links[nlinks] =
-			    pmc_target_object_alloc(M_NOWAIT);
+			    pmc_target_object_alloc(M_NOWAIT, true);
 			if (links[nlinks] == NULL)
 				goto fail;
 			nlinks++;
@@ -934,6 +938,7 @@ pmu_group_prepare_release(pmu_group_t *pg, struct pmc **members,
 		if (held_pp != NULL) {
 			mtx_lock_spin(&held_pp->pp_pmu_lock);
 			held_pp->pp_pmu_refs++;
+			pmc_test_counter_add(PMC_TEST_LIVE_ROTATION_REFS, 1);
 			mtx_unlock_spin(&held_pp->pp_pmu_lock);
 			pmu_pp_stop_rotate(held_pp, "muxrel");
 		}
@@ -955,6 +960,7 @@ pmu_group_prepare_release(pmu_group_t *pg, struct pmc **members,
 			KASSERT(held_pp->pp_pmu_refs > 0,
 			    ("[pmu] process reference underflow"));
 			held_pp->pp_pmu_refs--;
+			pmc_test_counter_add(PMC_TEST_LIVE_ROTATION_REFS, -1);
 			pp_unhashed = held_pp->pp_pmu_unhashed;
 			mtx_unlock_spin(&held_pp->pp_pmu_lock);
 			wakeup(&held_pp->pp_pmu_refs);
@@ -1153,6 +1159,7 @@ pmu_group_on_start(struct pmc *pm)
 	pg->pg_account_placement_admit = pg->pg_assigned;
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 
+	(void)pmc_test_group_hold_resident(pg);
 	pmu_pp_kick_rotate(pp);
 	return (0);
 }
@@ -1478,6 +1485,7 @@ pmu_event_set_thread_residual_impl(struct pmc *pm, struct pmc_process *pp,
 	if (!keep) {
 		if (discard != NULL) {
 			LIST_REMOVE(discard, ptr_next);
+			pmc_test_counter_add(PMC_TEST_LIVE_RESIDUAL_ENTRIES, -1);
 		}
 	} else if (discard != NULL) {
 		discard->ptr_value = value;
@@ -1490,6 +1498,7 @@ pmu_event_set_thread_residual_impl(struct pmc *pm, struct pmc_process *pp,
 		ptr->ptr_value = value;
 		ptr->ptr_state = state;
 		LIST_INSERT_HEAD(&pp->pp_pmu_residuals, ptr, ptr_next);
+		pmc_test_counter_add(PMC_TEST_LIVE_RESIDUAL_ENTRIES, 1);
 		ptr = NULL;
 	}
 	mtx_unlock_spin(pp->pp_tdslock);
@@ -1716,6 +1725,7 @@ pmu_thread_residual_remove(struct pmc_process *pp, lwpid_t tid)
 		}
 		if (ptr != NULL) {
 			LIST_REMOVE(ptr, ptr_next);
+			pmc_test_counter_add(PMC_TEST_LIVE_RESIDUAL_ENTRIES, -1);
 		}
 		mtx_unlock_spin(pp->pp_tdslock);
 		if (ptr == NULL)
@@ -1737,6 +1747,7 @@ pmu_event_remove_target_residuals(pmu_event_t *pe, struct pmc_process *pp)
 		}
 		if (ptr != NULL) {
 			LIST_REMOVE(ptr, ptr_next);
+			pmc_test_counter_add(PMC_TEST_LIVE_RESIDUAL_ENTRIES, -1);
 		}
 		mtx_unlock_spin(pp->pp_tdslock);
 		if (ptr == NULL)
@@ -1787,6 +1798,8 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 
 	if (pg == NULL || pg->pg_assigned)
 		return (0);
+	if (pmc_test_group_hold_evicted(pg))
+		return (ENOSPC);
 	/* Use the target process only. */
 	p = pmu_group_target_proc(pg);
 	if (p == NULL)
@@ -1818,6 +1831,8 @@ pmu_pp_schedule_in(struct pmc_process *pp, pmu_group_t *pg)
 	pg->pg_account_placement_admit = true;
 	mtx_pool_unlock_spin(pmc_mtxpool, pg);
 	pmu_group_kick_placement(pg);
+	if (pg->pg_running)
+		(void)pmc_test_group_hold_resident(pg);
 	return (0);
 }
 
@@ -1874,6 +1889,7 @@ pmu_pp_schedule_out(struct pmc_process *pp, pmu_group_t *pg,
 
 	/* Phase 4: release the hardware rows. */
 	pmu_unassign_group(pg, 0);
+	(void)pmc_test_group_hold_evicted(pg);
 }
 
 /*
@@ -2170,7 +2186,8 @@ pmu_list_next_victim(struct pmu_group_list *gl, pmu_group_t **vpg,
 			pg = LIST_FIRST(gl);
 		(*vseen)++;
 		*vpg = LIST_NEXT(pg, pg_proc_next);
-		if (pg->pg_assigned && pg->pg_defer_ok)
+		if (pg->pg_assigned && pg->pg_defer_ok &&
+		    !pmc_test_group_hold_resident(pg))
 			return (pg);
 	}
 	return (NULL);
@@ -2337,6 +2354,8 @@ pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
 
 	if (pg == NULL || pg->pg_assigned)
 		return (0);
+	if (pmc_test_group_hold_evicted(pg))
+		return (ENOSPC);
 
 	/* Check the owner process's allocation permission. */
 	owner = pg->pg_owner != NULL ? pg->pg_owner->po_owner : NULL;
@@ -2365,6 +2384,9 @@ pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
 	nstarted = 0;
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
+		if (pmc_test_should_fail(PMC_TEST_FAIL_SYSTEM_START))
+			error = EIO;
+		else
 		error = hwpmc_pmu_sys_start_row(cpu, pe->pe_pmc);
 		if (error != 0) {
 			PMCDBG3(PMC, OPS, 1,
@@ -2375,8 +2397,11 @@ pmu_sys_schedule_in(int cpu, pmu_group_t *pg)
 			return (error);
 		}
 		nstarted++;
+		pmc_test_system_start_pause(pg, nstarted);
 	}
 	pmu_sys_residency_mark(pg, true);
+	if (pg->pg_sys_listed)
+		(void)pmc_test_group_hold_resident(pg);
 	PMCDBG3(PMC, OPS, 4, "sys_schedule_in: gid=%u cpu=%d nevents=%u IN",
 	    pg->pg_id, cpu, pg->pg_nevents);
 	return (0);
@@ -2470,6 +2495,8 @@ pmu_sys_stop_rows(int cpu, pmu_group_t *pg, u_int nmembers)
 	    ("[pmu] group %u stopped member mismatch %u/%u", pg->pg_id,
 	    member, nmembers));
 
+	if (nmembers != 0)
+		pmc_test_sample_schedule_out(pg);
 	pmu_sys_group_drain_samples(cpu, pg, nmembers);
 }
 
@@ -2485,6 +2512,7 @@ pmu_sys_schedule_out(int cpu, pmu_group_t *pg)
 	pmu_sys_stop_rows(cpu, pg, pg->pg_nevents);
 	pmu_sys_residency_mark(pg, false);
 	pmu_unassign_group(pg, cpu);
+	(void)pmc_test_group_hold_evicted(pg);
 	PMCDBG2(PMC, OPS, 4, "sys_schedule_out: gid=%u cpu=%d OUT",
 	    pg->pg_id, cpu);
 }
@@ -2582,6 +2610,7 @@ pmu_sys_group_on_start(struct pmc *pm)
 	TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling)
 		pe->pe_pmc->pm_state = PMC_STATE_RUNNING;
 
+	(void)pmc_test_group_hold_resident(pg);
 	pmu_syscpu_kick_rotate(cpu);
 	return (0);
 }
