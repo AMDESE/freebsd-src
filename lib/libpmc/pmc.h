@@ -66,6 +66,14 @@ struct pmc_pmcinfo {
 	struct pmc_info	pm_pmcs[];	/* NPMC structs */
 };
 
+struct pmc_group_times {
+	uint64_t	pgt_enabled;
+	uint64_t	pgt_running;
+	uint64_t	pgt_enabled_wall;
+	uint64_t	pgt_wall;
+	uint32_t	pgt_flags;
+};
+
 /*
  * Prototypes
  */
@@ -73,6 +81,15 @@ struct pmc_pmcinfo {
 __BEGIN_DECLS
 int	pmc_allocate(const char *_ctrspec, enum pmc_mode _mode, uint32_t _flags,
     int _cpu, pmc_id_t *_pmcid, uint64_t count);
+int	pmc_allocate_group(const char *_ctrspec, enum pmc_mode _mode,
+    uint32_t _flags, int _cpu, pmc_id_t *_pmcid, uint64_t count);
+int	pmc_group_create(uint32_t *_groupid);
+int	pmc_group_add(uint32_t _groupid, pmc_id_t _pmcid, int _leader);
+int	pmc_group_commit(uint32_t _groupid);
+int	pmc_group_read(pmc_id_t _leader, uint32_t *_nmembers,
+    struct pmc_group_member *_members, struct pmc_group_times *_times);
+int	pmc_read_pair(pmc_id_t _pmc, pmc_value_t *_value,
+    uint64_t *_enabled, uint64_t *_running);
 int	pmc_attach(pmc_id_t _pmcid, pid_t _pid);
 int	pmc_capabilities(pmc_id_t _pmc, uint32_t *_caps);
 int	pmc_configure_logfile(int _fd);
