@@ -6,6 +6,8 @@ KMOD=	hwpmc
 SRCS=	hwpmc_mod.c \
 	hwpmc_logging.c \
 	hwpmc_soft.c
+SRCS+=	hwpmc_pmu.c \
+	hwpmc_assign.c
 SRCS+=	bus_if.h \
 	device_if.h \
 	vnode_if.h
