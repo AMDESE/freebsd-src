@@ -920,7 +920,7 @@ pmclog_process_callchain(struct pmc *pm, struct pmc_sample *ps)
 	PMCLOG_RESERVE_SAFE(po, PMCLOG_TYPE_CALLCHAIN, recordlen, ps->ps_tsc);
 	PMCLOG_EMIT32(ps->ps_pid);
 	PMCLOG_EMIT32(ps->ps_tid);
-	PMCLOG_EMIT32(pm->pm_id);
+	PMCLOG_EMIT32(pm->pm_handle);
 	PMCLOG_EMIT32(flags);
 	for (n = 0; n < ps->ps_nsamples; n++)
 		PMCLOG_EMITADDR(ps->ps_pc[n]);
@@ -967,6 +967,45 @@ pmclog_process_map_in(struct pmc_owner *po, pid_t pid, uintfptr_t start,
 	PMCLOG_DESPATCH_SYNC(po);
 }
 
+/*
+ * Queue a mapping record without a thread wakeup.
+ * Use this function when the caller holds a spin lock.
+ */
+void
+pmclog_process_map_in_nowakeup(struct pmc_owner *po, pid_t pid,
+    uintfptr_t start, const char *path)
+{
+	int pathlen, recordlen;
+
+	KASSERT(path != NULL, ("[pmclog,%d] map-in, null path", __LINE__));
+
+	pathlen = strlen(path) + 1;	/* #bytes for path name */
+	recordlen = offsetof(struct pmclog_map_in, pl_pathname) +
+	    pathlen;
+
+	PMCLOG_RESERVE_SAFE(po, PMCLOG_TYPE_MAP_IN, recordlen, pmc_rdtsc());
+	PMCLOG_EMIT32(pid);
+	PMCLOG_EMIT32(0);
+	PMCLOG_EMITADDR(start);
+	PMCLOG_EMITSTRING(path,pathlen);
+	PMCLOG_DESPATCH_SCHED_LOCK(po);
+}
+
+void
+pmclog_process_map_out_nowakeup(struct pmc_owner *po, pid_t pid,
+    uintfptr_t start, uintfptr_t end)
+{
+	KASSERT(start <= end, ("[pmclog,%d] start > end", __LINE__));
+
+	PMCLOG_RESERVE_SAFE(po, PMCLOG_TYPE_MAP_OUT,
+	    sizeof(struct pmclog_map_out), pmc_rdtsc());
+	PMCLOG_EMIT32(pid);
+	PMCLOG_EMIT32(0);
+	PMCLOG_EMITADDR(start);
+	PMCLOG_EMITADDR(end);
+	PMCLOG_DESPATCH_SCHED_LOCK(po);
+}
+
 void
 pmclog_process_map_out(struct pmc_owner *po, pid_t pid, uintfptr_t start,
     uintfptr_t end)
@@ -994,7 +1033,7 @@ pmclog_process_pmcallocate(struct pmc *pm)
 	if (PMC_TO_CLASS(pm) == PMC_CLASS_SOFT) {
 		PMCLOG_RESERVE(po, PMCLOG_TYPE_PMCALLOCATEDYN,
 		    sizeof(struct pmclog_pmcallocatedyn));
-		PMCLOG_EMIT32(pm->pm_id);
+		PMCLOG_EMIT32(pm->pm_handle);
 		PMCLOG_EMIT32(pm->pm_event);
 		PMCLOG_EMIT32(pm->pm_flags);
 		PMCLOG_EMIT32(0);
@@ -1009,7 +1048,7 @@ pmclog_process_pmcallocate(struct pmc *pm)
 	} else {
 		PMCLOG_RESERVE(po, PMCLOG_TYPE_PMCALLOCATE,
 		    sizeof(struct pmclog_pmcallocate));
-		PMCLOG_EMIT32(pm->pm_id);
+		PMCLOG_EMIT32(pm->pm_handle);
 		PMCLOG_EMIT32(pm->pm_event);
 		PMCLOG_EMIT32(pm->pm_flags);
 		PMCLOG_EMIT32(0);
@@ -1032,7 +1071,7 @@ pmclog_process_pmcattach(struct pmc *pm, pid_t pid, char *path)
 	recordlen = offsetof(struct pmclog_pmcattach, pl_pathname) + pathlen;
 
 	PMCLOG_RESERVE(po, PMCLOG_TYPE_PMCATTACH, recordlen);
-	PMCLOG_EMIT32(pm->pm_id);
+	PMCLOG_EMIT32(pm->pm_handle);
 	PMCLOG_EMIT32(pid);
 	PMCLOG_EMITSTRING(path, pathlen);
 	PMCLOG_DESPATCH_SYNC(po);
@@ -1049,7 +1088,27 @@ pmclog_process_pmcdetach(struct pmc *pm, pid_t pid)
 
 	PMCLOG_RESERVE(po, PMCLOG_TYPE_PMCDETACH,
 	    sizeof(struct pmclog_pmcdetach));
-	PMCLOG_EMIT32(pm->pm_id);
+	PMCLOG_EMIT32(pm->pm_handle);
+	PMCLOG_EMIT32(pid);
+	PMCLOG_DESPATCH_SYNC(po);
+}
+
+/*
+ * Record that a group did not follow a fork.
+ * This is not a detach.  The edge never attached, so PMCDETACH is wrong here.
+ */
+void
+pmclog_process_pmcgroupinheritmiss(struct pmc *pm, pid_t pid)
+{
+	struct pmc_owner *po;
+
+	PMCDBG2(LOG,ATT,1,"!pm=%p pid=%d", pm, pid);
+
+	po = pm->pm_owner;
+
+	PMCLOG_RESERVE(po, PMCLOG_TYPE_PMCGROUPINHERITMISS,
+	    sizeof(struct pmclog_pmcgroupinheritmiss));
+	PMCLOG_EMIT32(pm->pm_handle);
 	PMCLOG_EMIT32(pid);
 	PMCLOG_DESPATCH_SYNC(po);
 }
@@ -1094,7 +1153,7 @@ pmclog_process_proccsw(struct pmc *pm, struct pmc_process *pp, pmc_value_t v, st
 	PMCLOG_RESERVE_SAFE(po, PMCLOG_TYPE_PROCCSW,
 	    sizeof(struct pmclog_proccsw), pmc_rdtsc());
 	PMCLOG_EMIT64(v);
-	PMCLOG_EMIT32(pm->pm_id);
+	PMCLOG_EMIT32(pm->pm_handle);
 	PMCLOG_EMIT32(pp->pp_proc->p_pid);
 	PMCLOG_EMIT32(td->td_tid);
 	PMCLOG_EMIT32(0);
@@ -1138,7 +1197,7 @@ pmclog_process_procexit(struct pmc *pm, struct pmc_process *pp)
 
 	PMCLOG_RESERVE(po, PMCLOG_TYPE_PROCEXIT,
 	    sizeof(struct pmclog_procexit));
-	PMCLOG_EMIT32(pm->pm_id);
+	PMCLOG_EMIT32(pm->pm_handle);
 	PMCLOG_EMIT32(pp->pp_proc->p_pid);
 	PMCLOG_EMIT64(pp->pp_pmcs[ri].pp_pmcval);
 	PMCLOG_DESPATCH(po);
