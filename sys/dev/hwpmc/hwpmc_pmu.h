@@ -10,6 +10,8 @@
 #ifndef _DEV_HWPMC_PMU_H_
 #define	_DEV_HWPMC_PMU_H_
 
+#include <sys/_bitset.h>
+#include <sys/bitset.h>
 #include <sys/mutex.h>
 #include <sys/pmc.h>
 #include <sys/queue.h>
@@ -28,16 +30,20 @@ enum pmc_flags {
 	PMC_FLAG_NOWAIT   = 0x04, /* do not wait for mallocs */
 };
 
+/* The PMC handle reserves PMC_ROW_UNASSIGNED for an unassigned row. */
+#define	PMC_ROWSET_SIZE		PMC_ROW_UNASSIGNED
+BITSET_DEFINE(pmc_rowset, PMC_ROWSET_SIZE);
+
 /*
  * Scheduling constraint from the class backend.
- * pc_allowed_rows is a bitmask of valid class row indices.
+ * pc_allowed_rows contains valid class row indices.
  */
 #define	PMC_SC_F_FIXED		0x0001	/* must use pc_fixed_row */
 #define	PMC_SC_F_SHARED		0x0004	/* tolerates sharing siblings */
 
 struct pmc_sched_constraint {
-	uint32_t	pc_allowed_rows;	/* bitmask of legal rows */
-	uint8_t		pc_weight;		/* popcount(pc_allowed_rows) */
+	struct pmc_rowset pc_allowed_rows;	/* legal class rows */
+	uint8_t		pc_weight;		/* number of allowed rows */
 	uint8_t		pc_fixed_row;		/* used iff PMC_SC_F_FIXED */
 	uint16_t	pc_flags;		/* PMC_SC_F_* */
 };
@@ -207,7 +213,7 @@ void pmu_unassign_group(pmu_group_t *pg, int cpu);
 int pmu_group_can_fit(pmu_group_t *pg);
 int pmu_group_can_place(pmu_group_t *pg, struct proc *p, int cpu);
 int pmu_group_satisfiable(pmu_group_t *pg, struct proc *p, int cpu,
-    uint64_t evictable_rows);
+    const struct pmc_rowset *evictable_rows);
 int pmu_validate_group(pmu_group_t *pg);
 int pmu_event_get_constraint(pmu_event_t *pe,
     pmc_sched_constraint_t *cons);

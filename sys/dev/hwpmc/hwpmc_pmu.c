@@ -2132,27 +2132,27 @@ pmu_pp_kick_after_exec(struct pmc_process *pp)
 }
 
 /*
- * Return the bitmask of rows held by assigned MUX groups.
+ * Find the rows held by assigned MUX groups.
  */
-static uint64_t
-pmu_list_evictable_rows(struct pmu_group_list *gl)
+static void
+pmu_list_evictable_rows(struct pmu_group_list *gl,
+    struct pmc_rowset *evictable)
 {
 	pmu_event_t *pe;
 	pmu_group_t *pg;
-	uint64_t evictable;
 	u_int n;
 
-	evictable = 0;
+	BIT_ZERO(PMC_ROWSET_SIZE, evictable);
 	LIST_FOREACH(pg, gl, pg_proc_next) {
 		if (!pg->pg_assigned || !pg->pg_defer_ok)
 			continue;
 		TAILQ_FOREACH(pe, &pg->pg_events, pe_sibling) {
 			n = PMC_TO_ROWINDEX(pe->pe_pmc);
-			if (n < 64)
-				evictable |= 1ULL << n;
+			if (n < PMC_ROWSET_SIZE)
+				BIT_SET(PMC_ROWSET_SIZE, n, evictable);
 		}
 	}
-	return (evictable);
+
 }
 
 /*
@@ -2183,9 +2183,9 @@ pmu_list_next_victim(struct pmu_group_list *gl, pmu_group_t **vpg,
 static void
 pmu_pp_rotate_one(struct pmc_process *pp)
 {
+	struct pmc_rowset evictable;
 	pmu_group_t *cursor, *pg, *victim, *vpg;
 	struct proc *p;
-	uint64_t evictable;
 	u_int ngroups, seen, vseen;
 	int sin_err;
 	bool found_cursor, placed_any, satisfiable;
@@ -2210,14 +2210,14 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 		cursor = LIST_FIRST(&pp->pp_pmu_groups);
 
 	/* Do not rotate if no deferred group can run. */
-	evictable = pmu_list_evictable_rows(&pp->pp_pmu_groups);
+	pmu_list_evictable_rows(&pp->pp_pmu_groups, &evictable);
 	satisfiable = false;
 	LIST_FOREACH(pg, &pp->pp_pmu_groups, pg_proc_next) {
 		if (!pg->pg_running || pg->pg_assigned || !pg->pg_defer_ok)
 			continue;
 		p = pmu_group_target_proc(pg);
 		if (p != NULL && pmu_group_satisfiable(pg, p, PMC_CPU_ANY,
-		    evictable) == 0) {
+		    &evictable) == 0) {
 			satisfiable = true;
 			break;
 		}
@@ -2251,7 +2251,7 @@ pmu_pp_rotate_one(struct pmc_process *pp)
 			goto next;
 		p = pmu_group_target_proc(pg);
 		if (p == NULL || pmu_group_satisfiable(pg, p, PMC_CPU_ANY,
-		    evictable) != 0)
+		    &evictable) != 0)
 			goto next;
 		sin_err = pmu_pp_schedule_in(pp, pg);
 		while (sin_err == ENOSPC && !placed_any) {
@@ -2724,10 +2724,10 @@ pmu_syscpu_kick_rotate(int cpu)
 static void
 pmu_syscpu_rotate_one(int cpu)
 {
+	struct pmc_rowset evictable;
 	struct pmu_syscpu *sc;
 	pmu_group_t *cursor, *pg, *victim, *vpg;
 	struct proc *owner;
-	uint64_t evictable;
 	u_int ngroups, seen, vseen;
 	int sin_err;
 	bool found_cursor, placed_any, satisfiable;
@@ -2749,14 +2749,14 @@ pmu_syscpu_rotate_one(int cpu)
 	if (!found_cursor)
 		cursor = LIST_FIRST(&sc->sc_groups);
 
-	evictable = pmu_list_evictable_rows(&sc->sc_groups);
+	pmu_list_evictable_rows(&sc->sc_groups, &evictable);
 	satisfiable = false;
 	LIST_FOREACH(pg, &sc->sc_groups, pg_proc_next) {
 		if (!pg->pg_running || pg->pg_assigned || !pg->pg_defer_ok)
 			continue;
 		owner = pg->pg_owner != NULL ? pg->pg_owner->po_owner : NULL;
 		if (owner != NULL && pmu_group_satisfiable(pg, owner, cpu,
-		    evictable) == 0) {
+		    &evictable) == 0) {
 			satisfiable = true;
 			break;
 		}
@@ -2789,7 +2789,7 @@ pmu_syscpu_rotate_one(int cpu)
 			goto next;
 		owner = pg->pg_owner != NULL ? pg->pg_owner->po_owner : NULL;
 		if (owner == NULL || pmu_group_satisfiable(pg, owner, cpu,
-		    evictable) != 0)
+		    &evictable) != 0)
 			goto next;
 		sin_err = pmu_sys_schedule_in(cpu, pg);
 		while (sin_err == ENOSPC && !placed_any) {
