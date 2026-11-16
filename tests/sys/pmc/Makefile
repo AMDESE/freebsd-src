@@ -1,10 +1,12 @@
 TESTSDIR=	${TESTSBASE}/sys/pmc
+BINDIR=		${TESTSDIR}
 
 ATF_TESTS_C+=	pmc_api_test
 ATF_TESTS_C+=	pmc_credexec_test
 ATF_TESTS_C+=	pmc_detach_test
 ATF_TESTS_C+=	pmc_exec_test
 ATF_TESTS_C+=	pmc_fork_test
+ATF_TESTS_C+=	pmc_group_exec_test
 ATF_TESTS_C+=	pmc_group_gate_test
 ATF_TESTS_C+=	pmc_group_test
 ATF_TESTS_C+=	pmc_groupread_test
@@ -32,6 +34,8 @@ TEST_METADATA.pmc_cli_test+=		is_exclusive="true"
 TEST_METADATA.pmc_pidtrack_test+=	is_exclusive="true"
 TEST_METADATA.pmc_rapl_test+=		is_exclusive="true"
 TEST_METADATA.pmcstat_tsc_test+=	required_kmods="hwpmc"
+
+PROGS+=		pmc_exec_credential_helper
 
 LIBADD+=			pmc
 LIBADD.pmc_detach_test+=	pthread
