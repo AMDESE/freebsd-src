@@ -2502,6 +2502,43 @@ pmc_attach_process(struct proc *p, struct pmc *pm)
  * this process, remove the process structure from its hash table.  If
  * 'flags' contains PMC_FLAG_REMOVE, then free the process structure.
  */
+/*
+ * Move to each CPU where a thread of 'p' runs.  The scheduler then
+ * switches that thread out, and the switch-out removes its PMCs from
+ * the CPU.  A detached PMC can otherwise stay on the row of a remote
+ * CPU after a new PMC takes the row of 'p'.
+ */
+static void
+pmc_switch_out_running_threads(struct proc *p)
+{
+	struct pmc_binding pb;
+	struct thread *td;
+	cpuset_t cpus;
+	int cpu;
+
+	sx_assert(&pmc_sx, SX_XLOCKED);
+	CPU_ZERO(&cpus);
+	PROC_LOCK(p);
+	FOREACH_THREAD_IN_PROC(p, td) {
+		if (td == curthread)
+			continue;
+		thread_lock(td);
+		if (TD_IS_RUNNING(td))
+			CPU_SET(td->td_oncpu, &cpus);
+		thread_unlock(td);
+	}
+	PROC_UNLOCK(p);
+	if (CPU_EMPTY(&cpus))
+		return;
+
+	pmc_save_cpu_binding(&pb);
+	CPU_FOREACH_ISSET(cpu, &cpus) {
+		if (pmc_cpu_is_active(cpu))
+			pmc_select_cpu(cpu);
+	}
+	pmc_restore_cpu_binding(&pb);
+}
+
 static int
 pmc_detach_one_process(struct proc *p, struct pmc *pm, int flags)
 {
@@ -2546,6 +2583,10 @@ pmc_detach_one_process(struct proc *p, struct pmc *pm, int flags)
 	}
 
 	pmc_unlink_target_process(pm, pp);
+
+	/* Remove the PMC from the CPUs where 'p' still runs. */
+	if (PMC_IS_VIRTUAL_MODE(PMC_TO_MODE(pm)))
+		pmc_switch_out_running_threads(p);
 
 	/* Issue a detach entry if a log file is configured */
 	if (pm->pm_owner->po_flags & PMC_PO_OWNS_LOGFILE)
