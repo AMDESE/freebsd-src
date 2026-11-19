@@ -51,6 +51,7 @@
 #include <sys/param.h>
 #include <sys/cpuset.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
 #include <sys/wait.h>
 
 #include <errno.h>
@@ -467,6 +468,64 @@ ATF_TC_BODY(close_record_is_last, tc)
  * /dev/full accepts the configure and fails every write with ENOSPC, which
  * the flush - which waits for the buffers to be written - reports.
  */
+#define	SPAN_MARKER	0x53500000U
+#define	SPAN_INDEX	0x000fffffU
+
+/**
+ * @internal
+ * Write records on one CPU until they fill more than three log buffers.
+ * A record that does not fit the end of a buffer starts the next buffer.
+ * The record after it must not overwrite it.
+ */
+ATF_TC_WITHOUT_HEAD(records_span_buffers);
+ATF_TC_BODY(records_span_buffers, tc)
+{
+	struct pmclog_ev ev;
+	void *parser;
+	size_t len;
+	int bufkb, cpu_other, cpu_write, fd, i, n, seen;
+
+	require_hwpmc();
+	require_two_cpus(&cpu_write, &cpu_other);
+	len = sizeof(bufkb);
+	ATF_REQUIRE_MSG(sysctlbyname("kern.hwpmc.logbuffersize", &bufkb,
+	    &len, NULL, 0) == 0, "kern.hwpmc.logbuffersize: %s",
+	    strerror(errno));
+	n = 3 * bufkb * 1024 / (int)sizeof(struct pmclog_userdata) + 1;
+	ATF_REQUIRE(n <= (int)SPAN_INDEX);
+
+	fd = work_file("span.pmclog");
+	ATF_REQUIRE_MSG(pmc_configure_logfile(fd) == 0,
+	    "pmc_configure_logfile: %s", strerror(errno));
+	ATF_REQUIRE_MSG(pin_to_cpu(cpu_write), "cannot pin to CPU %d: %s",
+	    cpu_write, strerror(errno));
+	for (i = 0; i < n; i++)
+		ATF_REQUIRE_MSG(pmc_writelog(SPAN_MARKER | i) == 0,
+		    "pmc_writelog(%d): %s", i, strerror(errno));
+	ATF_REQUIRE_MSG(pmc_close_logfile() == 0, "pmc_close_logfile: %s",
+	    strerror(errno));
+	ATF_REQUIRE_MSG(pmc_configure_logfile(-1) == 0,
+	    "pmc_configure_logfile(-1): %s", strerror(errno));
+
+	ATF_REQUIRE(lseek(fd, 0, SEEK_SET) == 0);
+	ATF_REQUIRE((parser = pmclog_open(fd)) != NULL);
+	seen = 0;
+	while (pmclog_read(parser, &ev) == 0) {
+		if (ev.pl_type != PMCLOG_TYPE_USERDATA ||
+		    (ev.pl_u.pl_u.pl_userdata & ~SPAN_INDEX) != SPAN_MARKER)
+			continue;
+		ATF_CHECK_MSG((int)(ev.pl_u.pl_u.pl_userdata & SPAN_INDEX) ==
+		    seen, "record %d is missing", seen);
+		seen = (ev.pl_u.pl_u.pl_userdata & SPAN_INDEX) + 1;
+	}
+	ATF_CHECK_MSG(ev.pl_state == PMCLOG_EOF,
+	    "log parse ended in state %d", ev.pl_state);
+	pmclog_close(parser);
+	(void)close(fd);
+	ATF_CHECK_MSG(seen == n, "the last record seen is %d of %d",
+	    seen, n);
+}
+
 ATF_TC_WITHOUT_HEAD(log_write_error_is_reported);
 ATF_TC_BODY(log_write_error_is_reported, tc)
 {
@@ -565,6 +624,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, log_survives_userland_closing_the_fd);
 	ATF_TP_ADD_TC(tp, log_write_error_is_reported);
 	ATF_TP_ADD_TC(tp, close_record_is_last);
+	ATF_TP_ADD_TC(tp, records_span_buffers);
 	ATF_TP_ADD_TC(tp, owner_exit_with_log_and_running_pmc);
 
 	return (atf_no_error());

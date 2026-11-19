@@ -562,7 +562,7 @@ pmclog_reserve(struct pmc_owner *po, int length)
 static uint32_t *
 pmclog_reserve_flags(struct pmc_owner *po, int length, bool closing)
 {
-	uintptr_t newptr, oldptr __diagused;
+	uintptr_t newptr, oldptr;
 	struct pmclog_buffer *plb, **pplb;
 
 	PMCDBG2(LOG,ALL,1, "po=%p len=%d", po, length);
@@ -625,7 +625,13 @@ pmclog_reserve_flags(struct pmc_owner *po, int length, bool closing)
 		__LINE__, po, plb->plb_ptr, plb->plb_base,
 		plb->plb_fence));
 
+	/* Claim the space in the fresh buffer, as above. */
 	oldptr = (uintptr_t) plb->plb_ptr;
+	newptr = oldptr + length;
+	KASSERT(newptr <= (uintptr_t) plb->plb_fence,
+	    ("[pmclog,%d] po=%p record of %d bytes exceeds a buffer",
+		__LINE__, po, length));
+	plb->plb_ptr = (char *) newptr;
 
  done:
 	return ((uint32_t *) oldptr);
